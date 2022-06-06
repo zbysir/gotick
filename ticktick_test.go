@@ -8,8 +8,6 @@ import (
 )
 
 func TestTick(t *testing.T) {
-	ctx := context.Background()
-
 	var c = Workflow{
 		workflows: map[string]func(ctx *WorkflowContext) error{},
 	}
@@ -45,13 +43,22 @@ func TestTick(t *testing.T) {
 		return nil
 	})
 
-	// 触发 workflow
-	status, err := c.Touch("test", ctx)
-	if err != nil {
-		t.Fatal(err)
-		return
-	}
-	t.Logf("exit status: %+v", status)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		c.Run(ctx)
+	}()
+
+	go func() {
+		// 触发 workflow
+		status, err := c.Touch("test", ctx)
+		if err != nil {
+			t.Fatal(err)
+			return
+		}
+		t.Logf("exit status: %+v", status)
+	}()
 
 	time.Sleep(5 * time.Second)
 }

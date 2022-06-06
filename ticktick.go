@@ -7,17 +7,9 @@ import (
 	"fmt"
 	"log"
 	"reflect"
+	"sync"
 	"time"
 )
-
-type WorkflowContext struct {
-	Params json.Marshaler
-
-	jod   []string
-	state map[string]State
-	timer []*Timer
-	w     *Workflow
-}
 
 // 记录每一个步骤的执行状态，每一个 workflow 有有限个状态，可落盘
 type State struct {
@@ -46,18 +38,24 @@ type Timer struct {
 }
 
 type Workflow struct {
-	jod []string
-
-	data      map[string]State
-	hook      map[string]interface{}
 	workflows map[string]func(ctx *WorkflowContext) error
-	timer     []*Timer
+	wg        sync.WaitGroup
+}
+
+type WorkflowContext struct {
+	Params json.Marshaler
+
+	jod   []string
+	state map[string]State
+	timer []*Timer
+	w     *Workflow
 }
 
 type UniquKeyer interface {
 	UniquKey() string
 }
 
+// pushTimer 开启一个定时器
 func (c *WorkflowContext) pushTimer(jobName string, wfName string, on time.Time, ctx context.Context) {
 	c.timer = append(c.timer, &Timer{
 		On:      on,
@@ -65,6 +63,7 @@ func (c *WorkflowContext) pushTimer(jobName string, wfName string, on time.Time,
 		jobName: jobName,
 	})
 
+	// 先简单的用 AfterFunc 做 demo，后面需要使用过 mysql 实现
 	time.AfterFunc(on.Sub(time.Now()), func() {
 		log.Printf("timer fight")
 		status, err := c.w.Touch(wfName, WorkflowContextWithCtx(ctx, c))
@@ -96,40 +95,15 @@ func (c *WorkflowContext) Wrap(jobName string, f func() (any, error), rstPrt int
 	return nil
 }
 
-func (c *Workflow) Hook(jobName string, rstPrt interface{}) (exist bool, err error) {
-	c.jod = append(c.jod, jobName)
-
-	r, ok := c.data[jobName]
-	if !ok {
-		return false, nil
-	}
-
-	if ok {
-		reflect.ValueOf(rstPrt).Elem().Set(reflect.ValueOf(r.response))
-		return true, nil
-	}
-
-	return
-}
-
-func (c *Workflow) SendHook(jobName string, s interface{}) (exist bool, err error) {
-	c.jod = append(c.jod, jobName)
-
-	r, ok := c.data[jobName]
-	if ok {
-		r.response = s
-		c.data[jobName] = r
-		return
-	} else {
-		c.data[jobName] = State{response: r}
-	}
-
-	return
-}
-
 func (c *Workflow) Handle(wfName string, f func(ctx *WorkflowContext) error) {
 	c.workflows[wfName] = f
 	return
+}
+
+// Run 开始运行服务，主要是运行 nsq 消费者
+func (c *Workflow) Run(ctx context.Context) error {
+
+	return nil
 }
 
 var ctxWorkflowName struct{}
@@ -191,6 +165,7 @@ func (e ExitStatus) String() string {
 	panic(e)
 }
 
+// Touch 往消息队列发送一个触发事件
 func (c *Workflow) Touch(wfName string, ctx context.Context) (ExitStatus, error) {
 	// todo 做成发布模式
 	ctx = WorkflowNameWithCtx(ctx, wfName)
