@@ -63,7 +63,8 @@ func (c *WorkflowContext) pushTimer(jobName string, wfName string, on time.Time,
 		jobName: jobName,
 	})
 
-	// 先简单的用 AfterFunc 做 demo，后面需要使用过 mysql 实现
+	// 先简单的用 AfterFunc 做 demo，后面需要使用 mysql/redis 实现，先做框架
+	// https://github.com/hibiken/asynq/blob/master/internal/rdb/rdb.go
 	time.AfterFunc(on.Sub(time.Now()), func() {
 		log.Printf("timer fight")
 		status, err := c.w.Touch(wfName, WorkflowContextWithCtx(ctx, c))
@@ -101,6 +102,7 @@ func (c *Workflow) Handle(wfName string, f func(ctx *WorkflowContext) error) {
 }
 
 // Run 开始运行服务，主要是运行 nsq 消费者
+// - timer 定时器
 func (c *Workflow) Run(ctx context.Context) error {
 
 	return nil
