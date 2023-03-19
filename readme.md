@@ -1,6 +1,6 @@
 # Ticktick
 
-可以服务重启恢复的 Sleep 框架，灵感来自 https://github.com/temporalio/temporal
+支持重启恢复的同步方式写异步代码的 go 框架，灵感来自 https://github.com/temporalio/temporal
 
 ## 特性
 
@@ -16,8 +16,12 @@ TODO
 - 可视化执行
 
 ## 架构
-- SDK：用于项目里，和 nsq handler 类似，只需要 handler 回调，处理完成之后还是通过 nsq 发送结果给 独立服务
+- SDK：用于项目里，和 nsq handler 类似，只需要 注册 handler 回调，处理完成之后通过 nsq 发送结果给 独立服务
 - 独立服务：运行独立服务用于定时触发 timer，UI，存储数据，可扩缩容。
+
+## 使用方式
+1. 只有一个回调，适用于动态配置流程
+2. 如果数据流是静态的，可以使用.then 这样的链式调用方式创建流程。
 
 ## 用途
 
