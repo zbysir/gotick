@@ -1,101 +1,74 @@
-# Ticktick
+# Tick
 
-支持重启恢复的同步方式写异步代码的 go 框架，灵感来自 https://github.com/temporalio/temporal
+支持重启恢复的同步方式写异步代码的 go 框架，灵感来自 [temporal](https://github.com/temporalio/temporal)
 
 ## 特性
 
-- 实现同步语法写异步逻辑，优雅面对复杂逻辑，不必为了延时任务大改你的代码。
+- 实现同步语法写异步逻辑，优雅面对复杂逻辑，不必为了异步、延时任务大改你的代码。
 - 只能支持精度到秒级。
 - 支持失败重试（基于消息队列自身特性）。
-- 可扩缩容
-- 自身足够简单可信耐，依赖 nsq 和 redis 实现复杂特性，自己只实现了一个定时器与保存历史与 UI。
+- 自身足够简单可信耐，依赖 mq 和 redis 实现复杂特性。
 
 TODO
 
 - UI
-- 可视化执行
+  - 可视化流程，可视化任务状态，统计次数
+  - 查看执行结果
 
-## 架构
-- SDK：用于项目里，和 nsq handler 类似，只需要 注册 handler 回调，处理完成之后通过 nsq 发送结果给 独立服务
-- 独立服务：运行独立服务用于定时触发 timer，UI，存储数据，可扩缩容。
+## 用途
+
+最轻量化也可靠的定时、延时任务调度器
+
+不同于 temporal，ticktick 不是一个全栈框架，temporal 有很多部署与维护成本（和开发成本），
+而 ticktick 足够简单，你不用担心 ticktick 的部署与维护成本。
 
 ## 使用方式
 1. 只有一个回调，适用于动态配置流程
 2. 如果数据流是静态的，可以使用.then 这样的链式调用方式创建流程。
 
-## 用途
-
-最轻量化的定时、延时任务调度器
-
-不同于 temporal，ticktick 不是一个全栈框架，temporal 有很多部署与维护成本（和开发成本），
-而 ticktick 足够简单，你不用担心 ticktick 的部署与维护成本。
-
 ## 依赖
 
-- mysql：持久化 workflow 状态。
-- redis：定时消息（容易实现分布式一致性）。
-- nsq：使用消息队列来分发事件来实现负载均衡。
+- mysql（可选）：持久化 workflow 状态。
+- redis：定时任务。
+- nsq（可选）：使用消息队列来分发事件来实现负载均衡与重试。
 
 ## Example
 
 ```go
-package ticktick
-
-import (
-	"context"
-	"log"
-	"testing"
-	"time"
-)
-
 func TestTick(t *testing.T) {
-	ctx := context.Background()
+	b := MockBridge{}
+	tick := NewTickServer(&b)
 
-	var c = Workflow{
-		workflows: map[string]func(ctx *WorkflowContext) error{},
-	}
+	wg := sync.WaitGroup{}
+	wg.Add(1)
 
-	c.Handle("test", func(ctx *WorkflowContext) error {
-		// 发放 vip
-		var rst string
-		err := ctx.Wrap("create", func() (any, error) {
-			log.Printf("create exec")
-			return "success", nil
-		}, &rst, nil)
-		if err != nil {
-			return err
-		}
-		log.Printf("create result: %v", rst)
-		if rst != "success" {
+	tick.Flow("demo").
+		Then("first", func(ctx context.Context) error {
+			log.Printf("first exec at %v", time.Now())
+			v := "first value"
+			Store(ctx, "first", v)
+			log.Printf("set first value: %v", v)
+
 			return nil
-		}
+		}).
+		Sleep("wait-for-second", time.Second*2).
+		Then("third", func(ctx context.Context) error {
+			log.Printf("third exec at %v", time.Now())
+			return nil
+		}).
+		Then("end", func(ctx context.Context) error {
+			log.Printf("end at %v", time.Now())
+			data := GetMetaData(ctx)
+			log.Printf("meta data: %v", data)
+			wg.Done()
+			return nil
+		})
 
-		// 2s 之后删除 vip
-		err = ctx.Sleep("wait-for-delete", time.Second*2)
-		if err != nil {
-			return err
-		}
-		err = ctx.Wrap("delete", func() (interface{}, error) {
-			log.Printf("delete exec")
-			return "success", nil
-		}, &rst, nil)
-		if err != nil {
-			return err
-		}
-		log.Printf("delete result: %v", rst)
-		return nil
-	})
-
-	// 触发 workflow
-	status, err := c.Touch("test", ctx)
+	err := b.Publish(Scheler{FlowId: "demo"})
 	if err != nil {
 		t.Fatal(err)
-		return
 	}
-	t.Logf("exit status: %+v", status)
 
-	time.Sleep(5 * time.Second)
+	wg.Wait()
 }
-
 ```
-
