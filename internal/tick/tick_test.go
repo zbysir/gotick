@@ -64,7 +64,7 @@ func TestTick(t *testing.T) {
 		})
 
 	wg.Add(1)
-	err := b.Publish(Scheler{FlowId: "demo"})
+	err := b.Publish(Scheler{FlowId: "demo", MetaData: map[string]string{"id": "1"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestTick(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	wg.Add(1)
-	err = b.Publish(Scheler{FlowId: "demo"})
+	err = b.Publish(Scheler{FlowId: "demo", MetaData: map[string]string{"id": "2"}})
 	if err != nil {
 		t.Fatal(err)
 	}

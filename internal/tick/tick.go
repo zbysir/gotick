@@ -78,7 +78,8 @@ type Flow struct {
 type Scheler struct {
 	FlowId string
 	//Node   string
-	CallId string
+	CallId   string
+	MetaData MetaData
 }
 
 type AsyncJobProduct interface {
@@ -119,6 +120,11 @@ func (t *Flow) Scheduler(statusStore NodeStatusStore, callId string, data MetaDa
 	m, _, _ := statusStore.GetMetaData()
 	if m != nil {
 		ctx = WithMetaData(ctx, m)
+	}
+
+	// 拼装上额外的 data
+	if data != nil {
+		ctx = WithMetaData(ctx, data)
 	}
 
 	for _, node := range t.nodes {
@@ -248,18 +254,19 @@ func randomStr() string {
 	return fmt.Sprintf("%x", b)
 }
 
-func (t *Tick) Touch(flow string, callId string, data MetaData) error {
+func (t *Tick) Touch(s Scheler) error {
+	callId := s.CallId
 	if callId == "" {
 		callId = randomStr()
 	}
-	f := t.Flows[flow]
+	f := t.Flows[s.FlowId]
 	if f == nil {
 		return errors.New("flow not found")
 	}
 
 	st := t.statusStore.New(callId)
 
-	return f.Scheduler(st, callId, data)
+	return f.Scheduler(st, callId, s.MetaData)
 }
 
 type Bridge interface {
@@ -337,7 +344,7 @@ func NewTickServer(b Bridge) *Tick {
 	}
 
 	b.OnCallback(func(s Scheler) error {
-		return t.Touch(s.FlowId, s.CallId, MetaData{})
+		return t.Touch(s)
 	})
 	aw.OnCallback(func(s Scheler) error {
 		return b.Publish(s)
