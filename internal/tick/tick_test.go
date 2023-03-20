@@ -34,31 +34,45 @@ func TestTick(t *testing.T) {
 	tick := NewTickServer(&b)
 
 	wg := sync.WaitGroup{}
-	wg.Add(1)
+
+	var start time.Time = time.Now()
 
 	tick.Flow("demo").
-		Then("first", func(ctx context.Context) error {
-			log.Printf("first exec at %v", time.Now())
-			v := "first value"
+		Then("first", func(ctx context.Context) (NextStatus, error) {
+			log.Printf("[%v] first exec at %v", GetCallId(ctx), time.Now().Sub(start))
+			v := GetCallId(ctx)
 			Store(ctx, "first", v)
-			log.Printf("set first value: %v", v)
-
-			return nil
+			log.Printf("[%v] set first value: %v", GetCallId(ctx), v)
+			return NextStatus{}, nil
 		}).
-		Sleep("wait-for-second", time.Second*2).
-		Then("third", func(ctx context.Context) error {
-			log.Printf("third exec at %v", time.Now())
-			return nil
+		Then("wait-for-second", func(ctx context.Context) (NextStatus, error) {
+			return NextStatus{status: "sleep", runAt: time.Now().Add(2 * time.Second)}, nil
 		}).
-		Then("end", func(ctx context.Context) error {
-			log.Printf("end at %v", time.Now())
+		Then("third", func(ctx context.Context) (NextStatus, error) {
+			log.Printf("[%v] third exec at %v", GetCallId(ctx), time.Now().Sub(start))
+			return NextStatus{}, nil
+		}).
+		Then("wait-for-second2", func(ctx context.Context) (NextStatus, error) {
+			return NextStatus{status: "sleep", runAt: time.Now().Add(2 * time.Second)}, nil
+		}).
+		Then("end", func(ctx context.Context) (NextStatus, error) {
+			log.Printf("[%v] end at %v", GetCallId(ctx), time.Now().Sub(start))
 			data := GetMetaData(ctx)
-			log.Printf("meta data: %v", data)
+			log.Printf("[%v] meta data: %v", GetCallId(ctx), data)
 			wg.Done()
-			return nil
+			return NextStatus{}, nil
 		})
 
+	wg.Add(1)
 	err := b.Publish(Scheler{FlowId: "demo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(1 * time.Second)
+
+	wg.Add(1)
+	err = b.Publish(Scheler{FlowId: "demo"})
 	if err != nil {
 		t.Fatal(err)
 	}
