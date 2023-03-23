@@ -18,26 +18,26 @@ import (
 // 定义流程和触发还是需要分开写代码，因为每次服务启动都需要注册流程，和触发的时机是不同的。
 
 type MockBridge struct {
-	f func(s Scheler) error
+	f func(s Event) error
 }
 
-func (m *MockBridge) Publish(s Scheler) error {
+func (m *MockBridge) Publish(s Event) error {
 	return m.f(s)
 }
 
-func (m *MockBridge) OnCallback(f func(s Scheler) error) {
+func (m *MockBridge) OnCallback(f func(s Event) error) {
 	m.f = f
 }
 
 func TestTick(t *testing.T) {
-	b := MockBridge{}
-	tick := NewTickServer(&b)
+	tick := NewTickServer(&MockNodeStatusStoreProduct{}, SimpleAsyncQueenProduct{})
 
 	wg := sync.WaitGroup{}
 
-	var start time.Time = time.Now()
+	var start = time.Now()
 
-	tick.Flow("demo").
+	flow := tick.Flow("demo")
+	flow.
 		Then("first", func(ctx context.Context) (NextStatus, error) {
 			log.Printf("[%v] first exec at %v", GetCallId(ctx), time.Now().Sub(start))
 			v := GetCallId(ctx)
@@ -46,14 +46,14 @@ func TestTick(t *testing.T) {
 			return NextStatus{}, nil
 		}).
 		Then("wait-for-second", func(ctx context.Context) (NextStatus, error) {
-			return NextStatus{status: "sleep", runAt: time.Now().Add(2 * time.Second)}, nil
+			return NextStatus{Status: "sleep", RunAt: time.Now().Add(2 * time.Second)}, nil
 		}).
 		Then("third", func(ctx context.Context) (NextStatus, error) {
 			log.Printf("[%v] third exec at %v", GetCallId(ctx), time.Now().Sub(start))
 			return NextStatus{}, nil
 		}).
 		Then("wait-for-second2", func(ctx context.Context) (NextStatus, error) {
-			return NextStatus{status: "sleep", runAt: time.Now().Add(2 * time.Second)}, nil
+			return NextStatus{Status: "sleep", RunAt: time.Now().Add(2 * time.Second)}, nil
 		}).
 		Then("end", func(ctx context.Context) (NextStatus, error) {
 			log.Printf("[%v] end at %v", GetCallId(ctx), time.Now().Sub(start))
@@ -64,7 +64,7 @@ func TestTick(t *testing.T) {
 		})
 
 	wg.Add(1)
-	err := b.Publish(Scheler{FlowId: "demo", MetaData: map[string]string{"id": "1"}})
+	_, err := flow.Trigger(map[string]string{"id": "1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestTick(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	wg.Add(1)
-	err = b.Publish(Scheler{FlowId: "demo", MetaData: map[string]string{"id": "2"}})
+	_, err = flow.Trigger(map[string]string{"id": "2"})
 	if err != nil {
 		t.Fatal(err)
 	}
