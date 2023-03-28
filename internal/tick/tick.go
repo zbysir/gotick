@@ -66,14 +66,14 @@ type StoreProduct interface {
 }
 type AsyncQueenProduct interface {
 	New(key string) AsyncQueen
-	Start(ctx context.Context)
+	Start(ctx context.Context) error
 }
 
 type SimpleAsyncQueenProduct struct {
 }
 
-func (s SimpleAsyncQueenProduct) Start(ctx context.Context) {
-
+func (s SimpleAsyncQueenProduct) Start(ctx context.Context) error {
+	return nil
 }
 
 func (s SimpleAsyncQueenProduct) New(key string) AsyncQueen {
@@ -285,7 +285,7 @@ func (f *Flow) scheduler(event Event) error {
 finish:
 
 	// 执行到这里就是任务完成了
-	log.Printf("---- end ----")
+	log.Printf("---- end ---- %v", event.CallId)
 
 	return nil
 }
@@ -322,22 +322,27 @@ func (t *Tick) Trigger(flowId string, data MetaData) (string, error) {
 	return f.Trigger(data)
 }
 
-func (t *Tick) Start(ctx context.Context) {
-	t.asyncQueen.Start(ctx)
+func (t *Tick) Start(ctx context.Context) error {
+	t.wg.Add(1)
+	go func() {
+		defer t.wg.Done()
+		err := t.asyncQueen.Start(ctx)
+		if err != nil {
+			log.Printf("async queen start error: %v", err)
+		}
+	}()
 
 	select {
 	case <-ctx.Done():
 		t.close = true
 	}
 
-	// 启动异步队列
-
 	t.wg.Wait()
-	return
+	return nil
 }
 
 // SimpleAsyncQueen 使用 Goroutine 实现的异步队列
-// 不过不用担心它在重启之后不会触发，因为 tick 会记录所有 call 的状态，在重启之后会从缓存中重新调度 call（未完成的）。
+// 它在重启之后会丢数据，只应该在测试使用。
 // - 使用它可以达到最大定时的精度（毫秒级）
 // - 缺点是可能会占用更多的内容并且重启恢复需要时间。
 // - 所有任务都会在同一个机器上执行，可能导致热点问题。

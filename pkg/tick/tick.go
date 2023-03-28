@@ -2,7 +2,7 @@ package tick
 
 import (
 	"context"
-	"github.com/redis/go-redis/v9"
+	"github.com/go-redis/redis/v8"
 	"github.com/zbysir/ticktick/internal/store"
 	"github.com/zbysir/ticktick/internal/tick"
 	"time"
@@ -78,48 +78,49 @@ func NewTick(p Options) *tick.Tick {
 
 	redisClient := redis.NewClient(opt)
 	st := NewStoreProduct(store.NewRedisStore(redisClient))
-	queen := store.NewRedisAsyncQueen(redisClient, "default")
+	queen := store.NewAsynq(redisClient)
 	ap := NewAsyncQueenProduct(queen)
 	t := tick.NewTickServer(st, ap)
 	return t
 }
 
 type AsyncQueenProduct struct {
-	redis store.AsyncQueen
+	queen store.DelayedQueue
 }
 
-func (a *AsyncQueenProduct) Start(ctx context.Context) {
-	a.redis.Start(ctx)
+func (a *AsyncQueenProduct) Start(ctx context.Context) error {
+	return a.queen.Start(ctx)
 }
 
-func NewAsyncQueenProduct(redis store.AsyncQueen) *AsyncQueenProduct {
-	return &AsyncQueenProduct{redis: redis}
+func NewAsyncQueenProduct(redis store.DelayedQueue) *AsyncQueenProduct {
+	return &AsyncQueenProduct{queen: redis}
 }
 
 func (a *AsyncQueenProduct) New(key string) tick.AsyncQueen {
-	x := NewAsyncQueen(a.redis, key)
+	x := NewAsyncQueen(a.queen, key)
 	return x
 }
 
 type AsyncQueen struct {
-	redis store.AsyncQueen
+	redis store.DelayedQueue
 	key   string
 }
 
 func (a *AsyncQueen) Publish(data tick.Event, delay time.Duration) error {
-	return a.redis.Publish(data.CallId, delay)
+	return a.redis.Publish(a.key, data.CallId, delay)
 }
 
 func (a *AsyncQueen) Exist(uniqueKey []string) (map[string]bool, error) {
-	return a.redis.Exist(uniqueKey)
+	// return a.redis.Exist(uniqueKey)
+	return nil, nil
 }
 
 func (a *AsyncQueen) Subscribe(h func(data tick.Event) error) {
-	a.redis.Subscribe(func(data string) error {
+	a.redis.Subscribe(a.key, func(data string) error {
 		return h(tick.Event{CallId: data})
 	})
 }
 
-func NewAsyncQueen(redis store.AsyncQueen, key string) *AsyncQueen {
+func NewAsyncQueen(redis store.DelayedQueue, key string) *AsyncQueen {
 	return &AsyncQueen{redis: redis, key: key}
 }
