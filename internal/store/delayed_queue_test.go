@@ -22,22 +22,22 @@ func TestStdRedisDelayedQueue(t *testing.T) {
 		}
 	}()
 
-	q.Subscribe("t1", func(data string) error {
+	q.Subscribe("t1", func(ctx context.Context, data string) error {
 		t.Logf("t1 receive: %v", data)
 		return nil
 	})
 
-	err := q.Publish("t1", "test1", 2*time.Second)
+	err := q.Publish(context.Background(), "t1", "test1", 2*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	q.Subscribe("t2", func(data string) error {
+	q.Subscribe("t2", func(ctx context.Context, data string) error {
 		t.Logf("t2 receive: %v", data)
 		return nil
 	})
 
-	err = q.Publish("t2", "test2", 2*time.Second)
+	err = q.Publish(context.Background(), "t2", "test2", 2*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,22 +62,22 @@ func TestAsynqQueue(t *testing.T) {
 		}
 	}()
 
-	q.Subscribe("t2", func(data string) error {
+	q.Subscribe("t2", func(ctx context.Context, data string) error {
 		t.Logf("t2 receive: %v at %v", data, time.Now())
 		return nil
 	})
 
-	q.Subscribe("t3", func(data string) error {
+	q.Subscribe("t3", func(ctx context.Context, data string) error {
 		t.Logf("t3 receive : %v at %v", data, time.Now())
 		return nil
 	})
 
-	err := q.Publish("t2", "test1", 2*time.Second)
+	err := q.Publish(context.Background(), "t2", "test1", 2*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = q.Publish("t3", "test2", 2*time.Second)
+	err = q.Publish(context.Background(), "t3", "test2", 2*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

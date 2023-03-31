@@ -1,70 +1,82 @@
 # Tick
 
-支持重启恢复的同步方式写异步代码的 go 框架，灵感来自 [temporal](https://github.com/temporalio/temporal)
+方便的编写你的异步任务工作流。
+
+灵感来自 [temporal](https://github.com/temporalio/temporal)
+
+不同于 temporal，tick 不是一个全栈框架，temporal 有很多部署与维护成本（和开发成本），
+而 tick 足够简单，它只依赖于 Redis。
 
 ## 特性
 
-- 实现同步语法写异步逻辑，优雅面对复杂逻辑，不必为了异步、延时任务大改你的代码。
-- 只能支持精度到秒级。
-- 支持失败重试（基于消息队列自身特性）。
-- 自身足够简单可信耐，依赖 mq 和 redis 实现复杂特性。
+- 同步语法写异步逻辑，优雅面对复杂逻辑，不必为了延时任务破坏你的代码。
+- 支持分布式调用
+- 保证任务至少执行一次
+- 自身足够简单可信耐，依赖 [asynq](https://github.com/hibiken/asynq) 实现延时任务。
 
-TODO
+## 如何工作
+
+```mermaid
+flowchart TB
+  subgraph Service
+    Trigger --> AsyncQueue
+    AsyncQueue[/AsyncQueue/] <--> Scheduler
+    Flow <----> Scheduler
+
+    subgraph Flow
+      direction LR
+      Task_1 -.-> Task_2 -.-> Task_3
+      Task_2 
+      Task_3
+    end
+    
+    Scheduler <--> Redis[(Redis)]
+  end
+
+  subgraph Client
+    Client1[Client] --> Trigger
+  end
+```
+
+## TODO
 
 - UI
-  - 可视化流程，可视化任务状态，统计次数
-  - 查看执行结果
-
-## 用途
-
-最轻量化也可靠的定时、延时任务调度器
-
-不同于 temporal，ticktick 不是一个全栈框架，temporal 有很多部署与维护成本（和开发成本），
-而 ticktick 足够简单，你不用担心 ticktick 的部署与维护成本。
-
-## 使用方式
-1. 只有一个回调，适用于动态配置流程
-2. 如果数据流是静态的，可以使用.then 这样的链式调用方式创建流程。
-
-## 依赖
-
-- mysql（可选）：持久化 workflow 状态。
-- redis：定时任务。
-- nsq（可选）：使用消息队列来分发事件来实现负载均衡与重试。
+  - 可视化流程，可视化任务状态，统计次数 （通过节点的方式）
+  - 查看每个节点的执行结果
 
 ## Example
 
 ```go
 func TestTick(t *testing.T) {
-	b := MockBridge{}
-	tick := NewTickServer(&b)
+	tick := NewTick()
 
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 
-	tick.Flow("demo").
-		Then("first", func(ctx context.Context) error {
-			log.Printf("first exec at %v", time.Now())
-			v := "first value"
-			Store(ctx, "first", v)
-			log.Printf("set first value: %v", v)
-
+	flow := tick.Flow("demo")
+	
+	flow.
+		Then("first", func(ctx context.Context) (tick.NextStatus, error) {
+			v := tick.GetCallId(ctx)
+			tick.Store(ctx, "first", v)
+			return tick.NextStatus{}, nil
+		}).
+		Then("wait-for-second", func(ctx context.Context) (tick.NextStatus, error) {
+			return tick.NextStatus{Status: "sleep", RunAt: time.Now().Add(2 * time.Second)}, nil
+		}).
+		Then("end", func(ctx context.Context) (tick.NextStatus, error) {
+			return tick.NextStatus{}, nil
+		}).
+		Success(func(ctx context.Context, t tick.TaskStatus) error {
+            fmt.Printf("[%v] fail exec at %v, task: %v", tick.GetCallId(ctx), time.Now().Sub(start), t)
+            wg.Done()
 			return nil
 		}).
-		Sleep("wait-for-second", time.Second*2).
-		Then("third", func(ctx context.Context) error {
-			log.Printf("third exec at %v", time.Now())
-			return nil
-		}).
-		Then("end", func(ctx context.Context) error {
-			log.Printf("end at %v", time.Now())
-			data := GetMetaData(ctx)
-			log.Printf("meta data: %v", data)
-			wg.Done()
+		Fail(func(ctx context.Context, t tick.TaskStatus) error {
 			return nil
 		})
-
-	err := b.Publish(Scheler{FlowId: "demo"})
+	
+	err := tick.Trigger(context.Backbround(), "demo")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,3 +84,5 @@ func TestTick(t *testing.T) {
 	wg.Wait()
 }
 ```
+
+现在所有的 Task 将会按照顺序异步的各个节点中调度，并且你可以方便的添加睡眠时间。

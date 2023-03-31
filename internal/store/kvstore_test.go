@@ -2,7 +2,8 @@ package store
 
 import (
 	"context"
-	"github.com/redis/go-redis/v9"
+	"github.com/go-redis/redis/v8"
+	"github.com/stretchr/testify/assert"
 	"testing"
 	"time"
 )
@@ -26,12 +27,13 @@ func TestStore(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Logf("%v %v", exist, v)
+	assert.Equal(t, true, exist)
+	assert.Equal(t, "test", v)
 
 	exist, err = r.Get(ctx, "test2", &v)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	t.Logf("%v %v", exist, v)
+	assert.Equal(t, false, exist)
 }
