@@ -1,4 +1,4 @@
-module github.com/zbysir/ticktick
+module github.com/zbysir/gotick
 
 go 1.18
 

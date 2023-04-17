@@ -1,4 +1,4 @@
-package tick
+package gotick
 
 import (
 	"context"
@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/go-redis/redis/v8"
-	"github.com/zbysir/ticktick/internal/store"
+	"github.com/zbysir/gotick/internal/store"
 	"log"
 	"sync"
 	"time"
@@ -136,10 +136,11 @@ type NodeStatusStore interface {
 	Clear() error // 删除所有数据
 }
 
-type StoreProduct interface {
+type StoreFactory interface {
 	New(key string) NodeStatusStore
 }
-type AsyncQueenProduct interface {
+
+type AsyncQueenFactory interface {
 	New(key string) AsyncQueen
 	Start(ctx context.Context) error
 }
@@ -155,13 +156,17 @@ func (s SimpleAsyncQueenProduct) New(key string) AsyncQueen {
 	return &SimpleAsyncQueen{}
 }
 
-type Tick struct {
-	Flows      map[string]*Flow
-	asyncQueen AsyncQueenProduct
+type TickServer struct {
+	flows      map[string]*Flow
+	asyncQueen AsyncQueenFactory
 	closeChan  chan bool
 	closeOnce  sync.Once
 	wg         sync.WaitGroup
 
+	scheduler *Scheduler
+}
+
+type TickClient struct {
 	scheduler *Scheduler
 }
 
@@ -191,7 +196,6 @@ type AsyncQueen interface {
 	// Publish 当 uniqueKey 不为空时，后面 Publish 的数据会覆盖前面的数据
 	// uniqueKey 通常为 callId
 	Publish(ctx context.Context, data Event, delay time.Duration) error
-	Exist(uniqueKey []string) (map[string]bool, error)
 	Subscribe(h func(ctx context.Context, data Event) error)
 }
 
@@ -237,52 +241,35 @@ func GetCallId(ctx context.Context) string {
 
 var AbortError = errors.New("abort")
 
-func (t *Tick) Flow(id string) *Flow {
+func (t *TickServer) Flow(id string) *Flow {
 	f := &Flow{
 		Id:    id,
 		tasks: nil,
 	}
 
 	// 注册调度
-	t.scheduler.scheduler(f)
+	t.scheduler.register(f)
 
-	t.Flows[id] = f
+	t.flows[id] = f
 	return f
 }
 
 type Scheduler struct {
-	asyncScheduler AsyncQueenProduct
-	statusStore    StoreProduct
-	t              *Tick
-	//wg *sync.WaitGroup
+	asyncScheduler AsyncQueenFactory
+	statusStore    StoreFactory
 }
 
-func NewScheduler(asyncScheduler AsyncQueenProduct, statusStore StoreProduct, t *Tick) *Scheduler {
-	return &Scheduler{asyncScheduler: asyncScheduler, statusStore: statusStore, t: t}
+func NewScheduler(asyncScheduler AsyncQueenFactory, statusStore StoreFactory) *Scheduler {
+	return &Scheduler{asyncScheduler: asyncScheduler, statusStore: statusStore}
+}
+func (s *Scheduler) Start(ctx context.Context) error {
+	return s.asyncScheduler.Start(ctx)
 }
 
-func (s *Scheduler) scheduler(f *Flow) {
+func (s *Scheduler) register(f *Flow) {
 	aw := s.asyncScheduler.New(f.Id)
-
 	aw.Subscribe(func(ctx context.Context, event Event) error {
-		// 如果返回 error 则需要!!无限重试
-		select {
-		case <-s.t.closeChan:
-			// 重入队列
-			// 注意保证 asyncScheduler 应该优先于 tick 关闭
-			err := aw.Publish(ctx, event, 0)
-			if err != nil {
-				return fmt.Errorf("scheduler event error: %w", err)
-			}
-			return nil
-		default:
-		}
-
-		s.t.wg.Add(1)
-		defer s.t.wg.Done()
-
 		callId := event.CallId
-		//ctx := context.Background()
 		meta := MetaData{}
 		ctx = WithMetaData(ctx, meta)
 
@@ -520,27 +507,30 @@ func randomStr() string {
 	return fmt.Sprintf("%x", b)
 }
 
-func (t *Tick) Trigger(ctx context.Context, flowId string, data MetaData) (string, error) {
-	f := t.Flows[flowId]
-	if f == nil {
-		return "", errors.New("flow not found")
-	}
-
+// Trigger 触发一次流程运行，在服务端和客户端都可以调用。
+func (t *TickServer) Trigger(ctx context.Context, flowId string, data MetaData) (string, error) {
 	return t.scheduler.Trigger(ctx, flowId, data)
 }
 
-func (t *Tick) Start(ctx context.Context) error {
-	var asyncQueueWG sync.WaitGroup
-	asyncQueueWG.Add(1)
+// Trigger 触发一次流程运行，在服务端和客户端都可以调用。
+func (t *TickClient) Trigger(ctx context.Context, flowId string, data MetaData) (string, error) {
+	return t.scheduler.Trigger(ctx, flowId, data)
+}
+
+// StartServer 启动服务，在服务端应该调用此方法开始执行异步任务。
+// 当 ctx 被关闭时，服务也会关闭。
+func (t *TickServer) StartServer(ctx context.Context) error {
+	var schedulerWg sync.WaitGroup
+	schedulerWg.Add(1)
 	go func() {
-		defer asyncQueueWG.Done()
-		err := t.asyncQueen.Start(ctx)
+		defer schedulerWg.Done()
+		err := t.scheduler.Start(ctx)
 		if err != nil {
 			log.Printf("async queen start error: %v", err)
 		}
 	}()
 
-	asyncQueueWG.Wait()
+	schedulerWg.Wait()
 	// 先等待 asyncQueen（消费者）关闭之后才应该关闭 tick。
 	// 因为 tick 会在关闭期间如果收到任务会重新入队，如果消费者没有提前关闭则可能又收到重新入队的任务。
 
@@ -632,20 +622,6 @@ func (m *MockNodeStatusStore) SetMetaData(data MetaData) error {
 	return nil
 }
 
-func NewTickServer(st StoreProduct, ap AsyncQueenProduct) *Tick {
-	t := &Tick{
-		Flows:      map[string]*Flow{},
-		asyncQueen: ap,
-		closeChan:  make(chan bool),
-		closeOnce:  sync.Once{},
-		wg:         sync.WaitGroup{},
-	}
-
-	t.scheduler = NewScheduler(t.asyncQueen, st, t)
-
-	return t
-}
-
 type KvStoreProduct struct {
 	store store.KVStore
 }
@@ -709,7 +685,7 @@ type Options struct {
 	DelayedQueue store.DelayedQueue
 }
 
-func NewTick(p Options) *Tick {
+func NewTickServer(p Options) *TickServer {
 	opt, err := redis.ParseURL(p.RedisURL)
 	if err != nil {
 		panic(err)
@@ -721,49 +697,104 @@ func NewTick(p Options) *Tick {
 		p.DelayedQueue = store.NewAsynq(redisClient)
 	}
 	ap := NewAsyncQueenProduct(p.DelayedQueue)
-	t := NewTickServer(st, ap)
+
+	t := &TickServer{
+		flows:      map[string]*Flow{},
+		asyncQueen: ap,
+		closeChan:  make(chan bool),
+		closeOnce:  sync.Once{},
+		wg:         sync.WaitGroup{},
+		scheduler:  NewScheduler(ap, st),
+	}
+
+	return t
+}
+
+func NewTickClient(p Options) *TickClient {
+	opt, err := redis.ParseURL(p.RedisURL)
+	if err != nil {
+		panic(err)
+	}
+
+	redisClient := redis.NewClient(opt)
+	st := NewKvStoreProduct(store.NewRedisStore(redisClient))
+	if p.DelayedQueue == nil {
+		p.DelayedQueue = store.NewAsynq(redisClient)
+	}
+	ap := NewAsyncQueenProduct(p.DelayedQueue)
+
+	t := &TickClient{
+		scheduler: NewScheduler(ap, st),
+	}
+
 	return t
 }
 
 type DelayedAsyncQueenProduct struct {
-	queen store.DelayedQueue
+	queen     store.DelayedQueue
+	wg        sync.WaitGroup
+	closeChan chan bool
 }
 
-func (a *DelayedAsyncQueenProduct) Start(ctx context.Context) error {
-	return a.queen.Start(ctx)
+func (a *DelayedAsyncQueenProduct) Start(ctx context.Context) (err error) {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err = a.queen.Start(ctx)
+	}()
+
+	wg.Wait()
+
+	close(a.closeChan)
+	// wait for all queen down
+	a.wg.Wait()
+
+	return
 }
 
 func NewAsyncQueenProduct(redis store.DelayedQueue) *DelayedAsyncQueenProduct {
-	return &DelayedAsyncQueenProduct{queen: redis}
+	return &DelayedAsyncQueenProduct{queen: redis, closeChan: make(chan bool)}
 }
 
 func (a *DelayedAsyncQueenProduct) New(key string) AsyncQueen {
-	x := NewDelayedAsyncQueen(a.queen, key)
+	x := NewDelayedAsyncQueen(a.queen, key, &a.wg, a.closeChan)
 	return x
 }
 
 type DelayedAsyncQueen struct {
-	redis store.DelayedQueue
-	key   string
+	redis     store.DelayedQueue
+	key       string
+	wg        *sync.WaitGroup
+	closeChan chan bool
 }
 
 func (a *DelayedAsyncQueen) Publish(ctx context.Context, data Event, delay time.Duration) error {
-	return a.redis.Publish(ctx, a.key, data.CallId, delay)
-}
+	select {
+	case <-a.closeChan:
+		return errors.New("queen closed")
+	default:
+	}
 
-func (a *DelayedAsyncQueen) Exist(uniqueKey []string) (map[string]bool, error) {
-	// return a.redis.Exist(uniqueKey)
-	return nil, nil
+	return a.redis.Publish(ctx, a.key, data.CallId, delay)
 }
 
 func (a *DelayedAsyncQueen) Subscribe(h func(ctx context.Context, data Event) error) {
 	a.redis.Subscribe(a.key, func(ctx context.Context, data string) error {
+		a.wg.Add(1)
+		defer a.wg.Done()
+
 		return h(ctx, Event{CallId: data})
 	})
 }
 
-func NewDelayedAsyncQueen(redis store.DelayedQueue, key string) *DelayedAsyncQueen {
-	return &DelayedAsyncQueen{redis: redis, key: key}
+func NewDelayedAsyncQueen(redis store.DelayedQueue, key string, wg *sync.WaitGroup, closeChan chan bool) *DelayedAsyncQueen {
+	return &DelayedAsyncQueen{
+		redis:     redis,
+		key:       key,
+		wg:        wg,
+		closeChan: closeChan,
+	}
 }
 
 // Sleep means the task is exec success and sleep for d.

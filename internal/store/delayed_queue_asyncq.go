@@ -52,8 +52,6 @@ func (a *Asynq) Publish(ctx context.Context, topic string, data string, delay ti
 
 func (a *Asynq) Subscribe(topic string, h func(ctx context.Context, data string) error) {
 	a.callback[topic] = append(a.callback[topic], func(ctx context.Context, task *asynq.Task) error {
-		//log.Printf("Asynq Receive, taks: %v %s at %s", task.Type(), task.Payload(), time.Now())
-
 		return h(context.TODO(), string(task.Payload()))
 	})
 }
