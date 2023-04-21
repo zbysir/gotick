@@ -56,50 +56,52 @@ func (r *StdRedisDelayedQueue) Subscribe(topic string, h func(ctx context.Contex
 }
 
 func (r *StdRedisDelayedQueue) Start(ctx context.Context) error {
-	r.runOnce.Do(func() {
-		go func() {
-			for {
-				for topic, callback := range r.callbacks {
-					members, err := r.redis.ZRangeByScore(context.Background(), topic, &redis.ZRangeBy{
-						Min:    "",
-						Max:    strconv.FormatInt(time.Now().Unix(), 10),
-						Offset: 0,
-						Count:  100,
-					}).Result()
-					if err != nil {
-						time.Sleep(1 * time.Second)
-						log.Printf("ERROR: %v", err)
-						continue
-					}
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
 
-					for _, v := range members {
-						// 删除成功才能消费
-						i, err := r.redis.ZRem(context.Background(), topic, v).Result()
-						if err != nil {
-							log.Printf("ERROR: %v", err)
-							continue
-						}
-						if i == 0 {
-							continue
-						}
-						for _, c := range callback {
-							if err := c(context.Background(), v); err != nil {
-								log.Printf("callbacks ERROR: %v", err)
-								// 如果执行失败，重新放入队列
-								// TODO 这个操作不是原子性的，可能会导致数据丢失
-								e := r.Publish(context.Background(), topic, v, 0)
-								if e != nil {
-									log.Printf("requeen ERROR: %v", err)
-								}
-							}
+		for topic, callback := range r.callbacks {
+			members, err := r.redis.ZRangeByScore(context.Background(), topic, &redis.ZRangeBy{
+				Min:    "",
+				Max:    strconv.FormatInt(time.Now().Unix(), 10),
+				Offset: 0,
+				Count:  100,
+			}).Result()
+			if err != nil {
+				time.Sleep(1 * time.Second)
+				log.Printf("ERROR: %v", err)
+				continue
+			}
+
+			for _, v := range members {
+				// 删除成功才能消费
+				i, err := r.redis.ZRem(context.Background(), topic, v).Result()
+				if err != nil {
+					log.Printf("ERROR: %v", err)
+					continue
+				}
+				if i == 0 {
+					continue
+				}
+				for _, c := range callback {
+					if err := c(context.Background(), v); err != nil {
+						log.Printf("callbacks ERROR: %v", err)
+						// 如果执行失败，重新放入队列
+						// TODO 这个操作不是原子性的，可能会导致数据丢失
+						e := r.Publish(context.Background(), topic, v, 0)
+						if e != nil {
+							log.Printf("requeue ERROR: %v", err)
 						}
 					}
 				}
-
-				time.Sleep(time.Millisecond * 100)
 			}
-		}()
-	})
+		}
+
+		time.Sleep(time.Millisecond * 100)
+	}
 
 	return nil
 }

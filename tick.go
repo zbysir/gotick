@@ -3,11 +3,13 @@ package gotick
 import (
 	"context"
 	rand2 "crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/go-redis/redis/v8"
 	"github.com/zbysir/gotick/internal/store"
 	"log"
+	"os"
 	"sync"
 	"time"
 )
@@ -40,12 +42,80 @@ func GetMetaData(ctx context.Context) MetaData {
 	return value.(MetaData)
 }
 
-type Task struct {
-	Key  string
-	Func NodeCaller
-	//Options TaskOptions
-	options taskOption
-	//SleepDuration time.Duration
+type Context struct {
+	context.Context
+	CallId string
+	s      NodeStatusStore
+}
+
+func UseStatus[T interface{}](ctx *Context, key string, def T) (T, func(T)) {
+	// 从上下文中获取变量
+	// 如果不存在则创建
+	// 如果存在则返回
+	// 返回一个函数，用于设置变量
+	m, ok, _ := ctx.s.GetMetaData()
+	if ok {
+		if v, ok := m[key]; ok {
+			var t T
+			_ = json.Unmarshal([]byte(v), &t)
+			return t, func(t T) {
+				m, ok, _ := ctx.s.GetMetaData()
+				if !ok {
+					m = make(map[string]string)
+				}
+				bs, _ := json.Marshal(t)
+				m[key] = string(bs)
+				_ = ctx.s.SetMetaData(m)
+			}
+		}
+	}
+
+	setV := func(t T) {
+		m, ok, _ := ctx.s.GetMetaData()
+		if !ok {
+			m = make(map[string]string)
+		}
+		bs, _ := json.Marshal(t)
+		m[key] = string(bs)
+		_ = ctx.s.SetMetaData(m)
+	}
+	setV(def)
+
+	return def, setV
+}
+
+func Task(c *Context, key string, fun func() error) {
+	s, exist, _ := c.s.GetNodeStatus(key)
+	// todo panic error
+
+	if !exist {
+		_ = fun()
+		// TODO retry
+		panic(Done(key))
+	}
+	if s.Status == "retry" {
+		_ = fun()
+		panic(Done(key))
+	}
+}
+
+func Sleep(c *Context, key string, duration time.Duration) {
+	s, exist, _ := c.s.GetNodeStatus(key)
+	// todo panic error
+
+	if !exist {
+		panic(NewSleep(key, duration))
+	}
+
+	if s.Status == "sleep" {
+		d := s.RunAt.Sub(time.Now())
+		if d > 0 {
+			panic(NewSleep(key, d))
+		}
+
+		_ = c.s.SetNodeStatus(key, s.MakeDone())
+		// todo panic error
+	}
 }
 
 type taskOption struct {
@@ -140,25 +210,25 @@ type StoreFactory interface {
 	New(key string) NodeStatusStore
 }
 
-type AsyncQueenFactory interface {
-	New(key string) AsyncQueen
+type AsyncQueueFactory interface {
+	New(key string) AsyncQueue
 	Start(ctx context.Context) error
 }
 
-type SimpleAsyncQueenProduct struct {
+type SimpleAsyncQueueFactory struct {
 }
 
-func (s SimpleAsyncQueenProduct) Start(ctx context.Context) error {
+func (s SimpleAsyncQueueFactory) Start(ctx context.Context) error {
 	return nil
 }
 
-func (s SimpleAsyncQueenProduct) New(key string) AsyncQueen {
-	return &SimpleAsyncQueen{}
+func (s SimpleAsyncQueueFactory) New(key string) AsyncQueue {
+	return &SimpleAsyncQueue{}
 }
 
 type TickServer struct {
 	flows      map[string]*Flow
-	asyncQueen AsyncQueenFactory
+	asyncQueue AsyncQueueFactory
 	closeChan  chan bool
 	closeOnce  sync.Once
 	wg         sync.WaitGroup
@@ -172,11 +242,14 @@ type TickClient struct {
 
 type Flow struct {
 	Id        string
-	tasks     []Task
+	fun       func(ctx *Context) error
 	onFail    func(ctx context.Context, ts TaskStatus) error
 	onSuccess func(ctx context.Context, ts TaskStatus) error
 }
 
+func (f *Flow) DAG() {
+
+}
 func (f *Flow) Success(fun func(ctx context.Context, ts TaskStatus) error) FailAble {
 	f.onSuccess = fun
 	return f
@@ -192,7 +265,7 @@ type Event struct {
 	InitMetaData MetaData // 只有当第一次调度时有效
 }
 
-type AsyncQueen interface {
+type AsyncQueue interface {
 	// Publish 当 uniqueKey 不为空时，后面 Publish 的数据会覆盖前面的数据
 	// uniqueKey 通常为 callId
 	Publish(ctx context.Context, data Event, delay time.Duration) error
@@ -202,6 +275,7 @@ type AsyncQueen interface {
 type NextStatus struct {
 	Status string // abort, sleep
 	RunAt  time.Time
+	Task   string
 }
 
 type ThenAble interface {
@@ -222,11 +296,6 @@ type FailAble interface {
 
 type NodeCaller func(ctx context.Context) (NextStatus, error)
 
-func (f *Flow) Then(key string, c NodeCaller, opts ...TaskOption) ThenAble {
-	f.tasks = append(f.tasks, Task{Key: key, Func: c, options: TaskOptions(opts).build()})
-	return f
-}
-
 func WithCallId(ctx context.Context, callId string) context.Context {
 	return context.WithValue(ctx, "callId", callId)
 }
@@ -241,10 +310,12 @@ func GetCallId(ctx context.Context) string {
 
 var AbortError = errors.New("abort")
 
-func (t *TickServer) Flow(id string) *Flow {
+func (t *TickServer) Flow(id string, fun func(ctx *Context) error) *Flow {
 	f := &Flow{
-		Id:    id,
-		tasks: nil,
+		Id:        id,
+		fun:       fun,
+		onFail:    nil,
+		onSuccess: nil,
 	}
 
 	// 注册调度
@@ -255,12 +326,13 @@ func (t *TickServer) Flow(id string) *Flow {
 }
 
 type Scheduler struct {
-	asyncScheduler AsyncQueenFactory
-	statusStore    StoreFactory
+	asyncScheduler AsyncQueueFactory
+	statusFactory  StoreFactory
+	debug          bool
 }
 
-func NewScheduler(asyncScheduler AsyncQueenFactory, statusStore StoreFactory) *Scheduler {
-	return &Scheduler{asyncScheduler: asyncScheduler, statusStore: statusStore}
+func NewScheduler(asyncScheduler AsyncQueueFactory, statusStore StoreFactory) *Scheduler {
+	return &Scheduler{asyncScheduler: asyncScheduler, statusFactory: statusStore}
 }
 func (s *Scheduler) Start(ctx context.Context) error {
 	return s.asyncScheduler.Start(ctx)
@@ -285,202 +357,85 @@ func (s *Scheduler) register(f *Flow) {
 
 		ctx = WithCallId(ctx, callId)
 
-		statusStore := s.statusStore.New(callId)
+		statusStore := s.statusFactory.New(callId)
 		// 从缓存中拿出上次的运行状态
 		m, _, _ := statusStore.GetMetaData()
 		if m != nil {
 			ctx = WithMetaData(ctx, m)
 		}
 
-		for _, node := range f.tasks {
-			ns, ok, _ := statusStore.GetNodeStatus(node.Key)
-			if ok {
-				if ns.Status == "done" {
-					// 跳过已经执行过的节点
-					continue
-				}
-				if ns.Status == "abort" {
-					// 终止流程
-					status := ns.MakeAbort()
-					err := f.onSuccess(ctx, status)
-					if err != nil {
-						return err
-					}
-					break
+		err := func() error {
+			defer func() {
+				r := recover()
+				if r == nil {
+					return
 				}
 
-			}
+				ns, ok := r.(NextStatus)
+				if !ok {
+					panic(r)
+				}
 
-			// 异步任务
-			if ok && ns.Status == "sleep" {
-				// 等待一定时间，node.SleepDuration
-				d := ns.RunAt.Sub(time.Now())
-				// 还没到时间，重入调度
-				if d > 0 {
-					taskStatus := ns.MakeSleep(time.Now().Add(d))
+				if s.debug {
+					log.Printf("[gotick] %v", ns)
+				}
 
+				switch ns.Status {
+				case "abort":
+				case "sleep":
+					// 进入下次调度
+					now := time.Now()
+					_ = statusStore.SetNodeStatus(ns.Task, TaskStatus{
+						Status:     "sleep",
+						RunAt:      ns.RunAt,
+						Errs:       nil,
+						RetryCount: 0,
+					})
 					err := aw.Publish(ctx, Event{
 						CallId: callId,
-					}, d)
+					}, ns.RunAt.Sub(now))
 					if err != nil {
-						return fmt.Errorf("scheduler event error: %w", err)
+						log.Printf("scheduler event error: %v", err)
 					}
-
-					err = statusStore.SetNodeStatus(node.Key, taskStatus)
-					if err != nil {
-						return fmt.Errorf("save node status error: %w", err)
-					}
-
-					// 终止流程，等待下次调度
-					return nil
-				} else {
-					// 已经过时间了，当成执行成功，进入下一个节点
-					taskStatus := ns.MakeDone()
-					err := statusStore.SetNodeStatus(node.Key, taskStatus)
-					if err != nil {
-						return err
-					}
-
-					continue
-				}
-			}
-
-			// 执行节点
-			nextStatus, funcError := node.Func(ctx)
-			if funcError != nil {
-				// 默认需要重试，如果不需要重试，应该返回 AboutError
-				if errors.Is(funcError, AbortError) {
-					if f.onFail != nil {
-						status := ns.MakeAbort()
-						err := f.onFail(ctx, status)
-						if err != nil {
-							return err
-						}
-						err = statusStore.SetNodeStatus(node.Key, status)
-						if err != nil {
-							return fmt.Errorf("save node status error: %w", err)
-						}
-					}
-
-					return nil
-				} else {
-					// 重试
-					retryd := ns.RetryCount
-					if retryd >= node.options.MaxRetry {
-						// 超过次数，不再重试
-						status := ns.MakeFail(nil)
-						err := f.onFail(ctx, status)
-						if err != nil {
-							return err
-						}
-						err = statusStore.SetNodeStatus(node.Key, status)
-						if err != nil {
-							return fmt.Errorf("save node status error: %w", err)
-						}
-
-						return nil
-					} else {
-						// 重试 下一次调度
-						err := aw.Publish(ctx, Event{
-							CallId: callId,
-						}, time.Duration(retryd+1)*time.Second)
-						if err != nil {
-							return fmt.Errorf("scheduler event error: %w", err)
-						}
-
-						status := ns.MakeRetry(funcError)
-						log.Printf("--- retry --- %v %v %v", retryd, callId, ns)
-						err = statusStore.SetNodeStatus(node.Key, status)
-						if err != nil {
-							return fmt.Errorf("save node status error: %w", err)
-						}
-
-						return nil
-					}
-				}
-			}
-
-			funcError = statusStore.SetMetaData(meta)
-			if funcError != nil {
-				return fmt.Errorf("save meta data error: %w", funcError)
-			}
-
-			switch nextStatus.Status {
-			case "abort":
-				taskStatus := ns.MakeAbort()
-				funcError = statusStore.SetNodeStatus(node.Key, taskStatus)
-				if funcError != nil {
-					return fmt.Errorf("save node status error: %w", funcError)
-				}
-
-				if f.onSuccess != nil {
-					err := f.onSuccess(ctx, taskStatus)
-					if err != nil {
-						return err
-					}
-				}
-
-				// 终止整个流程
-				return nil
-			case "sleep":
-				d := nextStatus.RunAt.Sub(time.Now())
-				if d > 0 {
-					taskStatus := ns.MakeSleep(nextStatus.RunAt)
-					funcError = aw.Publish(ctx, Event{
+				case "done":
+					fallthrough
+				default:
+					_ = statusStore.SetNodeStatus(ns.Task, TaskStatus{
+						Status:     "done",
+						RunAt:      time.Now(),
+						Errs:       nil,
+						RetryCount: 0,
+					})
+					// 进入下次调度
+					err := aw.Publish(ctx, Event{
 						CallId: callId,
-					}, d)
-					if funcError != nil {
-						return fmt.Errorf("scheduler event error: %w", funcError)
-					}
-
-					funcError = statusStore.SetNodeStatus(node.Key, taskStatus)
-					if funcError != nil {
-						return fmt.Errorf("save node status error: %w", funcError)
-					}
-				} else {
-					taskStatus := TaskStatus{
-						Status: "done",
-						RunAt:  time.Time{},
-					}
-					// 已经过时间了，当成执行成功，进入下一个节点
-					err := statusStore.SetNodeStatus(node.Key, taskStatus)
+					}, 0)
 					if err != nil {
-						return fmt.Errorf("save node status error: %w", err)
+						log.Printf("scheduler event error: %v", err)
 					}
-
-					continue
 				}
+			}()
 
-			default:
-				// 默认为 done
-				taskStatus := ns.MakeDone()
-
-				// 默认情况下进入调度循环
-				err := aw.Publish(ctx, Event{
-					CallId: callId,
-				}, 0)
-				if err != nil {
-					return fmt.Errorf("scheduler event error: %w", err)
-				}
-				err = statusStore.SetNodeStatus(node.Key, taskStatus)
-				if err != nil {
-					return fmt.Errorf("save node status error: %w", err)
-				}
-			}
-
-			return nil
+			return f.fun(&Context{
+				Context: ctx,
+				CallId:  callId,
+				s:       statusStore,
+			})
+		}()
+		if err != nil {
+			return err
 		}
-
-		if f.onSuccess != nil {
-			// 如果什么都没做，默认就是完成状态
-			taskStatus := TaskStatus{
-				Status: "done",
-			}
-			err := f.onSuccess(ctx, taskStatus)
-			if err != nil {
-				return err
-			}
-		}
+		//
+		//if f.onSuccess != nil {
+		//	// 如果什么都没做，默认就是完成状态
+		//	taskStatus := TaskStatus{
+		//		Status: "done",
+		//	}
+		//	err := f.onSuccess(ctx, taskStatus)
+		//	if err != nil {
+		//		return err
+		//	}
+		//}
 
 		return nil
 	})
@@ -526,12 +481,12 @@ func (t *TickServer) StartServer(ctx context.Context) error {
 		defer schedulerWg.Done()
 		err := t.scheduler.Start(ctx)
 		if err != nil {
-			log.Printf("async queen start error: %v", err)
+			log.Printf("async queue start error: %v", err)
 		}
 	}()
 
 	schedulerWg.Wait()
-	// 先等待 asyncQueen（消费者）关闭之后才应该关闭 tick。
+	// 先等待 asyncQueue（消费者）关闭之后才应该关闭 tick。
 	// 因为 tick 会在关闭期间如果收到任务会重新入队，如果消费者没有提前关闭则可能又收到重新入队的任务。
 
 	select {
@@ -545,16 +500,16 @@ func (t *TickServer) StartServer(ctx context.Context) error {
 	return nil
 }
 
-// SimpleAsyncQueen 使用 Goroutine 实现的异步队列
+// SimpleAsyncQueue 使用 Goroutine 实现的异步队列
 // 它在重启之后会丢数据，只应该在测试使用。
 // - 使用它可以达到最大定时的精度（毫秒级）
 // - 缺点是可能会占用更多的内容并且重启恢复需要时间。
 // - 所有任务都会在同一个机器上执行，可能导致热点问题。
-type SimpleAsyncQueen struct {
+type SimpleAsyncQueue struct {
 	callback []func(ctx context.Context, s Event) error
 }
 
-func (a *SimpleAsyncQueen) Publish(ctx context.Context, data Event, delay time.Duration) error {
+func (a *SimpleAsyncQueue) Publish(ctx context.Context, data Event, delay time.Duration) error {
 	go func() {
 		time.Sleep(delay)
 		for _, c := range a.callback {
@@ -565,11 +520,11 @@ func (a *SimpleAsyncQueen) Publish(ctx context.Context, data Event, delay time.D
 	return nil
 }
 
-func (a *SimpleAsyncQueen) Subscribe(f func(ctx context.Context, s Event) error) {
+func (a *SimpleAsyncQueue) Subscribe(f func(ctx context.Context, s Event) error) {
 	a.callback = append(a.callback, f)
 }
 
-func (a *SimpleAsyncQueen) Exist(uniqueKey []string) (map[string]bool, error) {
+func (a *SimpleAsyncQueue) Exist(uniqueKey []string) (map[string]bool, error) {
 	return map[string]bool{}, nil
 }
 
@@ -696,16 +651,19 @@ func NewTickServer(p Options) *TickServer {
 	if p.DelayedQueue == nil {
 		p.DelayedQueue = store.NewAsynq(redisClient)
 	}
-	ap := NewAsyncQueenProduct(p.DelayedQueue)
+	ap := NewAsyncQueueFactory(p.DelayedQueue)
+
+	_, debug := os.LookupEnv("GOTICK_DEBUG")
 
 	t := &TickServer{
 		flows:      map[string]*Flow{},
-		asyncQueen: ap,
+		asyncQueue: ap,
 		closeChan:  make(chan bool),
 		closeOnce:  sync.Once{},
 		wg:         sync.WaitGroup{},
 		scheduler:  NewScheduler(ap, st),
 	}
+	t.scheduler.debug = debug
 
 	return t
 }
@@ -721,7 +679,7 @@ func NewTickClient(p Options) *TickClient {
 	if p.DelayedQueue == nil {
 		p.DelayedQueue = store.NewAsynq(redisClient)
 	}
-	ap := NewAsyncQueenProduct(p.DelayedQueue)
+	ap := NewAsyncQueueFactory(p.DelayedQueue)
 
 	t := &TickClient{
 		scheduler: NewScheduler(ap, st),
@@ -730,66 +688,73 @@ func NewTickClient(p Options) *TickClient {
 	return t
 }
 
-type DelayedAsyncQueenProduct struct {
-	queen     store.DelayedQueue
+type DelayedAsyncQueueProduct struct {
+	queue     store.DelayedQueue
 	wg        sync.WaitGroup
 	closeChan chan bool
 }
 
-func (a *DelayedAsyncQueenProduct) Start(ctx context.Context) (err error) {
+func (a *DelayedAsyncQueueProduct) Start(ctx context.Context) (err error) {
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		err = a.queen.Start(ctx)
+		err = a.queue.Start(ctx)
 	}()
 
 	wg.Wait()
 
 	close(a.closeChan)
-	// wait for all queen down
+	// wait for all queue down
 	a.wg.Wait()
 
 	return
 }
 
-func NewAsyncQueenProduct(redis store.DelayedQueue) *DelayedAsyncQueenProduct {
-	return &DelayedAsyncQueenProduct{queen: redis, closeChan: make(chan bool)}
+func NewAsyncQueueFactory(redis store.DelayedQueue) *DelayedAsyncQueueProduct {
+	return &DelayedAsyncQueueProduct{queue: redis, closeChan: make(chan bool)}
 }
 
-func (a *DelayedAsyncQueenProduct) New(key string) AsyncQueen {
-	x := NewDelayedAsyncQueen(a.queen, key, &a.wg, a.closeChan)
+func (a *DelayedAsyncQueueProduct) New(key string) AsyncQueue {
+	x := NewDelayedAsyncQueue(a.queue, key, &a.wg, a.closeChan)
 	return x
 }
 
-type DelayedAsyncQueen struct {
+type DelayedAsyncQueue struct {
 	redis     store.DelayedQueue
 	key       string
 	wg        *sync.WaitGroup
 	closeChan chan bool
 }
 
-func (a *DelayedAsyncQueen) Publish(ctx context.Context, data Event, delay time.Duration) error {
+func (a *DelayedAsyncQueue) Publish(ctx context.Context, data Event, delay time.Duration) error {
 	select {
 	case <-a.closeChan:
-		return errors.New("queen closed")
+		return errors.New("queue closed")
 	default:
 	}
 
 	return a.redis.Publish(ctx, a.key, data.CallId, delay)
 }
 
-func (a *DelayedAsyncQueen) Subscribe(h func(ctx context.Context, data Event) error) {
+func (a *DelayedAsyncQueue) Subscribe(h func(ctx context.Context, data Event) error) {
 	a.redis.Subscribe(a.key, func(ctx context.Context, data string) error {
 		a.wg.Add(1)
 		defer a.wg.Done()
+
+		// 如果已经关闭，则不再处理
+		select {
+		case <-a.closeChan:
+			return errors.New("queue closed")
+		default:
+		}
 
 		return h(ctx, Event{CallId: data})
 	})
 }
 
-func NewDelayedAsyncQueen(redis store.DelayedQueue, key string, wg *sync.WaitGroup, closeChan chan bool) *DelayedAsyncQueen {
-	return &DelayedAsyncQueen{
+func NewDelayedAsyncQueue(redis store.DelayedQueue, key string, wg *sync.WaitGroup, closeChan chan bool) *DelayedAsyncQueue {
+	return &DelayedAsyncQueue{
 		redis:     redis,
 		key:       key,
 		wg:        wg,
@@ -798,12 +763,17 @@ func NewDelayedAsyncQueen(redis store.DelayedQueue, key string, wg *sync.WaitGro
 }
 
 // Sleep means the task is exec success and sleep for d.
-func Sleep(d time.Duration) NextStatus {
-	return NextStatus{Status: "sleep", RunAt: time.Now().Add(d)}
+func NewSleep(task string, d time.Duration) NextStatus {
+	return NextStatus{Task: task, Status: "sleep", RunAt: time.Now().Add(d)}
 }
 
 // Done means the task is exec success
-func Done() NextStatus {
+func Done(task string) NextStatus {
+	return NextStatus{Status: "done", Task: task}
+}
+
+// Done means the task is exec success
+func DoFunc(fun func() error) NextStatus {
 	return NextStatus{Status: "done"}
 }
 
