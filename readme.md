@@ -1,6 +1,8 @@
 # GoTick
 
-方便的编写你的异步任务工作流。
+GoTick is a out-of-the-box workflow engine.
+
+方便的编写你的异步工作流。
 
 > 注意，此项目现在还是 Demo 状态。
 
