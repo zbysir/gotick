@@ -1,8 +1,158 @@
 package example
 
 import (
+	"errors"
+	"github.com/go-redis/redis/v8"
+	"github.com/zbysir/gotick"
+	"github.com/zbysir/gotick/internal/pkg/signal"
+	"github.com/zbysir/gotick/internal/store"
+	"log"
+	"sync"
 	"testing"
+	"time"
 )
+
+func TestFor(t *testing.T) {
+	url := "redis://localhost:6379/0"
+	opt, err := redis.ParseURL(url)
+	if err != nil {
+		panic(err)
+	}
+
+	redisClient := redis.NewClient(opt)
+
+	tick := gotick.NewTickServer(gotick.Options{RedisURL: url, DelayedQueue: store.NewStdRedisDelayedQueue(redisClient)})
+	ctx, c := signal.NewContext()
+	var currentCallId string
+
+	retry := 0
+
+	tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
+		//log.Printf("schedule callId: %v", ctx.CallId)
+		startAt, _ := gotick.UseStatus(ctx, "start_at", time.Now())
+		gotick.Task(ctx, "start", func() error {
+			log.Printf("start at %v", time.Now())
+			return nil
+		})
+
+		// 生成 10 个任务
+		tasks := gotick.UseMemo(ctx, "gen-tasks", func() ([]string, error) {
+			log.Printf("call gen-tasks at %v", time.Now().Sub(startAt))
+			return []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}, nil
+		})
+
+		for _, task := range tasks {
+			gotick.Task(ctx, "send-email"+task, func() error {
+				if task == "f" {
+					// 模拟错误 5 次后成功
+					retry++
+					log.Printf("send email to '%v' error, retrying %v", task, retry)
+					if retry < 5 {
+						return errors.New("err")
+					}
+				}
+				log.Printf("send email to '%v' success at %v", task, time.Now().Sub(startAt))
+				return nil
+			})
+		}
+
+		gotick.Task(ctx, "done", func() error {
+			log.Printf("done at %v", time.Now().Sub(startAt))
+			return nil
+		})
+
+		if ctx.CallId == currentCallId {
+			c()
+		}
+		return nil
+	})
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := tick.StartServer(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	callId, err := tick.Trigger(ctx, "demo/close-order", map[string]string{"name": "bysir"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentCallId = callId
+
+	t.Logf("Triggered callid: %v", callId)
+
+	wg.Wait()
+
+}
+
+func TestSequence(t *testing.T) {
+	url := "redis://localhost:6379/0"
+	opt, err := redis.ParseURL(url)
+	if err != nil {
+		panic(err)
+	}
+
+	redisClient := redis.NewClient(opt)
+
+	tick := gotick.NewTickServer(gotick.Options{RedisURL: url, DelayedQueue: store.NewStdRedisDelayedQueue(redisClient)})
+	ctx, c := signal.NewContext()
+	var currentCallId string
+
+	tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
+		//log.Printf("schedule callId: %v", ctx.CallId)
+		startAt, _ := gotick.UseStatus(ctx, "start_at", time.Now())
+		gotick.Task(ctx, "start", func() error {
+			log.Printf("start at %v", time.Now())
+			return nil
+		})
+
+		// 生成 100 个任务
+		seq := gotick.UseSequence(ctx, "gen-tasks", 100)
+
+		for seq.Next() {
+			gotick.Task(ctx, seq.TaskKey("send-email"), func() error {
+				time.Sleep(1 * time.Second)
+				log.Printf("send email to '%v' at %v", seq.Current, time.Now().Sub(startAt))
+				return nil
+			})
+		}
+
+		gotick.Task(ctx, "done", func() error {
+			log.Printf("done at %v", time.Now().Sub(startAt))
+			return nil
+		})
+
+		if ctx.CallId == currentCallId {
+			c()
+		}
+		return nil
+	})
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := tick.StartServer(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	callId, err := tick.Trigger(ctx, "demo/close-order", map[string]string{"name": "bysir"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentCallId = callId
+
+	t.Logf("Triggered callid: %v", callId)
+
+	wg.Wait()
+
+}
 
 //func TestName(t *testing.T) {
 //	// 链式, 每个方法都只会调用一次

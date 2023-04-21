@@ -6,8 +6,7 @@
 
 灵感来自 [temporal](https://github.com/temporalio/temporal)。
 
-不同于 temporal，gotick 不是一个全栈框架，temporal 大而全，有很多部署与维护成本（和开发成本），
-而 gotick 只依赖于 Redis，部署足够简单。
+不同于 [temporal](https://github.com/temporalio/temporal)，gotick 不是一个全栈框架。temporal 大而全，有部署成本和开发成本，而 gotick 只依赖于 Redis，足够简单方便使用。
 
 ## 特性
 
@@ -43,6 +42,7 @@ func TestTick(t *testing.T) {
 
   tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
     startAt, _ := gotick.UseStatus(ctx, "start_at", time.Now())
+
     gotick.Sleep(ctx, "wait-close", 3*time.Second)
 
     gotick.Task(ctx, "close-order", func() error {
@@ -115,8 +115,8 @@ flowchart TB
   end
 ```
 
-一个简单的例子是睡眠一段时间后打印一段信息：
-```
+在用一个例子简单的说下程序是如何挂起的，这个例子实现了睡眠一段时间后打印一段信息：
+```go
 tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
     startAt, _ := gotick.UseStatus(ctx, "start_at", time.Now())
     gotick.Sleep(ctx, "wait-close", 3*time.Second)
@@ -126,7 +126,7 @@ tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
   })
 ```
 
-在第一次运行时 gotick.Sleep 方法会通过 panic 终止整个流程，然后通过延时任务再次调度整个流程，而第二次运行流程时 gotick.Sleep 方法会执行成功并继续执行后面的语句。
+代码中 gotick.Sleep 方法会将当前任务挂起（当然不是真的 time.Sleep，而是通过 panic 中断运行），然后通过延时任务队列再次调度整个流程。
 
 ## 名词解释
 - TickClient: 客户端，用于触发 Flow
@@ -139,7 +139,7 @@ tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
 ## 计划
 
 - 特性
-  - [x] 使用 Golang 语法控制流 
+  - [x] 使用 Golang 语法控制流程
   - [ ] 支持循环调度
   - [ ] goto 到某一个 task (考虑使用场景中)
   - [ ] 支持设置任务的超时时间，超时后调用 Fail 回调

@@ -100,7 +100,7 @@ func (r *StdRedisDelayedQueue) Start(ctx context.Context) error {
 			}
 		}
 
-		time.Sleep(time.Millisecond * 100)
+		time.Sleep(time.Millisecond * 10)
 	}
 
 	return nil

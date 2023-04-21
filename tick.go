@@ -48,6 +48,71 @@ type Context struct {
 	s      NodeStatusStore
 }
 
+type Sequence struct {
+	Current int
+	max     int
+	name    string
+	ctx     *Context `json:"-"`
+}
+
+func (s *Sequence) TaskKey(prefix string) string {
+	return fmt.Sprintf("%s:%v", prefix, s.Current)
+}
+
+func (s *Sequence) Next() bool {
+	// 存储当前的序列号，而不是下一个
+	md, _, _ := s.ctx.s.GetMetaData()
+	bs, _ := json.Marshal(s)
+	md[s.name] = string(bs)
+	_ = s.ctx.s.SetMetaData(md)
+
+	s.Current += 1
+	if s.max == -1 {
+		return true
+	}
+	return s.Current < s.max
+}
+
+func UseSequence(ctx *Context, key string, maxLen int) Sequence {
+	md, ok, _ := ctx.s.GetMetaData()
+	s, ok := md[key]
+	if !ok {
+		return Sequence{
+			Current: 0,
+			max:     maxLen,
+			name:    key,
+			ctx:     ctx,
+		}
+	}
+
+	seq := Sequence{
+		Current: 0,
+		max:     maxLen,
+		name:    key,
+		ctx:     ctx,
+	}
+	_ = json.Unmarshal([]byte(s), &seq)
+	return seq
+}
+
+func UseMemo[T interface{}](ctx *Context, key string, build func() (T, error)) T {
+	m, exist, _ := ctx.s.GetMetaData()
+	// todo panic error
+	if exist {
+		if v, ok := m[key]; ok {
+			var t T
+			_ = json.Unmarshal([]byte(v), &t)
+			return t
+		}
+	}
+
+	t, _ := build()
+	// todo panic error
+	bs, _ := json.Marshal(t)
+	m[key] = string(bs)
+	_ = ctx.s.SetMetaData(m)
+	return t
+}
 func UseStatus[T interface{}](ctx *Context, key string, def T) (T, func(T)) {
 	// 从上下文中获取变量
 	// 如果不存在则创建
@@ -85,6 +150,26 @@ func UseStatus[T interface{}](ctx *Context, key string, def T) (T, func(T)) {
 }
 
 func Task(c *Context, key string, fun func() error) {
+	s, exist, _ := c.s.GetNodeStatus(key)
+	// todo panic error
+
+	if !exist {
+		err := fun()
+		if err != nil {
+			panic(Retry(key, err))
+		}
+		panic(Done(key))
+	}
+	if s.Status == "retry" {
+		err := fun()
+		if err != nil {
+			panic(Retry(key, err))
+		}
+		panic(Done(key))
+	}
+}
+
+func AB(c *Context, key string, fun func() error) {
 	s, exist, _ := c.s.GetNodeStatus(key)
 	// todo panic error
 
@@ -276,6 +361,7 @@ type NextStatus struct {
 	Status string // abort, sleep
 	RunAt  time.Time
 	Task   string
+	Err    error
 }
 
 type ThenAble interface {
@@ -381,6 +467,16 @@ func (s *Scheduler) register(f *Flow) {
 				}
 
 				switch ns.Status {
+				case "retry":
+					ts, _, _ := statusStore.GetNodeStatus(ns.Task)
+					_ = statusStore.SetNodeStatus(ns.Task, ts.MakeRetry(ns.Err))
+					// 进入下次调度
+					err := aw.Publish(ctx, Event{
+						CallId: callId,
+					}, time.Duration(ts.RetryCount)*time.Second)
+					if err != nil {
+						log.Printf("scheduler event error: %v", err)
+					}
 				case "abort":
 				case "sleep":
 					// 进入下次调度
@@ -780,4 +876,9 @@ func DoFunc(fun func() error) NextStatus {
 // Abort means abort the flow
 func Abort() NextStatus {
 	return NextStatus{Status: "abort"}
+}
+
+// Abort means abort the flow
+func Retry(task string, err error) NextStatus {
+	return NextStatus{Status: "retry", Task: task, Err: err}
 }
