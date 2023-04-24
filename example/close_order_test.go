@@ -27,20 +27,20 @@ func TestCloseOrder(t *testing.T) {
 	tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
 		//log.Printf("schedule callId: %v", ctx.CallId)
 		startAt, _ := gotick.UseStatus(ctx, "start_at", time.Now())
-		gotick.Task(ctx, "start", func() error {
+		gotick.Task(ctx, "start", func(ctx *gotick.TaskContext) error {
 			log.Printf("start at %v", time.Now())
 			return nil
 		})
 		gotick.Sleep(ctx, "wait-email", 1*time.Second)
 
-		gotick.Task(ctx, "send-email", func() error {
+		gotick.Task(ctx, "send-email", func(ctx *gotick.TaskContext) error {
 			log.Printf("send email at %v", time.Now().Sub(startAt))
 			return nil
 		})
 
 		gotick.Sleep(ctx, "wait-close", 3*time.Second)
 
-		gotick.Task(ctx, "close-order", func() error {
+		gotick.Task(ctx, "close-order", func(ctx *gotick.TaskContext) error {
 			log.Printf("close-order at %v", time.Now().Sub(startAt))
 			return nil
 		})

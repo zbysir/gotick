@@ -113,6 +113,46 @@ func UseMemo[T interface{}](ctx *Context, key string, build func() (T, error)) T
 	_ = ctx.s.SetMetaData(m)
 	return t
 }
+
+type ArrayWrap[T interface{}] struct {
+	Val T `json:"val"`
+}
+
+func (a ArrayWrap[T]) Value() (t T) {
+	return a.Val
+}
+
+func (a ArrayWrap[T]) Key(prefix string) string {
+	return fmt.Sprintf("%v:%v", prefix, a.Val)
+}
+
+func UseArray[T interface{}](ctx *Context, key string, build func() ([]T, error)) []ArrayWrap[T] {
+	m, exist, _ := ctx.s.GetMetaData()
+	// todo panic error
+	if exist {
+		if v, ok := m[key]; ok {
+			var t []ArrayWrap[T]
+			err := json.Unmarshal([]byte(v), &t)
+			if err != nil {
+				log.Printf("err: %v", err)
+			}
+			return t
+		}
+	}
+
+	t, _ := build()
+	a := make([]ArrayWrap[T], len(t))
+	for i, v := range t {
+		a[i] = ArrayWrap[T]{
+			Val: v,
+		}
+	}
+	// todo panic error
+	bs, _ := json.Marshal(a)
+	m[key] = string(bs)
+	_ = ctx.s.SetMetaData(m)
+	return a
+}
 func UseStatus[T interface{}](ctx *Context, key string, def T) (T, func(T)) {
 	// 从上下文中获取变量
 	// 如果不存在则创建
@@ -149,20 +189,43 @@ func UseStatus[T interface{}](ctx *Context, key string, def T) (T, func(T)) {
 	return def, setV
 }
 
-func Task(c *Context, key string, fun func() error) {
+type TaskContext struct {
+	*Context
+	Retry int
+}
+
+type TaskFun func(ctx *TaskContext) error
+
+func newTaskContext(c *Context, taskStatus TaskStatus) *TaskContext {
+	return &TaskContext{
+		Context: c,
+		Retry:   taskStatus.RetryCount,
+	}
+}
+
+func Task(c *Context, key string, fun TaskFun, opts ...TaskOption) {
 	s, exist, _ := c.s.GetNodeStatus(key)
 	// todo panic error
 
+	o := TaskOptions(opts).build()
+
+	taskContext := newTaskContext(c, s)
 	if !exist {
-		err := fun()
+		err := fun(taskContext)
 		if err != nil {
+			if s.RetryCount > o.MaxRetry {
+				panic(Fail(key, err))
+			}
 			panic(Retry(key, err))
 		}
 		panic(Done(key))
 	}
 	if s.Status == "retry" {
-		err := fun()
+		err := fun(taskContext)
 		if err != nil {
+			if s.RetryCount > o.MaxRetry {
+				panic(Fail(key, err))
+			}
 			panic(Retry(key, err))
 		}
 		panic(Done(key))
@@ -328,19 +391,19 @@ type TickClient struct {
 type Flow struct {
 	Id        string
 	fun       func(ctx *Context) error
-	onFail    func(ctx context.Context, ts TaskStatus) error
-	onSuccess func(ctx context.Context, ts TaskStatus) error
+	onFail    func(ctx *Context, ts TaskStatus) error
+	onSuccess func(ctx *Context, ts TaskStatus) error
 }
 
 func (f *Flow) DAG() {
 
 }
-func (f *Flow) Success(fun func(ctx context.Context, ts TaskStatus) error) FailAble {
+func (f *Flow) Success(fun func(ctx *Context, ts TaskStatus) error) FailAble {
 	f.onSuccess = fun
 	return f
 }
 
-func (f *Flow) Fail(fun func(ctx context.Context, ts TaskStatus) error) SuccessAble {
+func (f *Flow) Fail(fun func(ctx *Context, ts TaskStatus) error) SuccessAble {
 	f.onFail = fun
 	return f
 }
@@ -358,7 +421,7 @@ type AsyncQueue interface {
 }
 
 type NextStatus struct {
-	Status string // abort, sleep
+	Status string // abort, sleep, retry, done, fail
 	RunAt  time.Time
 	Task   string
 	Err    error
@@ -372,12 +435,12 @@ type ThenAble interface {
 
 type SuccessAble interface {
 	// Success When task exec success, will call this function
-	Success(f func(ctx context.Context, ts TaskStatus) error) FailAble
+	Success(f func(ctx *Context, ts TaskStatus) error) FailAble
 }
 
 type FailAble interface {
 	// Fail When task exec fail, will call this function
-	Fail(f func(ctx context.Context, ts TaskStatus) error) SuccessAble
+	Fail(f func(ctx *Context, ts TaskStatus) error) SuccessAble
 }
 
 type NodeCaller func(ctx context.Context) (NextStatus, error)
@@ -451,6 +514,12 @@ func (s *Scheduler) register(f *Flow) {
 		}
 
 		err := func() error {
+			ctx := &Context{
+				Context: ctx,
+				CallId:  callId,
+				s:       statusStore,
+			}
+
 			defer func() {
 				r := recover()
 				if r == nil {
@@ -478,6 +547,31 @@ func (s *Scheduler) register(f *Flow) {
 						log.Printf("scheduler event error: %v", err)
 					}
 				case "abort":
+					ts, _, _ := statusStore.GetNodeStatus(ns.Task)
+					if f.onFail != nil {
+						err := f.onFail(ctx, TaskStatus{
+							Status:     "abort",
+							RunAt:      time.Now(),
+							Errs:       nil,
+							RetryCount: ts.RetryCount,
+						})
+						if err != nil {
+							panic(err)
+						}
+					}
+				case "fail":
+					ts, _, _ := statusStore.GetNodeStatus(ns.Task)
+					if f.onFail != nil {
+						err := f.onFail(ctx, TaskStatus{
+							Status:     "fail",
+							RunAt:      time.Now(),
+							Errs:       ts.Errs,
+							RetryCount: ts.RetryCount,
+						})
+						if err != nil {
+							panic(err)
+						}
+					}
 				case "sleep":
 					// 进入下次调度
 					now := time.Now()
@@ -512,11 +606,7 @@ func (s *Scheduler) register(f *Flow) {
 				}
 			}()
 
-			return f.fun(&Context{
-				Context: ctx,
-				CallId:  callId,
-				s:       statusStore,
-			})
+			return f.fun(ctx)
 		}()
 		if err != nil {
 			return err
@@ -881,4 +971,9 @@ func Abort() NextStatus {
 // Abort means abort the flow
 func Retry(task string, err error) NextStatus {
 	return NextStatus{Status: "retry", Task: task, Err: err}
+}
+
+// Abort means abort the flow
+func Fail(task string, err error) NextStatus {
+	return NextStatus{Status: "fail", Task: task, Err: err}
 }
