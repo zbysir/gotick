@@ -11,13 +11,20 @@ type KVStore interface {
 	Get(ctx context.Context, key string, r interface{}) (bool, error)
 	Set(ctx context.Context, key string, value interface{}, expiration time.Duration) error
 	HGet(ctx context.Context, table string, key string, r interface{}) (bool, error)
+	HGetAll(ctx context.Context, table string) (map[string]string, bool, error)
 	HSet(ctx context.Context, table string, key string, value interface{}, expiration time.Duration) error
-	HClear(ctx context.Context, table string) error
+	Delete(ctx context.Context, key string) error
 }
+
+var _ KVStore = (*WithPrefix)(nil)
 
 type WithPrefix struct {
 	prefix string
 	store  KVStore
+}
+
+func (w *WithPrefix) HGetAll(ctx context.Context, table string) (map[string]string, bool, error) {
+	return w.store.HGetAll(ctx, w.prefix+table)
 }
 
 func (w *WithPrefix) HGet(ctx context.Context, table string, key string, r interface{}) (bool, error) {
@@ -28,8 +35,8 @@ func (w *WithPrefix) HSet(ctx context.Context, table string, key string, value i
 	return w.store.HSet(ctx, w.prefix+table, key, value, expiration)
 }
 
-func (w *WithPrefix) HClear(ctx context.Context, table string) error {
-	return w.store.HClear(ctx, w.prefix+table)
+func (w *WithPrefix) Delete(ctx context.Context, table string) error {
+	return w.store.Delete(ctx, w.prefix+table)
 }
 
 func (w *WithPrefix) Get(ctx context.Context, key string, r interface{}) (bool, error) {
@@ -67,6 +74,17 @@ func (r *RedisStore) HGet(ctx context.Context, table string, key string, value i
 	}
 	return true, nil
 }
+func (r *RedisStore) HGetAll(ctx context.Context, table string) (map[string]string, bool, error) {
+	val, err := r.redis.HGetAll(ctx, table).Result()
+	if err != nil {
+		if redis.Nil == err {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+
+	return val, true, nil
+}
 
 func (r *RedisStore) HSet(ctx context.Context, table string, key string, value interface{}, expiration time.Duration) error {
 	bs, _ := json.Marshal(value)
@@ -77,7 +95,7 @@ func (r *RedisStore) HSet(ctx context.Context, table string, key string, value i
 	return nil
 }
 
-func (r *RedisStore) HClear(ctx context.Context, table string) error {
+func (r *RedisStore) Delete(ctx context.Context, table string) error {
 	err := r.redis.Del(ctx, table).Err()
 	if err != nil {
 		return err

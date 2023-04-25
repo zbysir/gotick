@@ -149,4 +149,6 @@ tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
 
 - UI
   - 可视化流程，可视化任务状态，统计次数 （通过节点的方式）
+    - 可参考 https://visualgo.net/zh 中的"网络流" 
+    - https://algorithm-visualizer.org/branch-and-bound/binary-search-tree
   - 查看每个节点的执行结果

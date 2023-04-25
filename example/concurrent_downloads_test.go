@@ -31,7 +31,9 @@ func TestFor(t *testing.T) {
 
 	tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
 		//log.Printf("schedule callId: %v", ctx.CallId)
-		startAt, _ := gotick.UseStatus(ctx, "start_at", time.Now())
+		startAt := gotick.UseMemo(ctx, "start_at", func() (time.Time, error) {
+			return time.Now(), nil
+		})
 		gotick.Task(ctx, "start", func(ctx *gotick.TaskContext) error {
 			log.Printf("[%v] start at %v", ctx.CallId, time.Now())
 			return nil
@@ -112,7 +114,9 @@ func TestSequence(t *testing.T) {
 
 	tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
 		//log.Printf("schedule callId: %v", ctx.CallId)
-		startAt, _ := gotick.UseStatus(ctx, "start_at", time.Now())
+		startAt := gotick.UseMemo(ctx, "start_at", func() (time.Time, error) {
+			return time.Now(), nil
+		})
 		gotick.Task(ctx, "start", func(ctx *gotick.TaskContext) error {
 			log.Printf("start at %v", time.Now())
 			return nil

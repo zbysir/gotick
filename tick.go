@@ -7,45 +7,46 @@ import (
 	"errors"
 	"fmt"
 	"github.com/go-redis/redis/v8"
+	"github.com/zbysir/gotick/internal/pkg/flow"
 	"github.com/zbysir/gotick/internal/store"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
 
-func Store(ctx context.Context, k string, v string) {
-	_ = WithMetaData(ctx, MetaData{
-		k: v,
-	})
-}
-
 type MetaData map[string]string
-
-func WithMetaData(ctx context.Context, meta MetaData) context.Context {
-	o := GetMetaData(ctx)
-	if o == nil {
-		return context.WithValue(ctx, "meta", meta)
-	}
-
-	for k, v := range meta {
-		o[k] = v
-	}
-	return ctx
-}
-
-func GetMetaData(ctx context.Context) MetaData {
-	value := ctx.Value("meta")
-	if value == nil {
-		return nil
-	}
-	return value.(MetaData)
-}
 
 type Context struct {
 	context.Context
-	CallId string
-	s      NodeStatusStore
+	CallId  string
+	store   NodeStatusStore
+	collect func(typ string, key string) bool // 预运行来生成 flow 图
+}
+
+func (c *Context) MetaDataAll() MetaData {
+	m, err := c.store.GetMetaDataAll()
+	if err != nil {
+		panic(err)
+	}
+	return m
+}
+
+func (c *Context) SetMetaData(k, v string) {
+	err := c.store.SetMetaData(k, v)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func (c *Context) MetaData(k string) (string, bool) {
+	v, ok, err := c.store.GetMetaData(k)
+	if err != nil {
+		panic(err)
+	}
+
+	return v, ok
 }
 
 type Sequence struct {
@@ -61,10 +62,8 @@ func (s *Sequence) TaskKey(prefix string) string {
 
 func (s *Sequence) Next() bool {
 	// 存储当前的序列号，而不是下一个
-	md, _, _ := s.ctx.s.GetMetaData()
 	bs, _ := json.Marshal(s)
-	md[s.name] = string(bs)
-	_ = s.ctx.s.SetMetaData(md)
+	_ = s.ctx.store.SetMetaData(s.name, string(bs))
 
 	s.Current += 1
 	if s.max == -1 {
@@ -74,8 +73,7 @@ func (s *Sequence) Next() bool {
 }
 
 func UseSequence(ctx *Context, key string, maxLen int) Sequence {
-	md, ok, _ := ctx.s.GetMetaData()
-	s, ok := md[key]
+	s, ok, _ := ctx.store.GetMetaData(key)
 	if !ok {
 		return Sequence{
 			Current: 0,
@@ -96,26 +94,25 @@ func UseSequence(ctx *Context, key string, maxLen int) Sequence {
 }
 
 func UseMemo[T interface{}](ctx *Context, key string, build func() (T, error)) T {
-	m, exist, _ := ctx.s.GetMetaData()
+	v, exist, _ := ctx.store.GetMetaData(key)
 	// todo panic error
 	if exist {
-		if v, ok := m[key]; ok {
-			var t T
-			_ = json.Unmarshal([]byte(v), &t)
-			return t
-		}
+		var t T
+		_ = json.Unmarshal([]byte(v), &t)
+		return t
 	}
 
 	t, _ := build()
 	// todo panic error
 	bs, _ := json.Marshal(t)
-	m[key] = string(bs)
-	_ = ctx.s.SetMetaData(m)
+	_ = ctx.store.SetMetaData(key, string(bs))
 	return t
 }
 
 type ArrayWrap[T interface{}] struct {
-	Val T `json:"val"`
+	ProductKey string `json:"product_key"`
+	Val        T      `json:"val"`
+	Index      int    `json:"index"`
 }
 
 func (a ArrayWrap[T]) Value() (t T) {
@@ -123,71 +120,86 @@ func (a ArrayWrap[T]) Value() (t T) {
 }
 
 func (a ArrayWrap[T]) Key(prefix string) string {
-	return fmt.Sprintf("%v:%v", prefix, a.Val)
+	// /@/ 表示子集
+	return fmt.Sprintf("%v/@/%v:%v", a.ProductKey, prefix, a.Val)
 }
 
 func UseArray[T interface{}](ctx *Context, key string, build func() ([]T, error)) []ArrayWrap[T] {
-	m, exist, _ := ctx.s.GetMetaData()
+	if ctx.collect != nil {
+		end := ctx.collect("array", key)
+		if end {
+			var t T
+			return []ArrayWrap[T]{
+				{
+					ProductKey: key,
+					Val:        t,
+					Index:      0,
+				},
+			}
+		}
+	}
+	v, exist, _ := ctx.store.GetMetaData(key)
 	// todo panic error
 	if exist {
-		if v, ok := m[key]; ok {
-			var t []ArrayWrap[T]
-			err := json.Unmarshal([]byte(v), &t)
-			if err != nil {
-				log.Printf("err: %v", err)
-			}
-			return t
+		var t []ArrayWrap[T]
+		err := json.Unmarshal([]byte(v), &t)
+		if err != nil {
+			log.Printf("err: %v", err)
 		}
+		return t
 	}
 
 	t, _ := build()
 	a := make([]ArrayWrap[T], len(t))
 	for i, v := range t {
 		a[i] = ArrayWrap[T]{
-			Val: v,
+			ProductKey: key,
+			Val:        v,
+			Index:      i,
 		}
 	}
 	// todo panic error
 	bs, _ := json.Marshal(a)
-	m[key] = string(bs)
-	_ = ctx.s.SetMetaData(m)
+	_ = ctx.store.SetMetaData(key, string(bs))
 	return a
 }
-func UseStatus[T interface{}](ctx *Context, key string, def T) (T, func(T)) {
-	// 从上下文中获取变量
-	// 如果不存在则创建
-	// 如果存在则返回
-	// 返回一个函数，用于设置变量
-	m, ok, _ := ctx.s.GetMetaData()
-	if ok {
-		if v, ok := m[key]; ok {
-			var t T
-			_ = json.Unmarshal([]byte(v), &t)
-			return t, func(t T) {
-				m, ok, _ := ctx.s.GetMetaData()
-				if !ok {
-					m = make(map[string]string)
-				}
-				bs, _ := json.Marshal(t)
-				m[key] = string(bs)
-				_ = ctx.s.SetMetaData(m)
-			}
-		}
-	}
 
-	setV := func(t T) {
-		m, ok, _ := ctx.s.GetMetaData()
-		if !ok {
-			m = make(map[string]string)
-		}
-		bs, _ := json.Marshal(t)
-		m[key] = string(bs)
-		_ = ctx.s.SetMetaData(m)
-	}
-	setV(def)
-
-	return def, setV
-}
+//
+//func UseStatus[T interface{}](ctx *Context, key string, def T) (T, func(T)) {
+//	// 从上下文中获取变量
+//	// 如果不存在则创建
+//	// 如果存在则返回
+//	// 返回一个函数，用于设置变量
+//	m, ok, _ := ctx.store.GetMetaData()
+//	if ok {
+//		if v, ok := m[key]; ok {
+//			var t T
+//			_ = json.Unmarshal([]byte(v), &t)
+//			return t, func(t T) {
+//				m, ok, _ := ctx.store.GetMetaData()
+//				if !ok {
+//					m = make(map[string]string)
+//				}
+//				bs, _ := json.Marshal(t)
+//				m[key] = string(bs)
+//				_ = ctx.store.SetMetaData(m)
+//			}
+//		}
+//	}
+//
+//	setV := func(t T) {
+//		m, ok, _ := ctx.store.GetMetaData()
+//		if !ok {
+//			m = make(map[string]string)
+//		}
+//		bs, _ := json.Marshal(t)
+//		m[key] = string(bs)
+//		_ = ctx.store.SetMetaData(m)
+//	}
+//	setV(def)
+//
+//	return def, setV
+//}
 
 type TaskContext struct {
 	*Context
@@ -204,7 +216,13 @@ func newTaskContext(c *Context, taskStatus TaskStatus) *TaskContext {
 }
 
 func Task(c *Context, key string, fun TaskFun, opts ...TaskOption) {
-	s, exist, _ := c.s.GetNodeStatus(key)
+	if c.collect != nil {
+		if c.collect("task", key) {
+			return
+		}
+	}
+
+	s, exist, _ := c.store.GetNodeStatus(key)
 	// todo panic error
 
 	o := TaskOptions(opts).build()
@@ -233,7 +251,7 @@ func Task(c *Context, key string, fun TaskFun, opts ...TaskOption) {
 }
 
 func AB(c *Context, key string, fun func() error) {
-	s, exist, _ := c.s.GetNodeStatus(key)
+	s, exist, _ := c.store.GetNodeStatus(key)
 	// todo panic error
 
 	if !exist {
@@ -248,7 +266,12 @@ func AB(c *Context, key string, fun func() error) {
 }
 
 func Sleep(c *Context, key string, duration time.Duration) {
-	s, exist, _ := c.s.GetNodeStatus(key)
+	if c.collect != nil {
+		if c.collect("sleep", key) {
+			return
+		}
+	}
+	s, exist, _ := c.store.GetNodeStatus(key)
 	// todo panic error
 
 	if !exist {
@@ -261,7 +284,7 @@ func Sleep(c *Context, key string, duration time.Duration) {
 			panic(NewSleep(key, d))
 		}
 
-		_ = c.s.SetNodeStatus(key, s.MakeDone())
+		_ = c.store.SetNodeStatus(key, s.MakeDone())
 		// todo panic error
 	}
 }
@@ -349,10 +372,13 @@ func (t TaskStatus) MakeRetry(err error) TaskStatus {
 type NodeStatusStore interface {
 	GetNodeStatus(key string) (TaskStatus, bool, error)
 	SetNodeStatus(key string, value TaskStatus) error
-	GetMetaData() (MetaData, bool, error)
-	SetMetaData(MetaData) error
+	GetMetaDataAll() (MetaData, error)
+	SetMetaData(k string, v string) error
+	GetMetaData(k string) (string, bool, error)
 	Clear() error // 删除所有数据
 }
+
+var _ NodeStatusStore = (*KvNodeStatusStore)(nil)
 
 type StoreFactory interface {
 	New(key string) NodeStatusStore
@@ -361,17 +387,6 @@ type StoreFactory interface {
 type AsyncQueueFactory interface {
 	New(key string) AsyncQueue
 	Start(ctx context.Context) error
-}
-
-type SimpleAsyncQueueFactory struct {
-}
-
-func (s SimpleAsyncQueueFactory) Start(ctx context.Context) error {
-	return nil
-}
-
-func (s SimpleAsyncQueueFactory) New(key string) AsyncQueue {
-	return &SimpleAsyncQueue{}
 }
 
 type TickServer struct {
@@ -395,9 +410,85 @@ type Flow struct {
 	onSuccess func(ctx *Context, ts TaskStatus) error
 }
 
-func (f *Flow) DAG() {
+// DAG 生成一个数据流图
+// 可以使用 reactflow 绘制。
+func (f *Flow) DAG() (flow.DAG, error) {
+	dag := flow.DAG{}
 
+	err := f.fun(&Context{
+		Context: nil,
+		CallId:  "dag",
+		store:   nil,
+		collect: func(typ string, key string) bool {
+			ks := strings.Split(key, "/@/")
+
+			var parent string
+			if len(ks) > 1 {
+				parent = ks[len(ks)-2]
+				key = ks[len(ks)-1]
+			}
+
+			var node flow.Node
+			switch typ {
+			case "task":
+				node = flow.Node{
+					Id: key,
+					Data: flow.NodeData{
+						Label: fmt.Sprintf("[task] %s", key),
+						Data: map[string]interface{}{
+							"type": typ,
+						},
+					},
+					ParentNode: parent,
+				}
+			case "sleep":
+				node = flow.Node{
+					Id: key,
+					Data: flow.NodeData{
+						Label: fmt.Sprintf("[sleep] %s", key),
+						Data: map[string]interface{}{
+							"type": typ,
+						},
+					},
+				}
+			case "array":
+				node = flow.Node{
+					Id: key,
+					Data: flow.NodeData{
+						Label: fmt.Sprintf("[array] %s", key),
+						Data: map[string]interface{}{
+							"type": typ,
+						},
+					},
+				}
+			}
+
+			dag.AppendNode(node, parent)
+
+			// 连接上一个节点
+			if len(dag.Nodes) > 1 {
+				//l:=len(dag.Nodes)
+				//sourceId := dag.GetNodeByIndex(l-2).Id
+				//targetId := nodes[len(nodes)-1].Id
+				//edge = append(edge, flow.Edge{
+				//	Id:        fmt.Sprintf("%s--%s", sourceId, targetId),
+				//	Source:    sourceId,
+				//	Target:    targetId,
+				//	MarkerEnd: flow.Marker{Type: "arrow"},
+				//	Animated:  false,
+				//	Label:     "",
+				//	Data:      nil,
+				//	Style:     nil,
+				//})
+			}
+
+			return true
+		},
+	})
+
+	return dag, err
 }
+
 func (f *Flow) Success(fun func(ctx *Context, ts TaskStatus) error) FailAble {
 	f.onSuccess = fun
 	return f
@@ -471,6 +562,7 @@ func (t *TickServer) Flow(id string, fun func(ctx *Context) error) *Flow {
 	t.scheduler.register(f)
 
 	t.flows[id] = f
+
 	return f
 }
 
@@ -491,33 +583,26 @@ func (s *Scheduler) register(f *Flow) {
 	aw := s.asyncScheduler.New(f.Id)
 	aw.Subscribe(func(ctx context.Context, event Event) error {
 		callId := event.CallId
-		meta := MetaData{}
-		ctx = WithMetaData(ctx, meta)
-
-		// 如果是第一次调度，则需要生成 callId 用于存储调用状态
-		if callId == "" {
-			// 拼装上额外的 data
-			if event.InitMetaData != nil {
-				ctx = WithMetaData(ctx, event.InitMetaData)
-			}
-
-			callId = randomStr()
-		}
-
 		ctx = WithCallId(ctx, callId)
 
 		statusStore := s.statusFactory.New(callId)
-		// 从缓存中拿出上次的运行状态
-		m, _, _ := statusStore.GetMetaData()
-		if m != nil {
-			ctx = WithMetaData(ctx, m)
+
+		if event.InitMetaData != nil {
+			for k, v := range event.InitMetaData {
+				_ = statusStore.SetMetaData(k, v)
+			}
 		}
+		// 从缓存中拿出上次的运行状态
+		//m, _, := statusStore.GetMetaDataAll()
+		//if m != nil {
+		//	ctx = WithMetaData(ctx, m)
+		//}
 
 		err := func() error {
 			ctx := &Context{
 				Context: ctx,
 				CallId:  callId,
-				s:       statusStore,
+				store:   statusStore,
 			}
 
 			defer func() {
@@ -686,83 +771,6 @@ func (t *TickServer) StartServer(ctx context.Context) error {
 	return nil
 }
 
-// SimpleAsyncQueue 使用 Goroutine 实现的异步队列
-// 它在重启之后会丢数据，只应该在测试使用。
-// - 使用它可以达到最大定时的精度（毫秒级）
-// - 缺点是可能会占用更多的内容并且重启恢复需要时间。
-// - 所有任务都会在同一个机器上执行，可能导致热点问题。
-type SimpleAsyncQueue struct {
-	callback []func(ctx context.Context, s Event) error
-}
-
-func (a *SimpleAsyncQueue) Publish(ctx context.Context, data Event, delay time.Duration) error {
-	go func() {
-		time.Sleep(delay)
-		for _, c := range a.callback {
-			c(ctx, data)
-		}
-	}()
-
-	return nil
-}
-
-func (a *SimpleAsyncQueue) Subscribe(f func(ctx context.Context, s Event) error) {
-	a.callback = append(a.callback, f)
-}
-
-func (a *SimpleAsyncQueue) Exist(uniqueKey []string) (map[string]bool, error) {
-	return map[string]bool{}, nil
-}
-
-type MockNodeStatusStoreProduct struct {
-	m map[string]NodeStatusStore
-}
-
-func (n *MockNodeStatusStoreProduct) New(key string) NodeStatusStore {
-	if n.m == nil {
-		n.m = make(map[string]NodeStatusStore)
-	}
-	if n.m[key] == nil {
-		n.m[key] = &MockNodeStatusStore{m: make(map[string]interface{})}
-	}
-	return n.m[key]
-}
-
-type MockNodeStatusStore struct {
-	m map[string]interface{}
-}
-
-func (m *MockNodeStatusStore) Clear() error {
-	m.m = make(map[string]interface{})
-	return nil
-}
-
-func (m *MockNodeStatusStore) GetNodeStatus(key string) (TaskStatus, bool, error) {
-	i, ok := m.m[key]
-	if !ok {
-		return TaskStatus{}, false, nil
-	}
-	return i.(TaskStatus), true, nil
-}
-
-func (m *MockNodeStatusStore) SetNodeStatus(key string, value TaskStatus) error {
-	m.m[key] = value
-	return nil
-}
-
-func (m *MockNodeStatusStore) GetMetaData() (MetaData, bool, error) {
-	i, ok := m.m["meta"]
-	if !ok {
-		return nil, false, nil
-	}
-	return i.(MetaData), true, nil
-}
-
-func (m *MockNodeStatusStore) SetMetaData(data MetaData) error {
-	m.m["meta"] = data
-	return nil
-}
-
 type KvStoreProduct struct {
 	store store.KVStore
 }
@@ -777,20 +785,38 @@ func (s KvStoreProduct) New(key string) NodeStatusStore {
 
 type KvNodeStatusStore struct {
 	store store.KVStore
-	table string
+	key   string
+}
+
+func (n *KvNodeStatusStore) metaKey() string {
+	return n.key + "_meta"
+}
+
+func (n *KvNodeStatusStore) statusKey() string {
+	return n.key + "_status"
 }
 
 func (n *KvNodeStatusStore) Clear() error {
-	return n.store.HClear(context.Background(), n.table)
+	err := n.store.Delete(context.Background(), n.metaKey())
+	if err != nil {
+		return err
+	}
+
+	err = n.store.Delete(context.Background(), n.statusKey())
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
-func NewKvNodeStatusStore(store store.KVStore, table string) *KvNodeStatusStore {
-	return &KvNodeStatusStore{store: store, table: table}
+func NewKvNodeStatusStore(store store.KVStore, key string) *KvNodeStatusStore {
+	return &KvNodeStatusStore{store: store, key: key}
 }
 
 func (n *KvNodeStatusStore) GetNodeStatus(key string) (TaskStatus, bool, error) {
 	status := TaskStatus{}
-	exist, err := n.store.HGet(context.Background(), n.table, key, &status)
+	exist, err := n.store.HGet(context.Background(), n.statusKey(), key, &status)
 	if err != nil {
 		return status, false, err
 	}
@@ -802,43 +828,65 @@ func (n *KvNodeStatusStore) GetNodeStatus(key string) (TaskStatus, bool, error) 
 }
 
 func (n *KvNodeStatusStore) SetNodeStatus(key string, value TaskStatus) error {
-	return n.store.HSet(context.Background(), n.table, key, value, 0)
+	return n.store.HSet(context.Background(), n.statusKey(), key, value, 0)
 }
 
-func (n *KvNodeStatusStore) GetMetaData() (MetaData, bool, error) {
-	md := MetaData{}
-	exist, err := n.store.HGet(context.Background(), n.table, "__meta", &md)
+func (n *KvNodeStatusStore) GetMetaDataAll() (MetaData, error) {
+	v, exist, err := n.store.HGetAll(context.Background(), n.metaKey())
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	if !exist {
-		return nil, false, nil
+		return nil, nil
 	}
-	return md, true, nil
+	return v, nil
 }
 
-func (n *KvNodeStatusStore) SetMetaData(data MetaData) error {
-	return n.store.HSet(context.Background(), n.table, "__meta", data, 0)
+func (n *KvNodeStatusStore) GetMetaData(k string) (string, bool, error) {
+	var v string
+	exist, err := n.store.HGet(context.Background(), n.metaKey(), k, &v)
+	if err != nil {
+		return "", false, err
+	}
+	if !exist {
+		return "", false, nil
+	}
+	return v, true, nil
+}
+
+func (n *KvNodeStatusStore) SetMetaData(k, v string) error {
+	return n.store.HSet(context.Background(), n.metaKey(), k, v, 0)
 }
 
 type Options struct {
 	RedisURL     string // "redis://<user>:<pass>@localhost:6379/<db>"
 	DelayedQueue store.DelayedQueue
+	KvStore      store.KVStore
 }
 
 func NewTickServer(p Options) *TickServer {
-	opt, err := redis.ParseURL(p.RedisURL)
-	if err != nil {
-		panic(err)
-	}
 
-	redisClient := redis.NewClient(opt)
-	st := NewKvStoreProduct(store.NewRedisStore(redisClient))
 	if p.DelayedQueue == nil {
+		opt, err := redis.ParseURL(p.RedisURL)
+		if err != nil {
+			panic(err)
+		}
+
+		redisClient := redis.NewClient(opt)
 		p.DelayedQueue = store.NewAsynq(redisClient)
 	}
-	ap := NewAsyncQueueFactory(p.DelayedQueue)
+	if p.KvStore == nil {
+		opt, err := redis.ParseURL(p.RedisURL)
+		if err != nil {
+			panic(err)
+		}
 
+		redisClient := redis.NewClient(opt)
+		p.KvStore = store.NewRedisStore(redisClient)
+	}
+
+	ap := NewAsyncQueueFactory(p.DelayedQueue)
+	st := NewKvStoreProduct(p.KvStore)
 	_, debug := os.LookupEnv("GOTICK_DEBUG")
 
 	t := &TickServer{
@@ -920,7 +968,9 @@ func (a *DelayedAsyncQueue) Publish(ctx context.Context, data Event, delay time.
 	default:
 	}
 
-	return a.redis.Publish(ctx, a.key, data.CallId, delay)
+	bs, _ := json.Marshal(data)
+
+	return a.redis.Publish(ctx, a.key, string(bs), delay)
 }
 
 func (a *DelayedAsyncQueue) Subscribe(h func(ctx context.Context, data Event) error) {
@@ -935,7 +985,10 @@ func (a *DelayedAsyncQueue) Subscribe(h func(ctx context.Context, data Event) er
 		default:
 		}
 
-		return h(ctx, Event{CallId: data})
+		var ev Event
+		json.Unmarshal([]byte(data), &ev)
+
+		return h(ctx, ev)
 	})
 }
 

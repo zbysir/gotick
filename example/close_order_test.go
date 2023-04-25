@@ -1,7 +1,6 @@
 package example
 
 import (
-	"github.com/go-redis/redis/v8"
 	"github.com/zbysir/gotick"
 	"github.com/zbysir/gotick/internal/pkg/signal"
 	"github.com/zbysir/gotick/internal/store"
@@ -12,21 +11,16 @@ import (
 )
 
 func TestCloseOrder(t *testing.T) {
-	url := "redis://localhost:6379/0"
-	opt, err := redis.ParseURL(url)
-	if err != nil {
-		panic(err)
-	}
 
-	redisClient := redis.NewClient(opt)
-
-	tick := gotick.NewTickServer(gotick.Options{RedisURL: url, DelayedQueue: store.NewStdRedisDelayedQueue(redisClient)})
+	tick := gotick.NewTickServer(gotick.Options{KvStore: store.NewMockNodeStatusStore(), DelayedQueue: store.NewMockRedisDelayedQueue()})
 	ctx, c := signal.NewContext()
 	var currentCallId string
 
 	tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
 		//log.Printf("schedule callId: %v", ctx.CallId)
-		startAt, _ := gotick.UseStatus(ctx, "start_at", time.Now())
+		startAt := gotick.UseMemo(ctx, "start_at", func() (time.Time, error) {
+			return time.Now(), nil
+		})
 		gotick.Task(ctx, "start", func(ctx *gotick.TaskContext) error {
 			log.Printf("start at %v", time.Now())
 			return nil
@@ -34,7 +28,7 @@ func TestCloseOrder(t *testing.T) {
 		gotick.Sleep(ctx, "wait-email", 1*time.Second)
 
 		gotick.Task(ctx, "send-email", func(ctx *gotick.TaskContext) error {
-			log.Printf("send email at %v", time.Now().Sub(startAt))
+			log.Printf("send email at %v {%v}", time.Now().Sub(startAt), ctx.MetaDataAll())
 			return nil
 		})
 
