@@ -26,22 +26,31 @@ type Context struct {
 }
 
 func (c *Context) MetaDataAll() MetaData {
-	m, err := c.store.GetMetaDataAll()
+	m, err := c.store.GetKVAll()
 	if err != nil {
 		panic(err)
 	}
-	return m
+
+	meta := MetaData{}
+	for k, v := range m {
+		if strings.HasPrefix(k, "__") {
+			continue
+		}
+		meta[k] = v
+	}
+
+	return meta
 }
 
 func (c *Context) SetMetaData(k, v string) {
-	err := c.store.SetMetaData(k, v)
+	err := c.store.SetKV(k, v)
 	if err != nil {
 		panic(err)
 	}
 }
 
 func (c *Context) MetaData(k string) (string, bool) {
-	v, ok, err := c.store.GetMetaData(k)
+	v, ok, err := c.store.GetKV(k)
 	if err != nil {
 		panic(err)
 	}
@@ -63,7 +72,7 @@ func (s *Sequence) TaskKey(prefix string) string {
 func (s *Sequence) Next() bool {
 	// 存储当前的序列号，而不是下一个
 	bs, _ := json.Marshal(s)
-	_ = s.ctx.store.SetMetaData(s.name, string(bs))
+	_ = s.ctx.store.SetKV(s.name, string(bs))
 
 	s.Current += 1
 	if s.max == -1 {
@@ -72,40 +81,55 @@ func (s *Sequence) Next() bool {
 	return s.Current < s.max
 }
 
+func GetFromStore[T interface{}](s NodeStatusStore, key string) (T, bool, error) {
+	var t T
+	v, ok, err := s.GetKV("__" + key)
+	if err != nil {
+		return t, false, err
+	}
+	if !ok {
+		return t, false, nil
+	}
+	err = json.Unmarshal([]byte(v), &t)
+	if err != nil {
+		return t, false, err
+	}
+	return t, true, nil
+}
+
+func SetToStore[T interface{}](s NodeStatusStore, key string, t T) error {
+	bs, _ := json.Marshal(t)
+	err := s.SetKV("__"+key, string(bs))
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 func UseSequence(ctx *Context, key string, maxLen int) Sequence {
-	s, ok, _ := ctx.store.GetMetaData(key)
+	key = fmt.Sprintf("__%v", key)
+	s, ok, _ := GetFromStore[Sequence](ctx.store, key)
 	if !ok {
 		return Sequence{
-			Current: 0,
+			Current: -1, // skip first next()
 			max:     maxLen,
 			name:    key,
 			ctx:     ctx,
 		}
 	}
 
-	seq := Sequence{
-		Current: 0,
-		max:     maxLen,
-		name:    key,
-		ctx:     ctx,
-	}
-	_ = json.Unmarshal([]byte(s), &seq)
-	return seq
+	return s
 }
 
 func UseMemo[T interface{}](ctx *Context, key string, build func() (T, error)) T {
-	v, exist, _ := ctx.store.GetMetaData(key)
-	// todo panic error
+	key = fmt.Sprintf("__%v", key)
+	v, exist, _ := GetFromStore[T](ctx.store, key)
 	if exist {
-		var t T
-		_ = json.Unmarshal([]byte(v), &t)
-		return t
+		return v
 	}
 
 	t, _ := build()
-	// todo panic error
-	bs, _ := json.Marshal(t)
-	_ = ctx.store.SetMetaData(key, string(bs))
+	_ = SetToStore(ctx.store, key, t)
 	return t
 }
 
@@ -138,15 +162,11 @@ func UseArray[T interface{}](ctx *Context, key string, build func() ([]T, error)
 			}
 		}
 	}
-	v, exist, _ := ctx.store.GetMetaData(key)
+
+	v, exist, _ := GetFromStore[[]ArrayWrap[T]](ctx.store, key)
 	// todo panic error
 	if exist {
-		var t []ArrayWrap[T]
-		err := json.Unmarshal([]byte(v), &t)
-		if err != nil {
-			log.Printf("err: %v", err)
-		}
-		return t
+		return v
 	}
 
 	t, _ := build()
@@ -158,9 +178,7 @@ func UseArray[T interface{}](ctx *Context, key string, build func() ([]T, error)
 			Index:      i,
 		}
 	}
-	// todo panic error
-	bs, _ := json.Marshal(a)
-	_ = ctx.store.SetMetaData(key, string(bs))
+	_ = SetToStore(ctx.store, key, a)
 	return a
 }
 
@@ -170,31 +188,31 @@ func UseArray[T interface{}](ctx *Context, key string, build func() ([]T, error)
 //	// 如果不存在则创建
 //	// 如果存在则返回
 //	// 返回一个函数，用于设置变量
-//	m, ok, _ := ctx.store.GetMetaData()
+//	m, ok, _ := ctx.store.GetKV()
 //	if ok {
 //		if v, ok := m[key]; ok {
 //			var t T
 //			_ = json.Unmarshal([]byte(v), &t)
 //			return t, func(t T) {
-//				m, ok, _ := ctx.store.GetMetaData()
+//				m, ok, _ := ctx.store.GetKV()
 //				if !ok {
 //					m = make(map[string]string)
 //				}
 //				bs, _ := json.Marshal(t)
 //				m[key] = string(bs)
-//				_ = ctx.store.SetMetaData(m)
+//				_ = ctx.store.SetKV(m)
 //			}
 //		}
 //	}
 //
 //	setV := func(t T) {
-//		m, ok, _ := ctx.store.GetMetaData()
+//		m, ok, _ := ctx.store.GetKV()
 //		if !ok {
 //			m = make(map[string]string)
 //		}
 //		bs, _ := json.Marshal(t)
 //		m[key] = string(bs)
-//		_ = ctx.store.SetMetaData(m)
+//		_ = ctx.store.SetKV(m)
 //	}
 //	setV(def)
 //
@@ -232,36 +250,21 @@ func Task(c *Context, key string, fun TaskFun, opts ...TaskOption) {
 		err := fun(taskContext)
 		if err != nil {
 			if s.RetryCount > o.MaxRetry {
-				panic(Fail(key, err))
+				panic(Fail(s, key, err))
 			}
-			panic(Retry(key, err))
+			panic(Retry(s, key, err))
 		}
-		panic(Done(key))
+		panic(Done(s, key))
 	}
 	if s.Status == "retry" {
 		err := fun(taskContext)
 		if err != nil {
 			if s.RetryCount > o.MaxRetry {
-				panic(Fail(key, err))
+				panic(Fail(s, key, err))
 			}
-			panic(Retry(key, err))
+			panic(Retry(s, key, err))
 		}
-		panic(Done(key))
-	}
-}
-
-func AB(c *Context, key string, fun func() error) {
-	s, exist, _ := c.store.GetNodeStatus(key)
-	// todo panic error
-
-	if !exist {
-		_ = fun()
-		// TODO retry
-		panic(Done(key))
-	}
-	if s.Status == "retry" {
-		_ = fun()
-		panic(Done(key))
+		panic(Done(s, key))
 	}
 }
 
@@ -275,13 +278,13 @@ func Sleep(c *Context, key string, duration time.Duration) {
 	// todo panic error
 
 	if !exist {
-		panic(NewSleep(key, duration))
+		panic(NewSleep(s, key, duration))
 	}
 
 	if s.Status == "sleep" {
 		d := s.RunAt.Sub(time.Now())
 		if d > 0 {
-			panic(NewSleep(key, d))
+			panic(NewSleep(s, key, d))
 		}
 
 		_ = c.store.SetNodeStatus(key, s.MakeDone())
@@ -332,8 +335,9 @@ type TaskStatus struct {
 	// sleep, 等待中
 	// retry, 重试中
 	// done, 完成
+	Key        string
 	Status     string    `json:"status"`
-	RunAt      time.Time `json:"run_at"`
+	RunAt      time.Time `json:"run_at"` // sleep 到的时间
 	Errs       []string  `json:"errs"`
 	RetryCount int       `json:"retry_count"`
 }
@@ -370,11 +374,11 @@ func (t TaskStatus) MakeRetry(err error) TaskStatus {
 }
 
 type NodeStatusStore interface {
-	GetNodeStatus(key string) (TaskStatus, bool, error)
+	GetNodeStatus(key string) (TaskStatus, bool, error) // 获取每个 task 的运行状态
 	SetNodeStatus(key string, value TaskStatus) error
-	GetMetaDataAll() (MetaData, error)
-	SetMetaData(k string, v string) error
-	GetMetaData(k string) (string, bool, error)
+	GetKVAll() (map[string]string, error)
+	SetKV(k string, v string) error
+	GetKV(k string) (string, bool, error)
 	Clear() error // 删除所有数据
 }
 
@@ -511,11 +515,12 @@ type AsyncQueue interface {
 	Subscribe(h func(ctx context.Context, data Event) error)
 }
 
-type NextStatus struct {
-	Status string // abort, sleep, retry, done, fail
-	RunAt  time.Time
-	Task   string
-	Err    error
+type BreakStatus struct {
+	Status     string // abort, sleep, retry, done, fail
+	RunAt      time.Time
+	Task       string
+	Err        error
+	TaskStatus TaskStatus
 }
 
 type ThenAble interface {
@@ -534,7 +539,7 @@ type FailAble interface {
 	Fail(f func(ctx *Context, ts TaskStatus) error) SuccessAble
 }
 
-type NodeCaller func(ctx context.Context) (NextStatus, error)
+type NodeCaller func(ctx context.Context) (BreakStatus, error)
 
 func WithCallId(ctx context.Context, callId string) context.Context {
 	return context.WithValue(ctx, "callId", callId)
@@ -589,11 +594,11 @@ func (s *Scheduler) register(f *Flow) {
 
 		if event.InitMetaData != nil {
 			for k, v := range event.InitMetaData {
-				_ = statusStore.SetMetaData(k, v)
+				_ = statusStore.SetKV(k, v)
 			}
 		}
 		// 从缓存中拿出上次的运行状态
-		//m, _, := statusStore.GetMetaDataAll()
+		//m, _, := statusStore.GetKVAll()
 		//if m != nil {
 		//	ctx = WithMetaData(ctx, m)
 		//}
@@ -611,7 +616,7 @@ func (s *Scheduler) register(f *Flow) {
 					return
 				}
 
-				ns, ok := r.(NextStatus)
+				ns, ok := r.(BreakStatus)
 				if !ok {
 					panic(r)
 				}
@@ -622,37 +627,25 @@ func (s *Scheduler) register(f *Flow) {
 
 				switch ns.Status {
 				case "retry":
-					ts, _, _ := statusStore.GetNodeStatus(ns.Task)
-					_ = statusStore.SetNodeStatus(ns.Task, ts.MakeRetry(ns.Err))
+					// 存储重试次数
+					_ = statusStore.SetNodeStatus(ns.Task, ns.TaskStatus.MakeRetry(ns.Err))
 					// 进入下次调度
 					err := aw.Publish(ctx, Event{
 						CallId: callId,
-					}, time.Duration(ts.RetryCount)*time.Second)
+					}, time.Duration(ns.TaskStatus.RetryCount)*time.Second)
 					if err != nil {
 						log.Printf("scheduler event error: %v", err)
 					}
 				case "abort":
-					ts, _, _ := statusStore.GetNodeStatus(ns.Task)
 					if f.onFail != nil {
-						err := f.onFail(ctx, TaskStatus{
-							Status:     "abort",
-							RunAt:      time.Now(),
-							Errs:       nil,
-							RetryCount: ts.RetryCount,
-						})
+						err := f.onFail(ctx, ns.TaskStatus.MakeAbort())
 						if err != nil {
 							panic(err)
 						}
 					}
 				case "fail":
-					ts, _, _ := statusStore.GetNodeStatus(ns.Task)
 					if f.onFail != nil {
-						err := f.onFail(ctx, TaskStatus{
-							Status:     "fail",
-							RunAt:      time.Now(),
-							Errs:       ts.Errs,
-							RetryCount: ts.RetryCount,
-						})
+						err := f.onFail(ctx, ns.TaskStatus.MakeFail(ns.Err))
 						if err != nil {
 							panic(err)
 						}
@@ -660,12 +653,7 @@ func (s *Scheduler) register(f *Flow) {
 				case "sleep":
 					// 进入下次调度
 					now := time.Now()
-					_ = statusStore.SetNodeStatus(ns.Task, TaskStatus{
-						Status:     "sleep",
-						RunAt:      ns.RunAt,
-						Errs:       nil,
-						RetryCount: 0,
-					})
+					_ = statusStore.SetNodeStatus(ns.Task, ns.TaskStatus.MakeSleep(ns.RunAt))
 					err := aw.Publish(ctx, Event{
 						CallId: callId,
 					}, ns.RunAt.Sub(now))
@@ -675,12 +663,7 @@ func (s *Scheduler) register(f *Flow) {
 				case "done":
 					fallthrough
 				default:
-					_ = statusStore.SetNodeStatus(ns.Task, TaskStatus{
-						Status:     "done",
-						RunAt:      time.Now(),
-						Errs:       nil,
-						RetryCount: 0,
-					})
+					_ = statusStore.SetNodeStatus(ns.Task, ns.TaskStatus.MakeDone())
 					// 进入下次调度
 					err := aw.Publish(ctx, Event{
 						CallId: callId,
@@ -815,7 +798,7 @@ func NewKvNodeStatusStore(store store.KVStore, key string) *KvNodeStatusStore {
 }
 
 func (n *KvNodeStatusStore) GetNodeStatus(key string) (TaskStatus, bool, error) {
-	status := TaskStatus{}
+	status := TaskStatus{Key: key}
 	exist, err := n.store.HGet(context.Background(), n.statusKey(), key, &status)
 	if err != nil {
 		return status, false, err
@@ -831,7 +814,7 @@ func (n *KvNodeStatusStore) SetNodeStatus(key string, value TaskStatus) error {
 	return n.store.HSet(context.Background(), n.statusKey(), key, value, 0)
 }
 
-func (n *KvNodeStatusStore) GetMetaDataAll() (MetaData, error) {
+func (n *KvNodeStatusStore) GetKVAll() (map[string]string, error) {
 	v, exist, err := n.store.HGetAll(context.Background(), n.metaKey())
 	if err != nil {
 		return nil, err
@@ -839,10 +822,11 @@ func (n *KvNodeStatusStore) GetMetaDataAll() (MetaData, error) {
 	if !exist {
 		return nil, nil
 	}
+
 	return v, nil
 }
 
-func (n *KvNodeStatusStore) GetMetaData(k string) (string, bool, error) {
+func (n *KvNodeStatusStore) GetKV(k string) (string, bool, error) {
 	var v string
 	exist, err := n.store.HGet(context.Background(), n.metaKey(), k, &v)
 	if err != nil {
@@ -854,7 +838,7 @@ func (n *KvNodeStatusStore) GetMetaData(k string) (string, bool, error) {
 	return v, true, nil
 }
 
-func (n *KvNodeStatusStore) SetMetaData(k, v string) error {
+func (n *KvNodeStatusStore) SetKV(k, v string) error {
 	return n.store.HSet(context.Background(), n.metaKey(), k, v, 0)
 }
 
@@ -1002,31 +986,31 @@ func NewDelayedAsyncQueue(redis store.DelayedQueue, key string, wg *sync.WaitGro
 }
 
 // Sleep means the task is exec success and sleep for d.
-func NewSleep(task string, d time.Duration) NextStatus {
-	return NextStatus{Task: task, Status: "sleep", RunAt: time.Now().Add(d)}
+func NewSleep(s TaskStatus, task string, d time.Duration) BreakStatus {
+	return BreakStatus{Task: task, Status: "sleep", RunAt: time.Now().Add(d), TaskStatus: s}
 }
 
 // Done means the task is exec success
-func Done(task string) NextStatus {
-	return NextStatus{Status: "done", Task: task}
+func Done(s TaskStatus, task string) BreakStatus {
+	return BreakStatus{Status: "done", Task: task, TaskStatus: s}
 }
 
 // Done means the task is exec success
-func DoFunc(fun func() error) NextStatus {
-	return NextStatus{Status: "done"}
+func DoFunc(fun func() error) BreakStatus {
+	return BreakStatus{Status: "done"}
 }
 
 // Abort means abort the flow
-func Abort() NextStatus {
-	return NextStatus{Status: "abort"}
+func Abort() BreakStatus {
+	return BreakStatus{Status: "abort"}
 }
 
 // Abort means abort the flow
-func Retry(task string, err error) NextStatus {
-	return NextStatus{Status: "retry", Task: task, Err: err}
+func Retry(s TaskStatus, task string, err error) BreakStatus {
+	return BreakStatus{Status: "retry", Task: task, Err: err, TaskStatus: s}
 }
 
-// Abort means abort the flow
-func Fail(task string, err error) NextStatus {
-	return NextStatus{Status: "fail", Task: task, Err: err}
+// Fail means abort the flow
+func Fail(s TaskStatus, task string, err error) BreakStatus {
+	return BreakStatus{Status: "fail", Task: task, Err: err, TaskStatus: s}
 }

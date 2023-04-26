@@ -2,7 +2,6 @@ package example
 
 import (
 	"errors"
-	"github.com/go-redis/redis/v8"
 	"github.com/zbysir/gotick"
 	"github.com/zbysir/gotick/internal/pkg/signal"
 	"github.com/zbysir/gotick/internal/store"
@@ -17,15 +16,7 @@ import (
 // - UseArray: 和 UseMemo 类似用于缓存数据，不过如果想构建一个循环流程的话应该使用 UseArray，它提供更合适的 API。
 
 func TestFor(t *testing.T) {
-	url := "redis://localhost:6379/0"
-	opt, err := redis.ParseURL(url)
-	if err != nil {
-		panic(err)
-	}
-
-	redisClient := redis.NewClient(opt)
-
-	tick := gotick.NewTickServer(gotick.Options{RedisURL: url, DelayedQueue: store.NewStdRedisDelayedQueue(redisClient)})
+	tick := gotick.NewTickServer(gotick.Options{KvStore: store.NewMockNodeStatusStore(), DelayedQueue: store.NewMockRedisDelayedQueue()})
 	ctx, c := signal.NewContext()
 	var currentCallId string
 
@@ -100,15 +91,7 @@ func TestFor(t *testing.T) {
 }
 
 func TestSequence(t *testing.T) {
-	url := "redis://localhost:6379/0"
-	opt, err := redis.ParseURL(url)
-	if err != nil {
-		panic(err)
-	}
-
-	redisClient := redis.NewClient(opt)
-
-	tick := gotick.NewTickServer(gotick.Options{RedisURL: url, DelayedQueue: store.NewStdRedisDelayedQueue(redisClient)})
+	tick := gotick.NewTickServer(gotick.Options{KvStore: store.NewMockNodeStatusStore(), DelayedQueue: store.NewMockRedisDelayedQueue()})
 	ctx, c := signal.NewContext()
 	var currentCallId string
 
@@ -123,11 +106,11 @@ func TestSequence(t *testing.T) {
 		})
 
 		// 生成 100 个任务
-		seq := gotick.UseSequence(ctx, "gen-tasks", 100)
+		seq := gotick.UseSequence(ctx, "gen-tasks", 10)
 
 		for seq.Next() {
 			gotick.Task(ctx, seq.TaskKey("send-email"), func(ctx *gotick.TaskContext) error {
-				time.Sleep(1 * time.Second)
+				time.Sleep(1 * time.Second / 2)
 				log.Printf("send email to '%v' at %v", seq.Current, time.Now().Sub(startAt))
 				return nil
 			})
@@ -137,6 +120,8 @@ func TestSequence(t *testing.T) {
 			log.Printf("done at %v", time.Now().Sub(startAt))
 			return nil
 		})
+
+		log.Printf("meta %+v", ctx.MetaDataAll())
 
 		if ctx.CallId == currentCallId {
 			c()
