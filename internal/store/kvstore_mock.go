@@ -8,13 +8,19 @@ import (
 	"time"
 )
 
+type LifeValue struct {
+	live  time.Time
+	value interface{}
+}
+
 type MockNodeStatusStore struct {
-	m    map[string]interface{}
+	m    map[string]LifeValue
+	hm   map[string]map[string]LifeValue
 	lock sync.Mutex
 }
 
 func NewMockNodeStatusStore() *MockNodeStatusStore {
-	return &MockNodeStatusStore{m: map[string]interface{}{}}
+	return &MockNodeStatusStore{m: map[string]LifeValue{}, hm: map[string]map[string]LifeValue{}}
 }
 
 func (m *MockNodeStatusStore) Get(ctx context.Context, key string, r interface{}) (bool, error) {
@@ -24,8 +30,12 @@ func (m *MockNodeStatusStore) Get(ctx context.Context, key string, r interface{}
 	if !ok {
 		return false, nil
 	}
+	if v.live.Before(time.Now()) {
+		return false, nil
+	}
+
 	rv := reflect.ValueOf(r)
-	rv.Elem().Set(reflect.ValueOf(v))
+	rv.Elem().Set(reflect.ValueOf(v.value))
 	return true, nil
 }
 
@@ -33,7 +43,16 @@ func (m *MockNodeStatusStore) Set(ctx context.Context, key string, value interfa
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
-	m.m[key] = value
+	live := time.Now()
+	if expiration <= 0 {
+		live = time.Now().AddDate(1, 0, 0)
+	} else {
+		live = live.Add(expiration)
+	}
+	m.m[key] = LifeValue{
+		live:  live,
+		value: value,
+	}
 	return nil
 }
 
@@ -41,17 +60,22 @@ func (m *MockNodeStatusStore) HGet(ctx context.Context, table string, key string
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
-	mp, ok := m.m[table+"_"]
+	mp, ok := m.hm[table]
 	if !ok {
 		return false, nil
 	}
 
-	v, ok := mp.(map[string]interface{})[key]
+	v, ok := mp[key]
 	if !ok {
 		return false, nil
 	}
+
+	if v.live.Before(time.Now()) {
+		return false, nil
+	}
+
 	rv := reflect.ValueOf(r)
-	rv.Elem().Set(reflect.ValueOf(v))
+	rv.Elem().Set(reflect.ValueOf(v.value))
 
 	return true, nil
 }
@@ -60,14 +84,18 @@ func (m *MockNodeStatusStore) HGetAll(ctx context.Context, table string) (map[st
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
-	mp, ok := m.m[table+"_"]
+	mp, ok := m.hm[table]
 	if !ok {
 		return nil, false, nil
 	}
 
 	r := make(map[string]string)
-	for k, v := range mp.(map[string]interface{}) {
-		bs, _ := json.Marshal(v)
+	for k, v := range mp {
+		if v.live.Before(time.Now()) {
+			continue
+		}
+
+		bs, _ := json.Marshal(v.value)
 		r[k] = string(bs)
 	}
 
@@ -78,14 +106,26 @@ func (m *MockNodeStatusStore) HSet(ctx context.Context, table string, key string
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
-	mp, ok := m.m[table+"_"]
+	mp, ok := m.hm[table]
+
+	live := time.Now()
+	if expiration <= 0 {
+		live = time.Now().AddDate(1, 0, 0)
+	} else {
+		live = live.Add(expiration)
+	}
+
+	va := LifeValue{
+		live:  live,
+		value: value,
+	}
 	if !ok {
-		m.m[table+"_"] = map[string]interface{}{
-			key: value,
+		m.hm[table] = map[string]LifeValue{
+			key: va,
 		}
 		return nil
 	}
-	mp.(map[string]interface{})[key] = value
+	mp[key] = va
 
 	return nil
 }
@@ -95,6 +135,6 @@ func (m *MockNodeStatusStore) Delete(ctx context.Context, key string) error {
 	defer m.lock.Unlock()
 
 	delete(m.m, key)
-	delete(m.m, key+"_")
+	delete(m.hm, key)
 	return nil
 }

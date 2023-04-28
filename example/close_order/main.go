@@ -16,7 +16,7 @@ func main() {
 
 	tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
 		//log.Printf("schedule callId: %v", ctx.CallId)
-		startAt := gotick.UseMemo(ctx, "start_at", func() (time.Time, error) {
+		startAt := gotick.Memo(ctx, "start_at", func() (time.Time, error) {
 			return time.Now(), nil
 		})
 		gotick.Task(ctx, "start", func(ctx *gotick.TaskContext) error {

@@ -14,8 +14,6 @@ GoTick is a out-of-the-box workflow engine.
 
 - 简单得像魔法一样的语法。
 - 保证任务至少执行一次。
-- 支持循环执行某个任务。
-- 可终止任务。
 - 支持分布式架构，支持在多个节点中调度任务。
 - 只依赖于 Redis。
 - 自身足够简单可信耐，依赖 [asynq](https://github.com/hibiken/asynq) 实现延时任务。
@@ -23,14 +21,14 @@ GoTick is a out-of-the-box workflow engine.
 ## 为什么不？
 
 ### 延时 MQ
-- MQ 不能方便的组织多个依次执行的异步任务
-- MQ 不方便的管理任务的状态，比如失败之后更新数据。
+- MQ 只能实现单个任务调度，而不支持工作流。
 
 ### AirFlow
-- 慢
+- 大，慢
 
 ### [FastFlow](https://github.com/ShiningRush/fastflow)
-- 使用代码还是太复杂了，我想让异步代码和同步代码一样简单。
+- 使用代码还是太复杂了。
+- 不想用 yaml 定义工作流，用代码定义工作流将有更多的灵活性。
 
 ## Example
 
@@ -43,12 +41,11 @@ package main
 
 import (
   "github.com/zbysir/gotick"
-  "testing"
   "time"
 )
 
-func TestTick(t *testing.T) {
-  tick := gotick.NewTickServer(gotick.Options{RedisURL: "redis://localhost:6379/0"})
+func main() {
+  tick := gotick.NewTickServer()
 
   tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
     startAt, _ := gotick.UseStatus(ctx, "start_at", time.Now())
@@ -62,17 +59,7 @@ func TestTick(t *testing.T) {
     return nil
   })
   
-  callId, err := tick.Trigger(context.Background(), "demo/close-order", nil)
-  if err != nil {
-    t.Fatal(err)
-  }
-
-  t.Logf("callId: %+v", callId)
-
-  e := tick.StartServer(ctx)
-  if e != nil {
-    t.Fatal(e)
-  }
+  tick.Start()
 }
 
 ```
@@ -86,23 +73,28 @@ func TestTick(t *testing.T) {
 
 当然 `gotick.Sleep` 并不是真正的让程序挂起，它是支持服务重启恢复的。
 
-> Sleep 的精度不高的原因是 Asynq 的原因，你可以通过调整 [Asynq 的配置](https://pkg.go.dev/github.com/hibiken/asynq#Config:~:text=to%2015%20seconds.-,HealthCheckInterval,-time.Duration)来提高精度。
-
-### 分段依次下载并上报进度
-
-你有三种方法控制超时：
-- 声明 Flow 时提供超时时间
-- 触发 Flow 提供超时时间
-- 在 Task 中自己判断并 gotick.Fail(ctx, errors.New("timeout"))
-
-TODO 
-
-### 分段并行下载并上报进度
-TODO
+### 分段并行下载
+[View Example](./example/parallel_download)
 
 ## 如何工作
 
-调度流程如下：
+
+### 名词解释
+
+使用到的：
+- TickClient: 客户端，用于触发 Flow
+- TickServer: 服务端，调度所有 Flow；也可以和 Client 一样触发 Flow
+- Flow: 定义一个工作流
+- Task: 任务，每一个任务需要有一个唯一的名字。
+
+一个 TickServer 包含多个 Flow，一个 Flow 包含多个 Task。
+
+内部逻辑：
+- AsyncQueue：延时消息队列，用于触发调度器
+- Scheduler：调度器，用于调度 Task
+- KVStore：存储 Task 的状态
+
+Task 的调度流程如下：
 ```mermaid
 flowchart TB
   subgraph Service
@@ -125,10 +117,12 @@ flowchart TB
   end
 ```
 
-在用一个例子简单的说下程序是如何挂起的，这个例子实现了睡眠一段时间后打印一段信息：
+再用一个例子简单的说下程序是如何挂起的，这个例子实现了睡眠一段时间后打印一段信息：
 ```go
 tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
-    startAt, _ := gotick.UseStatus(ctx, "start_at", time.Now())
+    startAt := gotick.Memo(ctx, "start_at", func() (time.Time, error) {
+        return time.Now(), nil
+    })
     gotick.Sleep(ctx, "wait-close", 3*time.Second)
 
     log.Printf("wait end at %v", time.Now().Sub(startAt))
@@ -138,23 +132,81 @@ tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
 
 代码中 gotick.Sleep 方法会将当前任务挂起（当然不是真的 time.Sleep，而是通过 panic 中断运行），然后通过延时任务队列再次调度整个流程。
 
-## 名词解释
-- TickClient: 客户端，用于触发 Flow
-- TickServer: 服务端，调度所有 Flow；也可以和 Client 一样触发 Flow
-- Flow: 工作流，由多个 Task 组成
-- Task: 任务，每一个任务需要有一个唯一的名字，Task 会从上至下依次执行。
-
-一个 TickServer 包含多个 Flow，一个 Flow 包含多个 Task。
-
 ## API
-| API        | 说明                           | 用途                                                | 举例  |
-|------------|------------------------------|---------------------------------------------------|-----|
-| UseMemo    | 运行任务并存储结果，如果任务失败会重试，直到成功或者超时 | 如果一个任务依赖另一个任务的结果，应该使用 UseMemo 缓存任务结果              || 
-| Sleep      | 睡眠指定时间                       | 和 time.Sleep() 效果一样，不过不怕重启                        ||
-| At         | 睡眠到指定时间                      | 和 Sleep() 类似，不过需要传递的是期望的运行时间||
-| Task       | 运行一个任务                       | 如果一个任务不用返回数据，则可以使用 Task 代替 UseMemo                | |
-| UseSquence | 返回一个序列， 这个序列可以用来执行循环逻辑       | 如果要循环执行一个任务就需要使用到 UseSquence                      | |
-| UseArray   | 运行任务并存储数组结果                  | 如果一个任务返回的是一个数组，并且想要通过这个数组来循环执行一个任务就需要使用到 UseArray | |
+
+### Task
+运行一个不会返回数据的任务，如果任务失败会重试，直到成功或者超时；
+
+如果任务需要返回数据，则应该使用 Memo
+
+```go
+gotick.Task(ctx, "start", func(ctx *gotick.TaskContext) error {
+    log.Printf("start at %v", time.Now())
+    return nil
+})
+```
+
+### Memo
+运行任务并缓存结果，如果一个任务需要返回数据给后续任务使用，那么应该使用 Memo 代替 Task。
+
+```go
+startAt := gotick.Memo(ctx, "start_at", func() (time.Time, error) {
+    return time.Now(), nil
+})
+```
+
+### Sleep
+睡眠指定时间，和 time.Sleep() 效果一样，不过不怕重启
+
+```go
+gotick.Sleep(ctx, "wait-close", 3*time.Second)
+```
+
+### Array
+运行任务并存储数组结果，如果一个任务返回的是一个数组，并且想要通过这个数组来循环执行另一个任务，那么应该使用 Array 代替 Memo。
+
+```go
+tasks := gotick.Array(ctx, "split", func() ([]string, error) {
+    return strings.Split(src, ""), nil
+})
+```
+
+### Async
+Async 生成一个异步任务，你可以使用 Wait 来执行这个异步任务。
+
+### Wait
+Wait 并行执行任务并等待任务执行完毕，可以限制并发数量，需要和 Async 方法一起使用。
+```go
+toEnF := gotick.Async(ctx, "to_en", func(ctx *gotick.TaskContext) (string, error) {
+    log.Printf("[%s] execing to_en", time.Since(start))
+    time.Sleep(2 * time.Second)
+    return fmt.Sprintf("en(%s)", src), nil
+})
+
+lenF := gotick.Async(ctx, "token_len", func(ctx *gotick.TaskContext) (int, error) {
+    log.Printf("[%s] execing token_len", time.Since(start))
+    time.Sleep(2 * time.Second)
+    return len(src), nil
+})
+
+gotick.Wait(ctx, 2, toEnF, lenF)
+```
+
+### AsyncArray
+AsyncArray 是 使用 Array 生成 Async 数组的简写形式，用于方便的生成多个并行任务。
+```go
+tasks := gotick.Array(ctx, "split", func() ([]string, error) {
+    return strings.Split(src, ""), nil
+})
+
+fs := gotick.AsyncArray(ctx, "download", tasks, func(ctx *gotick.TaskContext, v string) (string, error) {
+    log.Printf("[%s] execing download(%v)", time.Since(start), v)
+    time.Sleep(2 * time.Second)
+    return fmt.Sprintf("download(%s)", v), nil
+})
+
+gotick.Wait(ctx, 4, fs...)
+```
 
 > 也许你需要理解 [gotick 如何工作]才能更加理解这些 API 的目的。
 
@@ -162,14 +214,15 @@ tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
 
 - 特性
   - [x] 使用 Golang 语法控制流程
-  - [ ] 支持循环调度
-  - [ ] goto 到某一个 task (考虑使用场景中)
-  - [ ] 支持设置任务的超时时间，超时后调用 Fail 回调
-  - [ ] 并行 task
-    - 目前实现不太好实现并发，参考 https://github.com/ShiningRush/fastflow 可以更方便的做并发
+  - [x] 支持循环调度
+  - [ ] 支持设置工作流和单个任务的超时时间，超时后调用 Fail 回调
+  - [x] 并行 task
+  - [ ] 支持中间件以方便的添加 Trace 与 Metrics
 
 - UI
-  - 可视化流程，可视化任务状态，统计次数 （通过节点的方式）
-    - 可参考 https://visualgo.net/zh 中的"网络流" 
-    - https://algorithm-visualizer.org/branch-and-bound/binary-search-tree
-  - 查看每个节点的执行结果
+  - 可视化流程
+    - 可视化 Task 状态
+      - 可参考 https://visualgo.net/zh 中的"网络流"
+      - react-flow
+      - https://algorithm-visualizer.org/branch-and-bound/binary-search-tree
+  - 查看每个 Task 的执行结果

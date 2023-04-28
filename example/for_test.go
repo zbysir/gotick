@@ -12,8 +12,8 @@ import (
 )
 
 // - UseStatus: 和 React Hooks 一样，它用于保存状态。
-// - UseMemo: 缓存数据，当数据不存在时会执行 build 方法。
-// - UseArray: 和 UseMemo 类似用于缓存数据，不过如果想构建一个循环流程的话应该使用 UseArray，它提供更合适的 API。
+// - Memo: 缓存数据，当数据不存在时会执行 build 方法。
+// - Array: 和 Memo 类似用于缓存数据，不过如果想构建一个循环流程的话应该使用 Array，它提供更合适的 API。
 
 func TestFor(t *testing.T) {
 	tick := gotick.NewTickServer(gotick.Options{KvStore: store.NewMockNodeStatusStore(), DelayedQueue: store.NewMockRedisDelayedQueue()})
@@ -22,7 +22,7 @@ func TestFor(t *testing.T) {
 
 	tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
 		//log.Printf("schedule callId: %v", ctx.CallId)
-		startAt := gotick.UseMemo(ctx, "start_at", func() (time.Time, error) {
+		startAt := gotick.Memo(ctx, "start_at", func() (time.Time, error) {
 			return time.Now(), nil
 		})
 		gotick.Task(ctx, "start", func(ctx *gotick.TaskContext) error {
@@ -31,7 +31,7 @@ func TestFor(t *testing.T) {
 		})
 
 		// 生成 10 个任务
-		tasks := gotick.UseArray(ctx, "gen-tasks", func() ([]string, error) {
+		tasks := gotick.Array(ctx, "gen-tasks", func() ([]string, error) {
 			log.Printf("call gen-tasks at %v", time.Now().Sub(startAt))
 			return []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}, nil
 		})
@@ -97,7 +97,7 @@ func TestSequence(t *testing.T) {
 
 	tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
 		//log.Printf("schedule callId: %v", ctx.CallId)
-		startAt := gotick.UseMemo(ctx, "start_at", func() (time.Time, error) {
+		startAt := gotick.Memo(ctx, "start_at", func() (time.Time, error) {
 			return time.Now(), nil
 		})
 		gotick.Task(ctx, "start", func(ctx *gotick.TaskContext) error {
@@ -106,7 +106,7 @@ func TestSequence(t *testing.T) {
 		})
 
 		// 生成 100 个任务
-		seq := gotick.UseSequence(ctx, "gen-tasks", 10)
+		seq := gotick.Sequence(ctx, "gen-tasks", 10)
 
 		for seq.Next() {
 			gotick.Task(ctx, seq.TaskKey("send-email"), func(ctx *gotick.TaskContext) error {

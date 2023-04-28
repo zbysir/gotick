@@ -67,18 +67,18 @@ func (c *Context) MetaData(k string) (string, bool) {
 	return v, ok
 }
 
-type Sequence struct {
+type SequenceWrap struct {
 	Current int
 	max     int
 	name    string
 	ctx     *Context `json:"-"`
 }
 
-func (s *Sequence) TaskKey(prefix string) string {
+func (s *SequenceWrap) TaskKey(prefix string) string {
 	return fmt.Sprintf("%s:%v", prefix, s.Current)
 }
 
-func (s *Sequence) Next() bool {
+func (s *SequenceWrap) Next() bool {
 	if s.ctx.collect != nil {
 		end := s.ctx.collect("sequence", s.name)
 		if end {
@@ -122,11 +122,11 @@ func SetToStore[T interface{}](s NodeStatusStore, key string, t T) error {
 	return nil
 }
 
-func UseSequence(ctx *Context, key string, maxLen int) Sequence {
+func Sequence(ctx *Context, key string, maxLen int) SequenceWrap {
 	if ctx.collect != nil {
 		end := ctx.collect("sequence", key)
 		if end {
-			return Sequence{
+			return SequenceWrap{
 				Current: -1,
 				max:     0,
 				name:    "",
@@ -136,9 +136,9 @@ func UseSequence(ctx *Context, key string, maxLen int) Sequence {
 	}
 
 	key = fmt.Sprintf("__%v", key)
-	s, ok, _ := GetFromStore[Sequence](ctx.store, key)
+	s, ok, _ := GetFromStore[SequenceWrap](ctx.store, key)
 	if !ok {
-		return Sequence{
+		return SequenceWrap{
 			Current: -1, // skip first next()
 			max:     maxLen,
 			name:    key,
@@ -149,39 +149,34 @@ func UseSequence(ctx *Context, key string, maxLen int) Sequence {
 	return s
 }
 
-type Future[T interface{}] struct {
-	Val  T
-	key  string
-	done bool // 是否已经完成
-	fun  func() (T, error)
+type FutureT[T interface{}] struct {
+	Val T
+	k   string
+	fun func() (T, error)
 }
 
-func (f *Future[T]) Value() T {
+func (f *FutureT[T]) Value() T {
 	return f.Val
 }
 
-func (f *Future[T]) Exec() (interface{}, error) {
+func (f *FutureT[T]) exec() (interface{}, error) {
 	t, err := f.fun()
 	if err != nil {
 		return t, err
 	}
 
 	f.Val = t
-	f.done = true
 
 	return t, nil
 }
 
-func (f *Future[T]) Done() bool {
-	return f.done
-}
-func (f *Future[T]) Key() string {
-	return f.key
+func (f *FutureT[T]) key() string {
+	return f.k
 }
 
-type FutureI interface {
-	Exec() (interface{}, error)
-	Key() string
+type Future interface {
+	exec() (interface{}, error)
+	key() string
 }
 
 type AsyncTask struct {
@@ -194,27 +189,36 @@ func (a *AsyncTask) Done() bool {
 func (a *AsyncTask) Exec() bool {
 	return true
 }
+func AsyncArray[T interface{}, A interface{}](ctx *Context, key string, arr []ArrayWrap[A], f func(ctx *TaskContext, a A) (T, error)) []Future {
+	var fs []Future
 
-func Async[T interface{}](ctx *Context, key string, f func(ctx *TaskContext) (T, error)) *Future[T] {
+	for _, t := range arr {
+		// 注意闭包问题
+		t := t
+		fs = append(fs, Async(ctx, t.Key(key), func(ctx *TaskContext) (T, error) {
+			return f(ctx, t.Val)
+		}))
+	}
+
+	return fs
+}
+
+func Async[T interface{}](ctx *Context, key string, f func(ctx *TaskContext) (T, error)) *FutureT[T] {
 	s, exist, _ := ctx.store.GetNodeStatus(key)
 	if exist {
 		// 有任务正在运行中，跳过执行
 		t, _, _ := GetFromStore[T](ctx.store, key)
-		return &Future[T]{
-			Val:  t,
-			key:  key,
-			done: false,
+		return &FutureT[T]{
+			Val: t,
+			k:   key,
 			fun: func() (T, error) {
 				return f(newTaskContext(ctx, s))
 			},
 		}
 	}
 
-	// 记录计划状态，并马上重新调度，让其他节点（也可以是自己）能并行执行，
-	// 并且执行完成之后再次调度来通过 Wait 命令，只会有一次调度能通过 Wait 命令，记得做好锁。
-	future := Future[T]{
-		key:  key,
-		done: false,
+	future := FutureT[T]{
+		k: key,
 		fun: func() (T, error) {
 			return f(newTaskContext(ctx, s))
 		},
@@ -223,11 +227,13 @@ func Async[T interface{}](ctx *Context, key string, f func(ctx *TaskContext) (T,
 	return &future
 }
 
-func Wait(ctx *Context, fs ...FutureI) {
-	// 等待所有的 future 完成
+// Wait will wait all future done, if Parallel is not 0, then no limit for parallel.
+func Wait(ctx *Context, parallel int, fs ...Future) {
 	allDone := true
+	runCount := 0
 	for _, f := range fs {
-		s, exist, _ := ctx.store.GetNodeStatus(f.Key())
+		s, exist, _ := ctx.store.GetNodeStatus(f.key())
+
 		if exist {
 			// 有任务正在运行中，跳过执行
 			done := false
@@ -235,7 +241,7 @@ func Wait(ctx *Context, fs ...FutureI) {
 			case "done":
 				done = true
 			case "fail":
-				done = true
+				panic(BreakFail(s, f.key(), nil))
 			}
 
 			if done {
@@ -248,62 +254,72 @@ func Wait(ctx *Context, fs ...FutureI) {
 				// 如果一个任务是 retry 状态，则需要重新执行
 			} else {
 				// 任务正在执行，跳过而执行后面的任务
+				runCount++
 				continue
 			}
 		}
 
-		// 如果任务重新状态，或没有状态，就需要执行
-		_ = ctx.store.SetNodeStatus(f.Key(), s.MakeRunning())
+		if (s.RunAt.IsZero() || s.RunAt.Before(time.Now())) && (parallel <= 0 || runCount < parallel) {
+			// 如果任务重试状态，或没有状态，就需要执行
+			// 如果是 retry，也改为执行状态，让下次调度跳过这次任务
+			_ = ctx.store.SetNodeStatus(f.key(), s.MakeRunning(), 6*time.Second)
 
-		go func(future FutureI, s TaskStatus) {
-			c, can := context.WithCancel(ctx)
-			defer can()
-			go func() {
-				// 启动心跳
-				for {
-					select {
-					case <-c.Done():
-						return
-					case <-time.After(3 * time.Second):
-						// 心跳续期
-						_ = ctx.store.SetNodeStatus(future.Key(), s.MakeRunning())
+			// 如果没到执行时间，则不执行
+
+			//log.Printf("step Run")
+			go func(future Future, s TaskStatus) {
+				errorc := make(chan error)
+				datac := make(chan interface{})
+				go func() {
+					// 启动心跳
+					for {
+						select {
+						case e := <-errorc:
+							// 不重新调度，而是等待 BreakWait 自循环。
+							// 重新调度将面临并发问题：
+							// 多次任务同时执行成功，将并发调用，可能会导致 task 并发调用出错（状态检查），最好不要并发调度，否则需要加锁导致逻辑复杂。
+							if s.RetryCount > 5 {
+								_ = ctx.store.SetNodeStatus(future.key(), s.MakeFail(e))
+							} else {
+								_ = ctx.store.SetNodeStatus(future.key(), s.MakeRetry(e))
+
+								//log.Printf("step MakeRetry")
+							}
+							return
+						case data := <-datac:
+							_ = SetToStore(ctx.store, future.key(), data)
+							_ = ctx.store.SetNodeStatus(future.key(), s.MakeDone())
+							return
+						case <-time.After(3 * time.Second):
+							// 心跳续期
+							_ = ctx.store.SetNodeStatus(future.key(), s.MakeRunning(), 6*time.Second)
+						}
 					}
+				}()
+
+				t, err := future.exec()
+				if err != nil {
+					errorc <- err
+				} else {
+					datac <- t
 				}
-			}()
+			}(f, s)
 
-			log.Printf("[start] %v", future.Key())
-
-			t, e := future.Exec()
-			if e != nil {
-				_ = ctx.store.SetNodeStatus(future.Key(), s.MakeRetry(e))
-
-				// 重新调度
-				//_ = ctx.s.Publish(ctx, Event{
-				//	CallId: ctx.CallId,
-				//}, 0)
-			} else {
-				_ = SetToStore(ctx.store, future.Key(), t)
-				_ = ctx.store.SetNodeStatus(future.Key(), s.MakeDone())
-				// 重新调度
-				_ = ctx.s.Publish(ctx, Event{
-					CallId: ctx.CallId,
-				}, 0)
-			}
-		}(f, s)
-
-		// 并行
-		panic(BreakContinue(s, f.Key()))
+			// 并行
+			// log.Printf("step BreakWait %s ", nextCall)
+			panic(BreakWait(0))
+		}
 	}
 
 	if !allDone {
+		//log.Printf("step BreakWait 10")
 		// 如果还有任务没完成，则等待任务完成
-		// 兜底逻辑：每 3 s 调度一次，检查任务心跳，如果任务没有心跳则重启任务。
-		panic(BreakWait(10 * time.Second))
+		// 循环 1 s 调度一次，检查任务状态，同时检查任务心跳，如果任务没有心跳则重启任务。
+		panic(BreakWait(time.Second / 1))
 	}
-
 }
 
-func UseMemo[T interface{}](ctx *Context, key string, build func() (T, error)) T {
+func Memo[T interface{}](ctx *Context, key string, build func() (T, error)) T {
 	if ctx.collect != nil {
 		end := ctx.collect("memo", key)
 		if end {
@@ -335,10 +351,10 @@ func (a ArrayWrap[T]) Value() (t T) {
 
 func (a ArrayWrap[T]) Key(prefix string) string {
 	// /@/ 表示子集
-	return fmt.Sprintf("%v/@/%v:%v", a.ProductKey, prefix, a.Val)
+	return fmt.Sprintf("%v/@/%v:%v", a.ProductKey, prefix, a.Index)
 }
 
-func UseArray[T interface{}](ctx *Context, key string, build func() ([]T, error)) []ArrayWrap[T] {
+func Array[T interface{}](ctx *Context, key string, build func() ([]T, error)) []ArrayWrap[T] {
 	if ctx.collect != nil {
 		end := ctx.collect("array", key)
 		if end {
@@ -438,7 +454,7 @@ func Task(c *Context, key string, fun TaskFun, opts ...TaskOption) {
 			return
 		}
 	}
-	defer c.Lock()()
+	//defer c.Lock()()
 
 	s, exist, _ := c.store.GetNodeStatus(key)
 
@@ -538,7 +554,7 @@ type TaskStatus struct {
 	Key        string
 	Status     string    `json:"status"`
 	RunAt      time.Time `json:"run_at"` // sleep 到的时间
-	Errs       []string  `json:"errs"`
+	Errs       []string  `json:"errs"`   // 每次重试都有错误
 	RetryCount int       `json:"retry_count"`
 }
 
@@ -575,12 +591,13 @@ func (t TaskStatus) MakeRetry(err error) TaskStatus {
 	t.Status = "retry"
 	t.RetryCount += 1
 	t.Errs = append(t.Errs, err.Error())
+	t.RunAt = time.Now().Add(time.Second * time.Duration(t.RetryCount))
 	return t
 }
 
 type NodeStatusStore interface {
 	GetNodeStatus(key string) (TaskStatus, bool, error) // 获取每个 task 的运行状态
-	SetNodeStatus(key string, value TaskStatus) error
+	SetNodeStatus(key string, value TaskStatus, ttl ...time.Duration) error
 	GetKVAll() (map[string]string, error)
 	SetKV(k string, v string) error
 	GetKV(k string) (string, bool, error)
@@ -890,6 +907,8 @@ func (s *Scheduler) Start(ctx context.Context) error {
 func (s *Scheduler) register(f *Flow) {
 	aw := s.asyncScheduler.New(f.Id)
 	aw.Subscribe(func(ctx context.Context, event Event) error {
+		//log.Printf("-----------------------------")
+
 		callId := event.CallId
 		ctx = WithCallId(ctx, callId)
 
@@ -931,9 +950,7 @@ func (s *Scheduler) register(f *Flow) {
 
 				switch ns.Status {
 				case "continue":
-					// 立即调度，并行
-					_ = statusStore.SetNodeStatus(ns.Task, ns.TaskStatus.MakeRunning())
-					// 进入下次调度
+					// 立即调度，实现并行
 					err := aw.Publish(ctx, Event{
 						CallId: callId,
 					}, 0)
@@ -1132,8 +1149,12 @@ func (n *KvNodeStatusStore) GetNodeStatus(key string) (TaskStatus, bool, error) 
 	return status, true, nil
 }
 
-func (n *KvNodeStatusStore) SetNodeStatus(key string, value TaskStatus) error {
-	return n.store.HSet(context.Background(), n.statusKey(), key, value, 0)
+func (n *KvNodeStatusStore) SetNodeStatus(key string, value TaskStatus, ttl ...time.Duration) error {
+	var t time.Duration
+	if len(ttl) >= 1 {
+		t = ttl[0]
+	}
+	return n.store.HSet(context.Background(), n.statusKey(), key, value, t)
 }
 
 func (n *KvNodeStatusStore) GetKVAll() (map[string]string, error) {
@@ -1262,38 +1283,32 @@ func (a *DelayedAsyncQueueProduct) New(key string) AsyncQueue {
 }
 
 type DelayedAsyncQueue struct {
-	redis     store.DelayedQueue
-	key       string
-	wg        *sync.WaitGroup
-	closeChan chan bool
+	delayedQueue store.DelayedQueue
+	key          string
+	wg           *sync.WaitGroup // wait for all callback down
+	closeChan    chan bool
 }
 
 func (a *DelayedAsyncQueue) Publish(ctx context.Context, data Event, delay time.Duration) error {
-	select {
-	case <-a.closeChan:
-		return errors.New("queue closed")
-	default:
-	}
-
 	bs, _ := json.Marshal(data)
-
-	return a.redis.Publish(ctx, a.key, bs, delay)
+	return a.delayedQueue.Publish(ctx, a.key, bs, delay)
 }
 
 func (a *DelayedAsyncQueue) Subscribe(h func(ctx context.Context, data Event) error) {
-	a.redis.Subscribe(a.key, func(ctx context.Context, data []byte) error {
+	a.delayedQueue.Subscribe(a.key, func(ctx context.Context, data []byte) error {
 		a.wg.Add(1)
 		defer a.wg.Done()
 
-		// 如果已经关闭，则不再处理
-		select {
-		case <-a.closeChan:
-			return errors.New("queue closed")
-		default:
-		}
+		// 如果已经关闭，则返回错误重试
+		//select {
+		//case <-a.closeChan:
+		//	// TODO 考虑是否可以重新入队
+		//	return errors.New("queue closed")
+		//default:
+		//}
 
 		var ev Event
-		json.Unmarshal([]byte(data), &ev)
+		_ = json.Unmarshal(data, &ev)
 
 		return h(ctx, ev)
 	})
@@ -1301,10 +1316,10 @@ func (a *DelayedAsyncQueue) Subscribe(h func(ctx context.Context, data Event) er
 
 func NewDelayedAsyncQueue(redis store.DelayedQueue, key string, wg *sync.WaitGroup, closeChan chan bool) *DelayedAsyncQueue {
 	return &DelayedAsyncQueue{
-		redis:     redis,
-		key:       key,
-		wg:        wg,
-		closeChan: closeChan,
+		delayedQueue: redis,
+		key:          key,
+		wg:           wg,
+		closeChan:    closeChan,
 	}
 }
 
@@ -1333,9 +1348,9 @@ func BreakFail(s TaskStatus, task string, err error) BreakStatus {
 	return BreakStatus{Status: "fail", Task: task, Err: err, TaskStatus: s}
 }
 
-// BreakContuil
-func BreakContinue(s TaskStatus, task string) BreakStatus {
-	return BreakStatus{Status: "continue", Task: task, TaskStatus: s}
+// BreakContinue 始终再次执行
+func BreakContinue() BreakStatus {
+	return BreakStatus{Status: "continue"}
 }
 
 // BreakContuil

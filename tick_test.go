@@ -16,7 +16,7 @@ func TestDag(t *testing.T) {
 
 			Sleep(ctx, "sleep", 10*time.Second)
 
-			tasks := UseArray(ctx, "gen-tasks", func() ([]string, error) {
+			tasks := Array(ctx, "gen-tasks", func() ([]string, error) {
 				return []string{"a", "b", "c"}, nil
 			})
 

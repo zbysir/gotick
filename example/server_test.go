@@ -22,7 +22,7 @@ func TestServer(t *testing.T) {
 
 	tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
 		//log.Printf("schedule callId: %v", ctx.CallId)
-		startAt := gotick.UseMemo(ctx, "start_at", func() (time.Time, error) {
+		startAt := gotick.Memo(ctx, "start_at", func() (time.Time, error) {
 			return time.Now(), nil
 		})
 		gotick.Task(ctx, "start", func(ctx *gotick.TaskContext) error {
@@ -31,7 +31,7 @@ func TestServer(t *testing.T) {
 		})
 
 		// 生成 100 个任务
-		seq := gotick.UseSequence(ctx, "gen-tasks", 10)
+		seq := gotick.Sequence(ctx, "gen-tasks", 10)
 
 		for seq.Next() {
 			gotick.Task(ctx, seq.TaskKey("send-email"), func(ctx *gotick.TaskContext) error {

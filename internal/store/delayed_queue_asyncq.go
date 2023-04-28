@@ -8,15 +8,32 @@ import (
 )
 
 type Asynq struct {
-	srv *asynq.Server
+	//srv *asynq.Server
 	cli *asynq.Client
+
+	redisCli redis.UniversalClient
 
 	// topic => callback
 	callback map[string][]func(ctx context.Context, task *asynq.Task) error
 }
 
 func (a *Asynq) Start(ctx context.Context) error {
-	err := a.srv.Start(asynq.HandlerFunc(func(ctx context.Context, task *asynq.Task) error {
+	queues := map[string]int{}
+	for k := range a.callback {
+		queues[k] = 1
+	}
+
+	cli := &RawRedisClient{a.redisCli}
+	srv := asynq.NewServer(
+		cli,
+		asynq.Config{
+			Concurrency:              10,
+			DelayedTaskCheckInterval: time.Millisecond * 10,
+			Queues:                   queues,
+		},
+	)
+
+	err := srv.Start(asynq.HandlerFunc(func(ctx context.Context, task *asynq.Task) error {
 		for _, c := range a.callback[task.Type()] {
 			err := c(ctx, task)
 			if err != nil {
@@ -33,16 +50,16 @@ func (a *Asynq) Start(ctx context.Context) error {
 	case <-ctx.Done():
 	}
 
-	a.srv.Shutdown()
+	srv.Shutdown()
 	_ = a.cli.Close()
 
 	return nil
 }
 
 func (a *Asynq) Publish(ctx context.Context, topic string, data []byte, delay time.Duration) error {
-	//log.Printf("Asynq Publish, taks: %v at %s", data, time.Now().Add(delay))
+	// log.Printf("Asynq Publish, taks: %v at %s", data, time.Now().Add(delay))
 
-	_, err := a.cli.Enqueue(asynq.NewTask(topic, data), asynq.ProcessAt(time.Now().Add(delay)))
+	_, err := a.cli.Enqueue(asynq.NewTask(topic, data), asynq.ProcessAt(time.Now().Add(delay)), asynq.Queue(topic))
 	if err != nil {
 		return err
 	}
@@ -68,19 +85,13 @@ func (r *RawRedisClient) MakeRedisClient() interface{} {
 
 func NewAsynq(redisCli redis.UniversalClient) *Asynq {
 	cli := &RawRedisClient{redisCli}
-	srv := asynq.NewServer(
-		cli,
-		asynq.Config{
-			Concurrency:              10,
-			DelayedTaskCheckInterval: time.Millisecond * 10,
-		},
-	)
 
 	client := asynq.NewClient(cli)
 
 	return &Asynq{
-		srv:      srv,
+		//srv:      srv,
 		cli:      client,
+		redisCli: redisCli,
 		callback: map[string][]func(ctx context.Context, task *asynq.Task) error{},
 	}
 }

@@ -15,6 +15,7 @@ func main() {
 	ctx, c := signal.NewContext()
 	var currentCallId string
 
+	var start time.Time
 	tick.Flow("demo/translate", func(ctx *gotick.Context) error {
 		//log.Printf("schedule callId: %v", ctx.CallId)
 
@@ -22,32 +23,46 @@ func main() {
 
 		//log.Printf("-- to_en")
 		toEnF := gotick.Async(ctx, "to_en", func(ctx *gotick.TaskContext) (string, error) {
-			//if ctx.Retry < 2 {
-			//	log.Printf("exec to_en, retry:%v", ctx.Retry)
-			//	return "", fmt.Errorf("retry")
-			//}
+			log.Printf("[%s] execing to_en", time.Since(start))
 			time.Sleep(2 * time.Second)
+
+			if ctx.Retry < 5 {
+				log.Printf("[%s] exec to_en, retry:%v", time.Since(start), ctx.Retry)
+				return "", fmt.Errorf("retry")
+			} else {
+				log.Printf("[%s] exec to_en success", time.Since(start))
+			}
+
 			return fmt.Sprintf("en(%s)", src), nil
 		})
 
 		//log.Printf("-- to_jp")
 		lenF := gotick.Async(ctx, "token_len", func(ctx *gotick.TaskContext) (int, error) {
-			//if ctx.Retry < 2 {
-			//	log.Printf("exec to_jp, retry:%v", ctx.Retry)
-			//	return 0, fmt.Errorf("retry")
-			//}
-			time.Sleep(1 * time.Second)
+			log.Printf("[%s] execing token_len", time.Since(start))
+
+			time.Sleep(2 * time.Second)
+			if ctx.Retry < 5 {
+				log.Printf("[%s] exec token_len, retry:%v", time.Since(start), ctx.Retry)
+				return 0, fmt.Errorf("retry")
+			} else {
+				log.Printf("[%s] exec token_len success", time.Since(start))
+			}
 			return len(src), nil
 		})
 
-		log.Printf("-- wait")
-		gotick.Wait(ctx, toEnF, lenF)
+		gotick.Wait(ctx, 2, toEnF, lenF)
 
 		gotick.Task(ctx, "save", func(ctx *gotick.TaskContext) error {
-			log.Printf("save result: en: %v, len:%v", toEnF.Value(), lenF.Value())
+			log.Printf("[%s] save result: en: %v, len:%v", time.Since(start), toEnF.Value(), lenF.Value())
 			return nil
 		})
 
+		if ctx.CallId == currentCallId {
+			c()
+		}
+		return nil
+	}).Fail(func(ctx *gotick.Context, ts gotick.TaskStatus) error {
+		log.Printf("[%s] fail %+v", time.Since(start), ts.Errs)
 		if ctx.CallId == currentCallId {
 			c()
 		}
@@ -64,6 +79,7 @@ func main() {
 		}
 	}()
 
+	start = time.Now()
 	callId, err := tick.Trigger(ctx, "demo/translate", map[string]string{"src": "bysir"})
 	if err != nil {
 		log.Fatal(err)
