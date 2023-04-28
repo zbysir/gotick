@@ -39,10 +39,10 @@ func (a *Asynq) Start(ctx context.Context) error {
 	return nil
 }
 
-func (a *Asynq) Publish(ctx context.Context, topic string, data string, delay time.Duration) error {
+func (a *Asynq) Publish(ctx context.Context, topic string, data []byte, delay time.Duration) error {
 	//log.Printf("Asynq Publish, taks: %v at %s", data, time.Now().Add(delay))
 
-	_, err := a.cli.Enqueue(asynq.NewTask(topic, []byte(data)), asynq.ProcessAt(time.Now().Add(delay)))
+	_, err := a.cli.Enqueue(asynq.NewTask(topic, data), asynq.ProcessAt(time.Now().Add(delay)))
 	if err != nil {
 		return err
 	}
@@ -50,9 +50,9 @@ func (a *Asynq) Publish(ctx context.Context, topic string, data string, delay ti
 	return nil
 }
 
-func (a *Asynq) Subscribe(topic string, h func(ctx context.Context, data string) error) {
+func (a *Asynq) Subscribe(topic string, h func(ctx context.Context, data []byte) error) {
 	a.callback[topic] = append(a.callback[topic], func(ctx context.Context, task *asynq.Task) error {
-		return h(context.TODO(), string(task.Payload()))
+		return h(context.TODO(), task.Payload())
 	})
 }
 

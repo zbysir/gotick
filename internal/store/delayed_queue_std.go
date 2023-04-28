@@ -19,17 +19,17 @@ import (
 
 type StdRedisDelayedQueue struct {
 	redis     *redis.Client
-	callbacks map[string][]func(ctx context.Context, data string) error
+	callbacks map[string][]func(ctx context.Context, data []byte) error
 	runOnce   sync.Once
 }
 
 var _ DelayedQueue = (*StdRedisDelayedQueue)(nil)
 
 func NewStdRedisDelayedQueue(redis *redis.Client) *StdRedisDelayedQueue {
-	return &StdRedisDelayedQueue{redis: redis, callbacks: make(map[string][]func(ctx context.Context, data string) error)}
+	return &StdRedisDelayedQueue{redis: redis, callbacks: make(map[string][]func(ctx context.Context, data []byte) error)}
 }
 
-func (r *StdRedisDelayedQueue) Publish(ctx context.Context, topic string, data string, delay time.Duration) error {
+func (r *StdRedisDelayedQueue) Publish(ctx context.Context, topic string, data []byte, delay time.Duration) error {
 	return r.redis.ZAdd(context.Background(), topic, &redis.Z{
 		Score:  float64(time.Now().Add(delay).Unix()),
 		Member: data,
@@ -51,7 +51,7 @@ func (r *StdRedisDelayedQueue) Exist(uniqueKey []string) (map[string]bool, error
 	return exist, nil
 }
 
-func (r *StdRedisDelayedQueue) Subscribe(topic string, h func(ctx context.Context, data string) error) {
+func (r *StdRedisDelayedQueue) Subscribe(topic string, h func(ctx context.Context, data []byte) error) {
 	r.callbacks[topic] = append(r.callbacks[topic], h)
 }
 
@@ -87,11 +87,11 @@ func (r *StdRedisDelayedQueue) Start(ctx context.Context) error {
 					continue
 				}
 				for _, c := range callback {
-					if err := c(context.Background(), v); err != nil {
+					if err := c(context.Background(), []byte(v)); err != nil {
 						log.Printf("callbacks ERROR: %v", err)
 						// 如果执行失败，重新放入队列
 						// TODO 这个操作不是原子性的，可能会导致数据丢失
-						e := r.Publish(context.Background(), topic, v, 0)
+						e := r.Publish(context.Background(), topic, []byte(v), 0)
 						if e != nil {
 							log.Printf("requeue ERROR: %v", err)
 						}

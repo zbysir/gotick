@@ -6,11 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v8"
 	"github.com/zbysir/gotick/internal/pkg/flow"
 	"github.com/zbysir/gotick/internal/store"
 	"log"
+	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,9 +26,15 @@ type Context struct {
 	CallId  string
 	store   NodeStatusStore
 	collect func(typ string, key string) bool // 预运行来生成 flow 图
+	s       AsyncQueue
+
+	lock sync.Mutex
 }
 
 func (c *Context) MetaDataAll() MetaData {
+	if c.store == nil {
+		return nil
+	}
 	m, err := c.store.GetKVAll()
 	if err != nil {
 		panic(err)
@@ -70,6 +79,13 @@ func (s *Sequence) TaskKey(prefix string) string {
 }
 
 func (s *Sequence) Next() bool {
+	if s.ctx.collect != nil {
+		end := s.ctx.collect("sequence", s.name)
+		if end {
+			s.Current += 1
+			return s.Current <= 0
+		}
+	}
 	// 存储当前的序列号，而不是下一个
 	bs, _ := json.Marshal(s)
 	_ = s.ctx.store.SetKV(s.name, string(bs))
@@ -107,6 +123,18 @@ func SetToStore[T interface{}](s NodeStatusStore, key string, t T) error {
 }
 
 func UseSequence(ctx *Context, key string, maxLen int) Sequence {
+	if ctx.collect != nil {
+		end := ctx.collect("sequence", key)
+		if end {
+			return Sequence{
+				Current: -1,
+				max:     0,
+				name:    "",
+				ctx:     ctx,
+			}
+		}
+	}
+
 	key = fmt.Sprintf("__%v", key)
 	s, ok, _ := GetFromStore[Sequence](ctx.store, key)
 	if !ok {
@@ -121,7 +149,169 @@ func UseSequence(ctx *Context, key string, maxLen int) Sequence {
 	return s
 }
 
+type Future[T interface{}] struct {
+	Val  T
+	key  string
+	done bool // 是否已经完成
+	fun  func() (T, error)
+}
+
+func (f *Future[T]) Value() T {
+	return f.Val
+}
+
+func (f *Future[T]) Exec() (interface{}, error) {
+	t, err := f.fun()
+	if err != nil {
+		return t, err
+	}
+
+	f.Val = t
+	f.done = true
+
+	return t, nil
+}
+
+func (f *Future[T]) Done() bool {
+	return f.done
+}
+func (f *Future[T]) Key() string {
+	return f.key
+}
+
+type FutureI interface {
+	Exec() (interface{}, error)
+	Key() string
+}
+
+type AsyncTask struct {
+}
+
+func (a *AsyncTask) Done() bool {
+	return true
+}
+
+func (a *AsyncTask) Exec() bool {
+	return true
+}
+
+func Async[T interface{}](ctx *Context, key string, f func(ctx *TaskContext) (T, error)) *Future[T] {
+	s, exist, _ := ctx.store.GetNodeStatus(key)
+	if exist {
+		// 有任务正在运行中，跳过执行
+		t, _, _ := GetFromStore[T](ctx.store, key)
+		return &Future[T]{
+			Val:  t,
+			key:  key,
+			done: false,
+			fun: func() (T, error) {
+				return f(newTaskContext(ctx, s))
+			},
+		}
+	}
+
+	// 记录计划状态，并马上重新调度，让其他节点（也可以是自己）能并行执行，
+	// 并且执行完成之后再次调度来通过 Wait 命令，只会有一次调度能通过 Wait 命令，记得做好锁。
+	future := Future[T]{
+		key:  key,
+		done: false,
+		fun: func() (T, error) {
+			return f(newTaskContext(ctx, s))
+		},
+	}
+
+	return &future
+}
+
+func Wait(ctx *Context, fs ...FutureI) {
+	// 等待所有的 future 完成
+	allDone := true
+	for _, f := range fs {
+		s, exist, _ := ctx.store.GetNodeStatus(f.Key())
+		if exist {
+			// 有任务正在运行中，跳过执行
+			done := false
+			switch s.Status {
+			case "done":
+				done = true
+			case "fail":
+				done = true
+			}
+
+			if done {
+				continue
+			} else {
+				allDone = false
+			}
+
+			if s.Status == "retry" {
+				// 如果一个任务是 retry 状态，则需要重新执行
+			} else {
+				// 任务正在执行，跳过而执行后面的任务
+				continue
+			}
+		}
+
+		// 如果任务重新状态，或没有状态，就需要执行
+		_ = ctx.store.SetNodeStatus(f.Key(), s.MakeRunning())
+
+		go func(future FutureI, s TaskStatus) {
+			c, can := context.WithCancel(ctx)
+			defer can()
+			go func() {
+				// 启动心跳
+				for {
+					select {
+					case <-c.Done():
+						return
+					case <-time.After(3 * time.Second):
+						// 心跳续期
+						_ = ctx.store.SetNodeStatus(future.Key(), s.MakeRunning())
+					}
+				}
+			}()
+
+			log.Printf("[start] %v", future.Key())
+
+			t, e := future.Exec()
+			if e != nil {
+				_ = ctx.store.SetNodeStatus(future.Key(), s.MakeRetry(e))
+
+				// 重新调度
+				//_ = ctx.s.Publish(ctx, Event{
+				//	CallId: ctx.CallId,
+				//}, 0)
+			} else {
+				_ = SetToStore(ctx.store, future.Key(), t)
+				_ = ctx.store.SetNodeStatus(future.Key(), s.MakeDone())
+				// 重新调度
+				_ = ctx.s.Publish(ctx, Event{
+					CallId: ctx.CallId,
+				}, 0)
+			}
+		}(f, s)
+
+		// 并行
+		panic(BreakContinue(s, f.Key()))
+	}
+
+	if !allDone {
+		// 如果还有任务没完成，则等待任务完成
+		// 兜底逻辑：每 3 s 调度一次，检查任务心跳，如果任务没有心跳则重启任务。
+		panic(BreakWait(10 * time.Second))
+	}
+
+}
+
 func UseMemo[T interface{}](ctx *Context, key string, build func() (T, error)) T {
+	if ctx.collect != nil {
+		end := ctx.collect("memo", key)
+		if end {
+			var t T
+			return t
+		}
+	}
+
 	key = fmt.Sprintf("__%v", key)
 	v, exist, _ := GetFromStore[T](ctx.store, key)
 	if exist {
@@ -233,15 +423,24 @@ func newTaskContext(c *Context, taskStatus TaskStatus) *TaskContext {
 	}
 }
 
+func (t *Context) Lock() func() {
+	t.lock.Lock()
+
+	return func() {
+		t.lock.Unlock()
+	}
+}
+
+// 同名的 task 在同意时间只能执行一次，加锁
 func Task(c *Context, key string, fun TaskFun, opts ...TaskOption) {
 	if c.collect != nil {
 		if c.collect("task", key) {
 			return
 		}
 	}
+	defer c.Lock()()
 
 	s, exist, _ := c.store.GetNodeStatus(key)
-	// todo panic error
 
 	o := TaskOptions(opts).build()
 
@@ -250,21 +449,21 @@ func Task(c *Context, key string, fun TaskFun, opts ...TaskOption) {
 		err := fun(taskContext)
 		if err != nil {
 			if s.RetryCount > o.MaxRetry {
-				panic(Fail(s, key, err))
+				panic(BreakFail(s, key, err))
 			}
-			panic(Retry(s, key, err))
+			panic(BreakRetry(s, key, err))
 		}
-		panic(Done(s, key))
+		panic(BreakDone(s, key))
 	}
 	if s.Status == "retry" {
 		err := fun(taskContext)
 		if err != nil {
 			if s.RetryCount > o.MaxRetry {
-				panic(Fail(s, key, err))
+				panic(BreakFail(s, key, err))
 			}
-			panic(Retry(s, key, err))
+			panic(BreakRetry(s, key, err))
 		}
-		panic(Done(s, key))
+		panic(BreakDone(s, key))
 	}
 }
 
@@ -278,13 +477,13 @@ func Sleep(c *Context, key string, duration time.Duration) {
 	// todo panic error
 
 	if !exist {
-		panic(NewSleep(s, key, duration))
+		panic(BreakSleep(s, key, duration))
 	}
 
 	if s.Status == "sleep" {
 		d := s.RunAt.Sub(time.Now())
 		if d > 0 {
-			panic(NewSleep(s, key, d))
+			panic(BreakSleep(s, key, d))
 		}
 
 		_ = c.store.SetNodeStatus(key, s.MakeDone())
@@ -335,6 +534,7 @@ type TaskStatus struct {
 	// sleep, 等待中
 	// retry, 重试中
 	// done, 完成
+	// running, 异步任务正在运行
 	Key        string
 	Status     string    `json:"status"`
 	RunAt      time.Time `json:"run_at"` // sleep 到的时间
@@ -357,6 +557,11 @@ func (t TaskStatus) MakeFail(err error) TaskStatus {
 
 func (t TaskStatus) MakeAbort() TaskStatus {
 	t.Status = "abort"
+	return t
+}
+
+func (t TaskStatus) MakeRunning() TaskStatus {
+	t.Status = "running"
 	return t
 }
 
@@ -394,13 +599,99 @@ type AsyncQueueFactory interface {
 }
 
 type TickServer struct {
-	flows      map[string]*Flow
-	asyncQueue AsyncQueueFactory
-	closeChan  chan bool
-	closeOnce  sync.Once
-	wg         sync.WaitGroup
+	scheduler  *Scheduler
+	httpServer *HttpServer
+	measure    Measure
+}
 
-	scheduler *Scheduler
+type Measure interface {
+	OnExec(flow, key string)
+	GetCount(flow string) map[string]int64
+}
+
+type MockMeasure struct {
+	m map[string]map[string]int64
+}
+
+func NewMockMeasure() *MockMeasure {
+	return &MockMeasure{
+		m: map[string]map[string]int64{},
+	}
+}
+
+func (m *MockMeasure) OnExec(flow, key string) {
+	if _, ok := m.m[flow]; !ok {
+		m.m[flow] = map[string]int64{}
+	}
+	m.m[flow][key] += 1
+}
+
+func (m *MockMeasure) GetCount(flow string) map[string]int64 {
+	return m.m[flow]
+}
+
+var _ Measure = (*MockMeasure)(nil)
+
+type RedisMeasure struct {
+	redis *redis.Client
+}
+
+func NewRedisMeasure(redis *redis.Client) *RedisMeasure {
+	return &RedisMeasure{redis: redis}
+}
+
+func (r *RedisMeasure) OnExec(flow, key string) {
+	r.redis.HIncrBy(context.Background(), "measure:"+flow, key, 1)
+}
+
+func (r *RedisMeasure) GetCount(flow string) map[string]int64 {
+	x, _ := r.redis.HGetAll(context.Background(), "measure:"+flow).Result()
+	rsp := map[string]int64{}
+	for k, v := range x {
+		rsp[k], _ = strconv.ParseInt(v, 10, 64)
+	}
+	return rsp
+}
+
+var _ Measure = (*RedisMeasure)(nil)
+
+type HttpServer struct {
+	flows         map[string]*Flow // to get flow info
+	scheduler     *Scheduler       // to trigger flow
+	measure       Measure
+	listenAddress string
+}
+
+func NewHttpServer(scheduler *Scheduler, measure Measure, listenAddress string) *HttpServer {
+	return &HttpServer{scheduler: scheduler, measure: measure, flows: map[string]*Flow{}, listenAddress: listenAddress}
+}
+
+func (s *HttpServer) Start(ctx context.Context) error {
+	r := gin.Default()
+	api := r.Group("/api")
+	api.GET("/flow_list", func(c *gin.Context) {
+		r := map[string]flow.DAG{}
+		for name, f := range s.flows {
+			dag, err := f.DAG()
+			if err != nil {
+				c.JSON(http.StatusBadGateway, gin.H{
+					"message": err.Error(),
+				})
+				return
+			}
+
+			r[name] = dag
+		}
+
+		c.JSON(http.StatusOK, r)
+	})
+	go r.Run()
+
+	return nil
+}
+
+func (s *HttpServer) register(f *Flow) {
+	s.flows[f.Id] = f
 }
 
 type TickClient struct {
@@ -459,7 +750,17 @@ func (f *Flow) DAG() (flow.DAG, error) {
 				node = flow.Node{
 					Id: key,
 					Data: flow.NodeData{
-						Label: fmt.Sprintf("[array] %s", key),
+						Label: fmt.Sprintf("[%v] %s", typ, key),
+						Data: map[string]interface{}{
+							"type": typ,
+						},
+					},
+				}
+			default:
+				node = flow.Node{
+					Id: key,
+					Data: flow.NodeData{
+						Label: fmt.Sprintf("[%v] %s", typ, key),
 						Data: map[string]interface{}{
 							"type": typ,
 						},
@@ -566,7 +867,9 @@ func (t *TickServer) Flow(id string, fun func(ctx *Context) error) *Flow {
 	// 注册调度
 	t.scheduler.register(f)
 
-	t.flows[id] = f
+	if t.httpServer != nil {
+		t.httpServer.register(f)
+	}
 
 	return f
 }
@@ -608,6 +911,7 @@ func (s *Scheduler) register(f *Flow) {
 				Context: ctx,
 				CallId:  callId,
 				store:   statusStore,
+				s:       aw,
 			}
 
 			defer func() {
@@ -626,6 +930,23 @@ func (s *Scheduler) register(f *Flow) {
 				}
 
 				switch ns.Status {
+				case "continue":
+					// 立即调度，并行
+					_ = statusStore.SetNodeStatus(ns.Task, ns.TaskStatus.MakeRunning())
+					// 进入下次调度
+					err := aw.Publish(ctx, Event{
+						CallId: callId,
+					}, 0)
+					if err != nil {
+						log.Printf("scheduler event error: %v", err)
+					}
+				case "wait":
+					err := aw.Publish(ctx, Event{
+						CallId: callId,
+					}, ns.RunAt.Sub(time.Now()))
+					if err != nil {
+						log.Printf("scheduler event error: %v", err)
+					}
 				case "retry":
 					// 存储重试次数
 					_ = statusStore.SetNodeStatus(ns.Task, ns.TaskStatus.MakeRetry(ns.Err))
@@ -729,28 +1050,29 @@ func (t *TickClient) Trigger(ctx context.Context, flowId string, data MetaData) 
 // StartServer 启动服务，在服务端应该调用此方法开始执行异步任务。
 // 当 ctx 被关闭时，服务也会关闭。
 func (t *TickServer) StartServer(ctx context.Context) error {
-	var schedulerWg sync.WaitGroup
-	schedulerWg.Add(1)
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
-		defer schedulerWg.Done()
+		defer wg.Done()
 		err := t.scheduler.Start(ctx)
 		if err != nil {
 			log.Printf("async queue start error: %v", err)
 		}
 	}()
 
-	schedulerWg.Wait()
-	// 先等待 asyncQueue（消费者）关闭之后才应该关闭 tick。
-	// 因为 tick 会在关闭期间如果收到任务会重新入队，如果消费者没有提前关闭则可能又收到重新入队的任务。
-
-	select {
-	case <-ctx.Done():
-		t.closeOnce.Do(func() {
-			close(t.closeChan)
-		})
+	if t.httpServer != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := t.httpServer.Start(ctx)
+			if err != nil {
+				log.Printf("async queue start error: %v", err)
+			}
+		}()
 	}
 
-	t.wg.Wait()
+	wg.Wait()
+
 	return nil
 }
 
@@ -846,10 +1168,10 @@ type Options struct {
 	RedisURL     string // "redis://<user>:<pass>@localhost:6379/<db>"
 	DelayedQueue store.DelayedQueue
 	KvStore      store.KVStore
+	ListenAddr   string // ":8080"
 }
 
 func NewTickServer(p Options) *TickServer {
-
 	if p.DelayedQueue == nil {
 		opt, err := redis.ParseURL(p.RedisURL)
 		if err != nil {
@@ -873,13 +1195,14 @@ func NewTickServer(p Options) *TickServer {
 	st := NewKvStoreProduct(p.KvStore)
 	_, debug := os.LookupEnv("GOTICK_DEBUG")
 
+	scheduler := NewScheduler(ap, st)
+	var server *HttpServer
+	if p.ListenAddr != "" {
+		server = NewHttpServer(scheduler, nil, p.ListenAddr)
+	}
 	t := &TickServer{
-		flows:      map[string]*Flow{},
-		asyncQueue: ap,
-		closeChan:  make(chan bool),
-		closeOnce:  sync.Once{},
-		wg:         sync.WaitGroup{},
-		scheduler:  NewScheduler(ap, st),
+		scheduler:  scheduler,
+		httpServer: server,
 	}
 	t.scheduler.debug = debug
 
@@ -954,11 +1277,11 @@ func (a *DelayedAsyncQueue) Publish(ctx context.Context, data Event, delay time.
 
 	bs, _ := json.Marshal(data)
 
-	return a.redis.Publish(ctx, a.key, string(bs), delay)
+	return a.redis.Publish(ctx, a.key, bs, delay)
 }
 
 func (a *DelayedAsyncQueue) Subscribe(h func(ctx context.Context, data Event) error) {
-	a.redis.Subscribe(a.key, func(ctx context.Context, data string) error {
+	a.redis.Subscribe(a.key, func(ctx context.Context, data []byte) error {
 		a.wg.Add(1)
 		defer a.wg.Done()
 
@@ -986,31 +1309,36 @@ func NewDelayedAsyncQueue(redis store.DelayedQueue, key string, wg *sync.WaitGro
 }
 
 // Sleep means the task is exec success and sleep for d.
-func NewSleep(s TaskStatus, task string, d time.Duration) BreakStatus {
+func BreakSleep(s TaskStatus, task string, d time.Duration) BreakStatus {
 	return BreakStatus{Task: task, Status: "sleep", RunAt: time.Now().Add(d), TaskStatus: s}
 }
 
-// Done means the task is exec success
-func Done(s TaskStatus, task string) BreakStatus {
+// BreakDone means the task is exec success
+func BreakDone(s TaskStatus, task string) BreakStatus {
 	return BreakStatus{Status: "done", Task: task, TaskStatus: s}
 }
 
-// Done means the task is exec success
-func DoFunc(fun func() error) BreakStatus {
-	return BreakStatus{Status: "done"}
-}
-
 // Abort means abort the flow
-func Abort() BreakStatus {
+func BreakAbort() BreakStatus {
 	return BreakStatus{Status: "abort"}
 }
 
 // Abort means abort the flow
-func Retry(s TaskStatus, task string, err error) BreakStatus {
+func BreakRetry(s TaskStatus, task string, err error) BreakStatus {
 	return BreakStatus{Status: "retry", Task: task, Err: err, TaskStatus: s}
 }
 
-// Fail means abort the flow
-func Fail(s TaskStatus, task string, err error) BreakStatus {
+// BreakFail means abort the flow
+func BreakFail(s TaskStatus, task string, err error) BreakStatus {
 	return BreakStatus{Status: "fail", Task: task, Err: err, TaskStatus: s}
+}
+
+// BreakContuil
+func BreakContinue(s TaskStatus, task string) BreakStatus {
+	return BreakStatus{Status: "continue", Task: task, TaskStatus: s}
+}
+
+// BreakContuil
+func BreakWait(t time.Duration) BreakStatus {
+	return BreakStatus{Status: "wait", RunAt: time.Now().Add(t)}
 }

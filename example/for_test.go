@@ -64,7 +64,7 @@ func TestFor(t *testing.T) {
 		if ctx.CallId == currentCallId {
 			c()
 		}
-		log.Printf("Fail: %+v", ts)
+		log.Printf("BreakFail: %+v", ts)
 		return nil
 	})
 

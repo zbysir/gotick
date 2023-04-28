@@ -6,16 +6,16 @@ import (
 )
 
 type MockDelayedQueue struct {
-	callbacks map[string][]func(ctx context.Context, data string) error
+	callbacks map[string][]func(ctx context.Context, data []byte) error
 }
 
 var _ DelayedQueue = (*MockDelayedQueue)(nil)
 
 func NewMockRedisDelayedQueue() *MockDelayedQueue {
-	return &MockDelayedQueue{callbacks: map[string][]func(ctx context.Context, data string) error{}}
+	return &MockDelayedQueue{callbacks: map[string][]func(ctx context.Context, data []byte) error{}}
 }
 
-func (r *MockDelayedQueue) Publish(ctx context.Context, topic string, data string, delay time.Duration) error {
+func (r *MockDelayedQueue) Publish(ctx context.Context, topic string, data []byte, delay time.Duration) error {
 	go func() {
 		time.Sleep(delay)
 		for _, h := range r.callbacks[topic] {
@@ -26,7 +26,7 @@ func (r *MockDelayedQueue) Publish(ctx context.Context, topic string, data strin
 	return nil
 }
 
-func (r *MockDelayedQueue) Subscribe(topic string, h func(ctx context.Context, data string) error) {
+func (r *MockDelayedQueue) Subscribe(topic string, h func(ctx context.Context, data []byte) error) {
 	r.callbacks[topic] = append(r.callbacks[topic], h)
 }
 

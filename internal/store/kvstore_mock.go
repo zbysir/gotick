@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
+	"sync"
 	"time"
 )
 
 type MockNodeStatusStore struct {
-	m map[string]interface{}
+	m    map[string]interface{}
+	lock sync.Mutex
 }
 
 func NewMockNodeStatusStore() *MockNodeStatusStore {
@@ -16,6 +18,8 @@ func NewMockNodeStatusStore() *MockNodeStatusStore {
 }
 
 func (m *MockNodeStatusStore) Get(ctx context.Context, key string, r interface{}) (bool, error) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
 	v, ok := m.m[key]
 	if !ok {
 		return false, nil
@@ -26,11 +30,17 @@ func (m *MockNodeStatusStore) Get(ctx context.Context, key string, r interface{}
 }
 
 func (m *MockNodeStatusStore) Set(ctx context.Context, key string, value interface{}, expiration time.Duration) error {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
 	m.m[key] = value
 	return nil
 }
 
 func (m *MockNodeStatusStore) HGet(ctx context.Context, table string, key string, r interface{}) (bool, error) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
 	mp, ok := m.m[table+"_"]
 	if !ok {
 		return false, nil
@@ -47,6 +57,9 @@ func (m *MockNodeStatusStore) HGet(ctx context.Context, table string, key string
 }
 
 func (m *MockNodeStatusStore) HGetAll(ctx context.Context, table string) (map[string]string, bool, error) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
 	mp, ok := m.m[table+"_"]
 	if !ok {
 		return nil, false, nil
@@ -62,6 +75,9 @@ func (m *MockNodeStatusStore) HGetAll(ctx context.Context, table string) (map[st
 }
 
 func (m *MockNodeStatusStore) HSet(ctx context.Context, table string, key string, value interface{}, expiration time.Duration) error {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
 	mp, ok := m.m[table+"_"]
 	if !ok {
 		m.m[table+"_"] = map[string]interface{}{
@@ -75,6 +91,9 @@ func (m *MockNodeStatusStore) HSet(ctx context.Context, table string, key string
 }
 
 func (m *MockNodeStatusStore) Delete(ctx context.Context, key string) error {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
 	delete(m.m, key)
 	delete(m.m, key+"_")
 	return nil

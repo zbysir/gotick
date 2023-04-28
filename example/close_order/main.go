@@ -1,4 +1,4 @@
-package example
+package main
 
 import (
 	"github.com/zbysir/gotick"
@@ -6,12 +6,10 @@ import (
 	"github.com/zbysir/gotick/internal/store"
 	"log"
 	"sync"
-	"testing"
 	"time"
 )
 
-func TestCloseOrder(t *testing.T) {
-
+func main() {
 	tick := gotick.NewTickServer(gotick.Options{KvStore: store.NewMockNodeStatusStore(), DelayedQueue: store.NewMockRedisDelayedQueue()})
 	ctx, c := signal.NewContext()
 	var currentCallId string
@@ -51,18 +49,17 @@ func TestCloseOrder(t *testing.T) {
 		defer wg.Done()
 		err := tick.StartServer(ctx)
 		if err != nil {
-			t.Fatal(err)
+			log.Fatal(err)
 		}
 	}()
 
 	callId, err := tick.Trigger(ctx, "demo/close-order", map[string]string{"name": "bysir"})
 	if err != nil {
-		t.Fatal(err)
+		log.Fatal(err)
 	}
 	currentCallId = callId
 
-	t.Logf("Triggered callid: %v", callId)
+	log.Printf("Triggered callid: %v", callId)
 
 	wg.Wait()
-
 }

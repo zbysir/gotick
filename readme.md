@@ -20,9 +20,17 @@ GoTick is a out-of-the-box workflow engine.
 - 只依赖于 Redis。
 - 自身足够简单可信耐，依赖 [asynq](https://github.com/hibiken/asynq) 实现延时任务。
 
-## 为什么不使用 MQ？
+## 为什么不？
+
+### 延时 MQ
 - MQ 不能方便的组织多个依次执行的异步任务
 - MQ 不方便的管理任务的状态，比如失败之后更新数据。
+
+### AirFlow
+- 慢
+
+### [FastFlow](https://github.com/ShiningRush/fastflow)
+- 使用代码还是太复杂了，我想让异步代码和同步代码一样简单。
 
 ## Example
 
@@ -138,6 +146,18 @@ tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
 
 一个 TickServer 包含多个 Flow，一个 Flow 包含多个 Task。
 
+## API
+| API        | 说明                           | 用途                                                | 举例  |
+|------------|------------------------------|---------------------------------------------------|-----|
+| UseMemo    | 运行任务并存储结果，如果任务失败会重试，直到成功或者超时 | 如果一个任务依赖另一个任务的结果，应该使用 UseMemo 缓存任务结果              || 
+| Sleep      | 睡眠指定时间                       | 和 time.Sleep() 效果一样，不过不怕重启                        ||
+| At         | 睡眠到指定时间                      | 和 Sleep() 类似，不过需要传递的是期望的运行时间||
+| Task       | 运行一个任务                       | 如果一个任务不用返回数据，则可以使用 Task 代替 UseMemo                | |
+| UseSquence | 返回一个序列， 这个序列可以用来执行循环逻辑       | 如果要循环执行一个任务就需要使用到 UseSquence                      | |
+| UseArray   | 运行任务并存储数组结果                  | 如果一个任务返回的是一个数组，并且想要通过这个数组来循环执行一个任务就需要使用到 UseArray | |
+
+> 也许你需要理解 [gotick 如何工作]才能更加理解这些 API 的目的。
+
 ## 计划
 
 - 特性
@@ -145,7 +165,8 @@ tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
   - [ ] 支持循环调度
   - [ ] goto 到某一个 task (考虑使用场景中)
   - [ ] 支持设置任务的超时时间，超时后调用 Fail 回调
-  - [ ] 并行 task （考虑中）
+  - [ ] 并行 task
+    - 目前实现不太好实现并发，参考 https://github.com/ShiningRush/fastflow 可以更方便的做并发
 
 - UI
   - 可视化流程，可视化任务状态，统计次数 （通过节点的方式）
