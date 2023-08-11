@@ -208,7 +208,7 @@ fs := gotick.AsyncArray(ctx, "download", tasks, func(ctx *gotick.TaskContext, v 
 gotick.Wait(ctx, 4, fs...)
 ```
 
-> 也许你需要理解 [gotick 如何工作]才能更加理解这些 API 的目的。
+> 也许你需要理解 [gotick 如何工作 TODO](TODO)才能更加理解这些 API 的目的。
 
 ## 计划
 
@@ -226,3 +226,8 @@ gotick.Wait(ctx, 4, fs...)
       - react-flow
       - https://algorithm-visualizer.org/branch-and-bound/binary-search-tree
   - 查看每个 Task 的执行结果
+
+- DOC
+  - 解释代码运行流程：
+    - https://metaflow.org/ 首页有可参考的实现
+    - https://lit.dev/

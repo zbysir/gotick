@@ -201,7 +201,7 @@ func TestName2(t *testing.T) {
 //
 //		gotick.Sleep(30 * time.Minute)
 //
-//		gotick.Task(ctx, "1", func() {
+//		gotick.Cmd(ctx, "1", func() {
 //			// do something
 //
 //		})
@@ -215,7 +215,7 @@ func TestName2(t *testing.T) {
 //		})
 //
 //		for _, item := range product {
-//			gotick.Task(ctx, item, func() {
+//			gotick.Cmd(ctx, item, func() {
 //				// 如果一个 task 有人在运行了，则会跳过这个 task（不重复调度）。
 //				// 如果一个 task 执行失败了，则需要重试，重试逻辑是指定运行具名 task，跳过名字不匹配的 task
 //
@@ -225,7 +225,7 @@ func TestName2(t *testing.T) {
 //			// break
 //		}
 //
-//		gotick.Task(ctx, "end", func() {
+//		gotick.Cmd(ctx, "end", func() {
 //			// do something
 //		})
 //

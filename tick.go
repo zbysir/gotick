@@ -873,12 +873,30 @@ func GetCallId(ctx context.Context) string {
 
 var AbortError = errors.New("abort")
 
-func (t *TickServer) Flow(id string, fun func(ctx *Context) error) *Flow {
+type FlowOption func(f *Flow)
+
+func WithOnFail(fun func(ctx *Context, ts TaskStatus) error) FlowOption {
+	return func(f *Flow) {
+		f.onFail = fun
+	}
+}
+
+func WithOnSuccess(fun func(ctx *Context, ts TaskStatus) error) FlowOption {
+	return func(f *Flow) {
+		f.onSuccess = fun
+	}
+}
+
+func (t *TickServer) Flow(id string, fun func(ctx *Context) error, opts ...FlowOption) *Flow {
 	f := &Flow{
 		Id:        id,
 		fun:       fun,
 		onFail:    nil,
 		onSuccess: nil,
+	}
+
+	for _, o := range opts {
+		o(f)
 	}
 
 	// 注册调度
