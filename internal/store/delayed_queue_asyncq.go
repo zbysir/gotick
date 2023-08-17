@@ -19,8 +19,11 @@ type Asynq struct {
 
 func (a *Asynq) Start(ctx context.Context) error {
 	queues := map[string]int{}
+
+	// 只监听注册了的 topic
 	for k := range a.callback {
 		queues[k] = 1
+		queues[k+"_critical"] = 9
 	}
 
 	cli := &RawRedisClient{a.redisCli}
@@ -40,6 +43,7 @@ func (a *Asynq) Start(ctx context.Context) error {
 				return err
 			}
 		}
+
 		return nil
 	}))
 	if err != nil {
@@ -56,10 +60,19 @@ func (a *Asynq) Start(ctx context.Context) error {
 	return nil
 }
 
-func (a *Asynq) Publish(ctx context.Context, topic string, data []byte, delay time.Duration) error {
-	// log.Printf("Asynq Publish, taks: %v at %s", data, time.Now().Add(delay))
+type Option struct {
+	Critical bool // If true, it is scheduled first.
+}
 
-	_, err := a.cli.Enqueue(asynq.NewTask(topic, data), asynq.ProcessAt(time.Now().Add(delay)), asynq.Queue(topic))
+func (a *Asynq) Publish(ctx context.Context, topic string, data []byte, delay time.Duration, opt Option) error {
+	queueName := topic
+	if opt.Critical {
+		queueName = queueName + "_critical"
+	}
+	_, err := a.cli.EnqueueContext(ctx, asynq.NewTask(topic, data),
+		asynq.ProcessAt(time.Now().Add(delay)),
+		asynq.Queue(queueName),
+	)
 	if err != nil {
 		return err
 	}

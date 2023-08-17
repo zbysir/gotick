@@ -823,6 +823,7 @@ func (f *Flow) Fail(fun func(ctx *Context, ts TaskStatus) error) SuccessAble {
 
 type Event struct {
 	CallId       string
+	Critical     bool
 	InitMetaData MetaData // 只有当第一次调度时有效
 }
 
@@ -971,6 +972,7 @@ func (s *Scheduler) register(f *Flow) {
 					// 立即调度，实现并行
 					err := aw.Publish(ctx, Event{
 						CallId: callId,
+						Critical: true,
 					}, 0)
 					if err != nil {
 						log.Printf("scheduler event error: %v", err)
@@ -978,6 +980,7 @@ func (s *Scheduler) register(f *Flow) {
 				case "wait":
 					err := aw.Publish(ctx, Event{
 						CallId: callId,
+						Critical: true,
 					}, ns.RunAt.Sub(time.Now()))
 					if err != nil {
 						log.Printf("scheduler event error: %v", err)
@@ -988,6 +991,7 @@ func (s *Scheduler) register(f *Flow) {
 					// 进入下次调度
 					err := aw.Publish(ctx, Event{
 						CallId: callId,
+						Critical: true,
 					}, time.Duration(ns.TaskStatus.RetryCount)*time.Second)
 					if err != nil {
 						log.Printf("scheduler event error: %v", err)
@@ -1012,6 +1016,7 @@ func (s *Scheduler) register(f *Flow) {
 					_ = statusStore.SetNodeStatus(ns.Task, ns.TaskStatus.MakeSleep(ns.RunAt))
 					err := aw.Publish(ctx, Event{
 						CallId: callId,
+						Critical: true,
 					}, ns.RunAt.Sub(now))
 					if err != nil {
 						log.Printf("scheduler event error: %v", err)
@@ -1023,6 +1028,7 @@ func (s *Scheduler) register(f *Flow) {
 					// 进入下次调度
 					err := aw.Publish(ctx, Event{
 						CallId: callId,
+						Critical: true,
 					}, 0)
 					if err != nil {
 						log.Printf("scheduler event error: %v", err)
@@ -1309,7 +1315,9 @@ type DelayedAsyncQueue struct {
 
 func (a *DelayedAsyncQueue) Publish(ctx context.Context, data Event, delay time.Duration) error {
 	bs, _ := json.Marshal(data)
-	return a.delayedQueue.Publish(ctx, a.key, bs, delay)
+	return a.delayedQueue.Publish(ctx, a.key, bs, delay, store.Option{
+		Critical: data.Critical,
+	})
 }
 
 func (a *DelayedAsyncQueue) Subscribe(h func(ctx context.Context, data Event) error) {

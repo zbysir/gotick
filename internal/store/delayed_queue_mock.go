@@ -15,7 +15,7 @@ func NewMockRedisDelayedQueue() *MockDelayedQueue {
 	return &MockDelayedQueue{callbacks: map[string][]func(ctx context.Context, data []byte) error{}}
 }
 
-func (r *MockDelayedQueue) Publish(ctx context.Context, topic string, data []byte, delay time.Duration) error {
+func (r *MockDelayedQueue) Publish(ctx context.Context, topic string, data []byte, delay time.Duration, option Option) error {
 	go func() {
 		time.Sleep(delay)
 		for _, h := range r.callbacks[topic] {
