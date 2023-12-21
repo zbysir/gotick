@@ -1,6 +1,7 @@
 package example
 
 import (
+	"fmt"
 	"github.com/zbysir/gotick"
 	"github.com/zbysir/gotick/internal/pkg/signal"
 	"github.com/zbysir/gotick/internal/store"
@@ -10,12 +11,14 @@ import (
 	"time"
 )
 
+var mockTick = gotick.NewTickServer(gotick.Options{
+	KvStore:      store.NewMockNodeStatusStore(),
+	DelayedQueue: store.NewMockRedisDelayedQueue(),
+	ListenAddr:   ":8080",
+})
+
 func TestServer(t *testing.T) {
-	tick := gotick.NewTickServer(gotick.Options{
-		KvStore:      store.NewMockNodeStatusStore(),
-		DelayedQueue: store.NewMockRedisDelayedQueue(),
-		ListenAddr:   ":8080",
-	})
+	tick := mockTick
 	ctx, c := signal.NewContext()
 
 	defer c()
@@ -59,6 +62,46 @@ func TestServer(t *testing.T) {
 			t.Fatal(err)
 		}
 	}()
+
+	wg.Wait()
+}
+
+func TestFail(t *testing.T) {
+	tick := mockTick
+	ctx, c := signal.NewContext()
+
+	defer c()
+
+	tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
+		gotick.Task(ctx, "text", func(ctx *gotick.TaskContext) error {
+			return fmt.Errorf("test error")
+		})
+		t.Logf("running: %v, %v", ctx.MetaDataAll(), time.Now())
+		return nil
+	}).OnError(func(ctx *gotick.Context, ts gotick.TaskStatus) error {
+		t.Logf("OnError: %v", ts)
+		return nil
+	}).OnFail(func(ctx *gotick.Context, ts gotick.TaskStatus) error {
+		t.Logf("OnFail: %v", ts)
+		return nil
+	})
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := tick.StartServer(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	id, err := tick.Trigger(ctx, "demo/close-order", map[string]string{"name": "bysir"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf("%+v", id)
 
 	wg.Wait()
 }

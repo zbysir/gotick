@@ -44,7 +44,7 @@ func main() {
 			c()
 		}
 		return nil
-	}).Fail(func(ctx *gotick.Context, ts gotick.TaskStatus) error {
+	}).OnFail(func(ctx *gotick.Context, ts gotick.TaskStatus) error {
 		log.Printf("[%s] fail %+v", time.Since(start), ts.Errs)
 		if ctx.CallId == currentCallId {
 			c()

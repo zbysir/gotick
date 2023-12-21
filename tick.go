@@ -565,6 +565,7 @@ func (t TaskStatus) MakeDone() TaskStatus {
 
 func (t TaskStatus) MakeFail(err error) TaskStatus {
 	t.Status = "fail"
+	t.RetryCount += 1
 	if err != nil {
 		t.Errs = append(t.Errs, err.Error())
 	}
@@ -719,6 +720,7 @@ type Flow struct {
 	Id        string
 	fun       func(ctx *Context) error
 	onFail    func(ctx *Context, ts TaskStatus) error
+	onError   func(ctx *Context, ts TaskStatus) error
 	onSuccess func(ctx *Context, ts TaskStatus) error
 }
 
@@ -811,13 +813,17 @@ func (f *Flow) DAG() (flow.DAG, error) {
 	return dag, err
 }
 
-func (f *Flow) Success(fun func(ctx *Context, ts TaskStatus) error) FailAble {
-	f.onSuccess = fun
+func (f *Flow) OnSuccess(fun func(ctx *Context, ts TaskStatus) error) *Flow {
 	return f
 }
 
-func (f *Flow) Fail(fun func(ctx *Context, ts TaskStatus) error) SuccessAble {
+func (f *Flow) OnFail(fun func(ctx *Context, ts TaskStatus) error) *Flow {
 	f.onFail = fun
+	return f
+}
+
+func (f *Flow) OnError(fun func(ctx *Context, ts TaskStatus) error) *Flow {
+	f.onError = fun
 	return f
 }
 
@@ -840,22 +846,6 @@ type BreakStatus struct {
 	Task       string
 	Err        error
 	TaskStatus TaskStatus
-}
-
-type ThenAble interface {
-	SuccessAble
-	FailAble
-	Then(key string, c NodeCaller, opts ...TaskOption) ThenAble
-}
-
-type SuccessAble interface {
-	// Success When task exec success, will call this function
-	Success(f func(ctx *Context, ts TaskStatus) error) FailAble
-}
-
-type FailAble interface {
-	// Fail When task exec fail, will call this function
-	Fail(f func(ctx *Context, ts TaskStatus) error) SuccessAble
 }
 
 type NodeCaller func(ctx context.Context) (BreakStatus, error)
@@ -885,6 +875,12 @@ func WithOnFail(fun func(ctx *Context, ts TaskStatus) error) FlowOption {
 func WithOnSuccess(fun func(ctx *Context, ts TaskStatus) error) FlowOption {
 	return func(f *Flow) {
 		f.onSuccess = fun
+	}
+}
+
+func WithOnError(fun func(ctx *Context, ts TaskStatus) error) FlowOption {
+	return func(f *Flow) {
+		f.onError = fun
 	}
 }
 
@@ -971,7 +967,7 @@ func (s *Scheduler) register(f *Flow) {
 				case "continue":
 					// 立即调度，实现并行
 					err := aw.Publish(ctx, Event{
-						CallId: callId,
+						CallId:   callId,
 						Critical: true,
 					}, 0)
 					if err != nil {
@@ -979,7 +975,7 @@ func (s *Scheduler) register(f *Flow) {
 					}
 				case "wait":
 					err := aw.Publish(ctx, Event{
-						CallId: callId,
+						CallId:   callId,
 						Critical: true,
 					}, ns.RunAt.Sub(time.Now()))
 					if err != nil {
@@ -987,27 +983,35 @@ func (s *Scheduler) register(f *Flow) {
 					}
 				case "retry":
 					// 存储重试次数
-					_ = statusStore.SetNodeStatus(ns.Task, ns.TaskStatus.MakeRetry(ns.Err))
+					newStatus := ns.TaskStatus.MakeRetry(ns.Err)
+					_ = statusStore.SetNodeStatus(ns.Task, newStatus)
+
+					if f.onError != nil {
+						err := f.onError(ctx, newStatus)
+						if err != nil {
+							log.Printf("[gotick error] error: %v", err)
+						}
+					}
 					// 进入下次调度
 					err := aw.Publish(ctx, Event{
-						CallId: callId,
+						CallId:   callId,
 						Critical: true,
 					}, time.Duration(ns.TaskStatus.RetryCount)*time.Second)
 					if err != nil {
-						log.Printf("scheduler event error: %v", err)
+						log.Printf("[gotick error] Publish error: %v", err)
 					}
 				case "abort":
 					if f.onFail != nil {
 						err := f.onFail(ctx, ns.TaskStatus.MakeAbort())
 						if err != nil {
-							panic(err)
+							log.Printf("[gotick error] onFail error: %v", err)
 						}
 					}
 				case "fail":
 					if f.onFail != nil {
 						err := f.onFail(ctx, ns.TaskStatus.MakeFail(ns.Err))
 						if err != nil {
-							panic(err)
+							log.Printf("[gotick error] onFail error: %v", err)
 						}
 					}
 				case "sleep":
@@ -1015,11 +1019,11 @@ func (s *Scheduler) register(f *Flow) {
 					now := time.Now()
 					_ = statusStore.SetNodeStatus(ns.Task, ns.TaskStatus.MakeSleep(ns.RunAt))
 					err := aw.Publish(ctx, Event{
-						CallId: callId,
+						CallId:   callId,
 						Critical: true,
 					}, ns.RunAt.Sub(now))
 					if err != nil {
-						log.Printf("scheduler event error: %v", err)
+						log.Printf("[gotick error] Publish error: %v", err)
 					}
 				case "done":
 					fallthrough
@@ -1027,15 +1031,17 @@ func (s *Scheduler) register(f *Flow) {
 					_ = statusStore.SetNodeStatus(ns.Task, ns.TaskStatus.MakeDone())
 					// 进入下次调度
 					err := aw.Publish(ctx, Event{
-						CallId: callId,
+						CallId:   callId,
 						Critical: true,
 					}, 0)
 					if err != nil {
-						log.Printf("scheduler event error: %v", err)
+						log.Printf("[gotick error] Publish error: %v", err)
 					}
 				}
 			}()
 
+			// 正确情况下不应该返回 error，因为这个 error 会直接交给 asyncq 处理，脱离了框架控制。
+			// 都应该在 gotick.Task 中返回 error
 			return f.fun(ctx)
 		}()
 		if err != nil {
