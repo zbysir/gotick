@@ -14,7 +14,7 @@ import (
 var mockTick = gotick.NewTickServer(gotick.Options{
 	KvStore:      store.NewMockNodeStatusStore(),
 	DelayedQueue: store.NewMockRedisDelayedQueue(),
-	ListenAddr:   ":8080",
+	ListenAddr:   "",
 })
 
 func TestServer(t *testing.T) {
@@ -23,7 +23,7 @@ func TestServer(t *testing.T) {
 
 	defer c()
 
-	tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
+	tick.Flow("demo/close-order", func(ctx *gotick.Context) {
 		//log.Printf("schedule callId: %v", ctx.CallId)
 		startAt := gotick.Memo(ctx, "start_at", func() (time.Time, error) {
 			return time.Now(), nil
@@ -50,7 +50,7 @@ func TestServer(t *testing.T) {
 		})
 
 		log.Printf("meta %+v", ctx.MetaDataAll())
-		return nil
+		return
 	})
 
 	var wg sync.WaitGroup
@@ -72,17 +72,67 @@ func TestFail(t *testing.T) {
 
 	defer c()
 
-	tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
+	tick.Flow("demo/close-order", func(ctx *gotick.Context) {
+		t.Logf("running: %v, %v", ctx.MetaDataAll(), time.Now())
 		gotick.Task(ctx, "text", func(ctx *gotick.TaskContext) error {
 			return fmt.Errorf("test error")
 		})
-		t.Logf("running: %v, %v", ctx.MetaDataAll(), time.Now())
-		return nil
+		return
 	}).OnError(func(ctx *gotick.Context, ts gotick.TaskStatus) error {
 		t.Logf("OnError: %v", ts)
 		return nil
 	}).OnFail(func(ctx *gotick.Context, ts gotick.TaskStatus) error {
 		t.Logf("OnFail: %v", ts)
+		c()
+		return nil
+	})
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := tick.StartServer(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	id, err := tick.Trigger(ctx, "demo/close-order", map[string]string{"name": "bysir"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf("%+v", id)
+
+	wg.Wait()
+}
+
+func TestSuccess(t *testing.T) {
+	tick := mockTick
+	ctx, c := signal.NewContext()
+
+	defer c()
+
+	tick.Flow("demo/close-order", func(ctx *gotick.Context) {
+		gotick.Task(ctx, "t1", func(ctx *gotick.TaskContext) error {
+			t.Logf("running t1: %v, %v", ctx.MetaDataAll(), time.Now())
+			return nil
+		})
+		gotick.Task(ctx, "t2", func(ctx *gotick.TaskContext) error {
+			t.Logf("running t2: %v, %v", ctx.MetaDataAll(), time.Now())
+			return nil
+		})
+		return
+	}).OnError(func(ctx *gotick.Context, ts gotick.TaskStatus) error {
+		t.Logf("OnError: %v", ts)
+		return nil
+	}).OnFail(func(ctx *gotick.Context, ts gotick.TaskStatus) error {
+		t.Logf("OnFail: %v", ts)
+		c()
+		return nil
+	}).OnSuccess(func(ctx *gotick.Context) error {
+		t.Logf("OnSuccess")
+		c()
 		return nil
 	})
 

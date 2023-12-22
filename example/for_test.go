@@ -20,7 +20,7 @@ func TestFor(t *testing.T) {
 	ctx, c := signal.NewContext()
 	var currentCallId string
 
-	tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
+	tick.Flow("demo/close-order", func(ctx *gotick.Context) {
 		//log.Printf("schedule callId: %v", ctx.CallId)
 		startAt := gotick.Memo(ctx, "start_at", func() (time.Time, error) {
 			return time.Now(), nil
@@ -48,7 +48,7 @@ func TestFor(t *testing.T) {
 				}
 				log.Printf("[%v] send email to '%v' success at %v", ctx.CallId, task.Value(), time.Now().Sub(startAt))
 				return nil
-			})
+			}, gotick.WithMaxRetry(6))
 		}
 
 		gotick.Task(ctx, "done", func(ctx *gotick.TaskContext) error {
@@ -59,12 +59,12 @@ func TestFor(t *testing.T) {
 		if ctx.CallId == currentCallId {
 			c()
 		}
-		return nil
+		return
 	}).OnFail(func(ctx *gotick.Context, ts gotick.TaskStatus) error {
 		if ctx.CallId == currentCallId {
 			c()
 		}
-		log.Printf("BreakFail: %+v", ts)
+		log.Printf("breakFail: %+v", ts)
 		return nil
 	})
 
@@ -95,7 +95,7 @@ func TestSequence(t *testing.T) {
 	ctx, c := signal.NewContext()
 	var currentCallId string
 
-	tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
+	tick.Flow("demo/close-order", func(ctx *gotick.Context) {
 		//log.Printf("schedule callId: %v", ctx.CallId)
 		startAt := gotick.Memo(ctx, "start_at", func() (time.Time, error) {
 			return time.Now(), nil
@@ -126,6 +126,9 @@ func TestSequence(t *testing.T) {
 		if ctx.CallId == currentCallId {
 			c()
 		}
+		return
+	}).OnSuccess(func(ctx *gotick.Context) error {
+		log.Printf("onSuccess")
 		return nil
 	})
 

@@ -71,7 +71,7 @@ type SequenceWrap struct {
 	Current int
 	max     int
 	name    string
-	ctx     *Context `json:"-"`
+	ctx     *Context
 }
 
 func (s *SequenceWrap) TaskKey(prefix string) string {
@@ -241,7 +241,8 @@ func Wait(ctx *Context, parallel int, fs ...Future) {
 			case "done":
 				done = true
 			case "fail":
-				panic(BreakFail(s, f.key(), nil))
+				// 如果有一个任务失败了，则算整个失败。
+				panic(BreakFail(f.key(), fmt.Errorf("task %v, error %v: ", s.Key, strings.Join(s.Errs, ";"))))
 			}
 
 			if done {
@@ -447,39 +448,36 @@ func (t *Context) Lock() func() {
 	}
 }
 
-// 同名的 task 在同意时间只能执行一次，加锁
+// Task 同名的 task 在同一时间只能执行一次
 func Task(c *Context, key string, fun TaskFun, opts ...TaskOption) {
 	if c.collect != nil {
 		if c.collect("task", key) {
 			return
 		}
 	}
-	//defer c.Lock()()
 
 	s, exist, _ := c.store.GetNodeStatus(key)
+	if s.Status == "done" {
+		return
+	}
 
 	o := TaskOptions(opts).build()
 
 	taskContext := newTaskContext(c, s)
-	if !exist {
+	if !exist || s.Status == "retry" {
 		err := fun(taskContext)
 		if err != nil {
-			if s.RetryCount > o.MaxRetry {
-				panic(BreakFail(s, key, err))
+			if errors.Is(err, AbortError) {
+				panic(BreakAbort(key, err))
 			}
-			panic(BreakRetry(s, key, err))
-		}
-		panic(BreakDone(s, key))
-	}
-	if s.Status == "retry" {
-		err := fun(taskContext)
-		if err != nil {
 			if s.RetryCount > o.MaxRetry {
-				panic(BreakFail(s, key, err))
+				panic(BreakFail(key, err))
 			}
-			panic(BreakRetry(s, key, err))
+			panic(BreakRetry(key, err))
 		}
-		panic(BreakDone(s, key))
+
+		// 执行成功也需要断点，因为需要依靠断点来存储状态。
+		panic(BreakDone(key))
 	}
 }
 
@@ -490,20 +488,24 @@ func Sleep(c *Context, key string, duration time.Duration) {
 		}
 	}
 	s, exist, _ := c.store.GetNodeStatus(key)
-	// todo panic error
+	// todo panic error，这个错误应该直接交给 MQ 重试兜底
+
+	if s.Status == "done" {
+		return
+	}
 
 	if !exist {
-		panic(BreakSleep(s, key, duration))
+		panic(BreakSleep(key, duration))
 	}
 
 	if s.Status == "sleep" {
 		d := s.RunAt.Sub(time.Now())
 		if d > 0 {
-			panic(BreakSleep(s, key, d))
+			panic(BreakSleep(key, d))
 		}
 
 		_ = c.store.SetNodeStatus(key, s.MakeDone())
-		// todo panic error
+		// todo panic error，这个错误应该直接交给 MQ 重试兜底
 	}
 }
 
@@ -545,13 +547,13 @@ type Set interface {
 }
 
 type TaskStatus struct {
+	Key string
 	// fail, 超过重试次数就算失败
 	// abort, 手动终止流程
 	// sleep, 等待中
 	// retry, 重试中
 	// done, 完成
 	// running, 异步任务正在运行
-	Key        string
 	Status     string    `json:"status"`
 	RunAt      time.Time `json:"run_at"` // sleep 到的时间
 	Errs       []string  `json:"errs"`   // 每次重试都有错误
@@ -599,6 +601,7 @@ func (t TaskStatus) MakeRetry(err error) TaskStatus {
 type NodeStatusStore interface {
 	GetNodeStatus(key string) (TaskStatus, bool, error) // 获取每个 task 的运行状态
 	SetNodeStatus(key string, value TaskStatus, ttl ...time.Duration) error
+	UpdateNodeStatus(key string, fu func(status TaskStatus, isNew bool) TaskStatus) (TaskStatus, error)
 	GetKVAll() (map[string]string, error)
 	SetKV(k string, v string) error
 	GetKV(k string) (string, bool, error)
@@ -718,10 +721,11 @@ type TickClient struct {
 
 type Flow struct {
 	Id        string
-	fun       func(ctx *Context) error
+	fun       func(ctx *Context)
 	onFail    func(ctx *Context, ts TaskStatus) error
 	onError   func(ctx *Context, ts TaskStatus) error
-	onSuccess func(ctx *Context, ts TaskStatus) error
+	onSuccess func(ctx *Context) error
+	opt       flowOpt
 }
 
 // DAG 生成一个数据流图
@@ -729,7 +733,7 @@ type Flow struct {
 func (f *Flow) DAG() (flow.DAG, error) {
 	dag := flow.DAG{}
 
-	err := f.fun(&Context{
+	f.fun(&Context{
 		Context: nil,
 		CallId:  "dag",
 		store:   nil,
@@ -810,10 +814,11 @@ func (f *Flow) DAG() (flow.DAG, error) {
 		},
 	})
 
-	return dag, err
+	return dag, nil
 }
 
-func (f *Flow) OnSuccess(fun func(ctx *Context, ts TaskStatus) error) *Flow {
+func (f *Flow) OnSuccess(fun func(ctx *Context) error) *Flow {
+	f.onSuccess = fun
 	return f
 }
 
@@ -822,6 +827,7 @@ func (f *Flow) OnFail(fun func(ctx *Context, ts TaskStatus) error) *Flow {
 	return f
 }
 
+// OnError 添加一个错误回调，和 task 一样，错误回调也支持重试。
 func (f *Flow) OnError(fun func(ctx *Context, ts TaskStatus) error) *Flow {
 	f.onError = fun
 	return f
@@ -841,14 +847,11 @@ type AsyncQueue interface {
 }
 
 type BreakStatus struct {
-	Status     string // abort, sleep, retry, done, fail
-	RunAt      time.Time
-	Task       string
-	Err        error
-	TaskStatus TaskStatus
+	Type  string    // abort, sleep, retry, done, fail
+	RunAt time.Time // 当 sleep 时，表示下次调度的时间
+	Task  string    // 表示触发的是哪一个 task 内部断点
+	Err   error
 }
-
-type NodeCaller func(ctx context.Context) (BreakStatus, error)
 
 func WithCallId(ctx context.Context, callId string) context.Context {
 	return context.WithValue(ctx, "callId", callId)
@@ -864,27 +867,21 @@ func GetCallId(ctx context.Context) string {
 
 var AbortError = errors.New("abort")
 
-type FlowOption func(f *Flow)
+type FlowOption func(f *flowOpt)
 
-func WithOnFail(fun func(ctx *Context, ts TaskStatus) error) FlowOption {
-	return func(f *Flow) {
-		f.onFail = fun
+type flowOpt struct {
+	timeout time.Duration
+}
+
+// WithTimeout 控制执行整个 flow 的超时时间，超时后将会中断任务并调用 onFail.
+func WithTimeout(t time.Duration) FlowOption {
+	return func(f *flowOpt) {
+		f.timeout = t
 	}
 }
 
-func WithOnSuccess(fun func(ctx *Context, ts TaskStatus) error) FlowOption {
-	return func(f *Flow) {
-		f.onSuccess = fun
-	}
-}
-
-func WithOnError(fun func(ctx *Context, ts TaskStatus) error) FlowOption {
-	return func(f *Flow) {
-		f.onError = fun
-	}
-}
-
-func (t *TickServer) Flow(id string, fun func(ctx *Context) error, opts ...FlowOption) *Flow {
+// Flow Define a flow
+func (t *TickServer) Flow(id string, fun func(ctx *Context), opts ...FlowOption) *Flow {
 	f := &Flow{
 		Id:        id,
 		fun:       fun,
@@ -893,7 +890,7 @@ func (t *TickServer) Flow(id string, fun func(ctx *Context) error, opts ...FlowO
 	}
 
 	for _, o := range opts {
-		o(f)
+		o(&f.opt)
 	}
 
 	// 注册调度
@@ -940,7 +937,7 @@ func (s *Scheduler) register(f *Flow) {
 		//	ctx = WithMetaData(ctx, m)
 		//}
 
-		err := func() error {
+		err := func() (err error) {
 			ctx := &Context{
 				Context: ctx,
 				CallId:  callId,
@@ -954,104 +951,147 @@ func (s *Scheduler) register(f *Flow) {
 					return
 				}
 
-				ns, ok := r.(BreakStatus)
+				ns, ok := r.(Breakpoint)
 				if !ok {
 					panic(r)
 				}
 
-				if s.debug {
-					log.Printf("[gotick] %v", ns)
-				}
-
-				switch ns.Status {
-				case "continue":
+				switch breakpoint := ns.(type) {
+				case *breakContinue:
 					// 立即调度，实现并行
-					err := aw.Publish(ctx, Event{
+					err = aw.Publish(ctx, Event{
 						CallId:   callId,
 						Critical: true,
 					}, 0)
 					if err != nil {
 						log.Printf("scheduler event error: %v", err)
+						return
 					}
-				case "wait":
-					err := aw.Publish(ctx, Event{
+				case *breakWait:
+					err = aw.Publish(ctx, Event{
 						CallId:   callId,
 						Critical: true,
-					}, ns.RunAt.Sub(time.Now()))
+					}, breakpoint.RunAt.Sub(time.Now()))
 					if err != nil {
 						log.Printf("scheduler event error: %v", err)
+						return
 					}
-				case "retry":
+				case *breakRetry:
 					// 存储重试次数
-					newStatus := ns.TaskStatus.MakeRetry(ns.Err)
-					_ = statusStore.SetNodeStatus(ns.Task, newStatus)
+					var newStatus TaskStatus
+					newStatus, err = statusStore.UpdateNodeStatus(breakpoint.Task, func(status TaskStatus, isNew bool) TaskStatus {
+						return status.MakeRetry(breakpoint.Err)
+					})
 
 					if f.onError != nil {
-						err := f.onError(ctx, newStatus)
+						err = f.onError(ctx, newStatus)
 						if err != nil {
-							log.Printf("[gotick error] error: %v", err)
+							// TODO retry when onError error
+							log.Printf("[gotick error] onFail error: %v", err)
 						}
 					}
 					// 进入下次调度
-					err := aw.Publish(ctx, Event{
+					err = aw.Publish(ctx, Event{
 						CallId:   callId,
 						Critical: true,
-					}, time.Duration(ns.TaskStatus.RetryCount)*time.Second)
+					}, time.Duration(newStatus.RetryCount)*time.Second) // TODO 支持指定算法计算回退时间
 					if err != nil {
 						log.Printf("[gotick error] Publish error: %v", err)
 					}
-				case "abort":
+				case *breakAbort:
+					var newStatus TaskStatus
+					newStatus, err = statusStore.UpdateNodeStatus(breakpoint.Task, func(status TaskStatus, isNew bool) TaskStatus {
+						return status.MakeAbort()
+					})
+					if err != nil {
+						return
+					}
 					if f.onFail != nil {
-						err := f.onFail(ctx, ns.TaskStatus.MakeAbort())
+						err = f.onFail(ctx, newStatus)
 						if err != nil {
 							log.Printf("[gotick error] onFail error: %v", err)
 						}
 					}
-				case "fail":
+				case *breakFail:
+					var newStatus TaskStatus
+					newStatus, err = statusStore.UpdateNodeStatus(breakpoint.Task, func(status TaskStatus, isNew bool) TaskStatus {
+						return status.MakeFail(breakpoint.Err)
+					})
+					if err != nil {
+						return
+					}
 					if f.onFail != nil {
-						err := f.onFail(ctx, ns.TaskStatus.MakeFail(ns.Err))
+						err = f.onFail(ctx, newStatus)
 						if err != nil {
 							log.Printf("[gotick error] onFail error: %v", err)
 						}
 					}
-				case "sleep":
+				case *breakSleep:
 					// 进入下次调度
+					// TODO 考虑先入队，然后更改状态
+					_, err = statusStore.UpdateNodeStatus(breakpoint.Task, func(status TaskStatus, isNew bool) TaskStatus {
+						return status.MakeSleep(breakpoint.RunAt)
+					})
+					if err != nil {
+						return
+					}
+
 					now := time.Now()
-					_ = statusStore.SetNodeStatus(ns.Task, ns.TaskStatus.MakeSleep(ns.RunAt))
-					err := aw.Publish(ctx, Event{
+					err = aw.Publish(ctx, Event{
 						CallId:   callId,
 						Critical: true,
-					}, ns.RunAt.Sub(now))
+					}, breakpoint.RunAt.Sub(now))
 					if err != nil {
 						log.Printf("[gotick error] Publish error: %v", err)
+						return
 					}
-				case "done":
-					fallthrough
-				default:
-					_ = statusStore.SetNodeStatus(ns.Task, ns.TaskStatus.MakeDone())
-					// 进入下次调度
-					err := aw.Publish(ctx, Event{
+				case *breakDone:
+					_, err = statusStore.UpdateNodeStatus(breakpoint.Task, func(status TaskStatus, isNew bool) TaskStatus {
+						return status.MakeDone()
+					})
+					if err != nil {
+						return
+					}
+
+					err = aw.Publish(ctx, Event{
 						CallId:   callId,
 						Critical: true,
 					}, 0)
 					if err != nil {
 						log.Printf("[gotick error] Publish error: %v", err)
+						return
 					}
 				}
 			}()
 
 			// 正确情况下不应该返回 error，因为这个 error 会直接交给 asyncq 处理，脱离了框架控制。
 			// 都应该在 gotick.Task 中返回 error
-			return f.fun(ctx)
+			f.fun(ctx)
+
+			if err != nil {
+				return nil
+			}
+
+			// 全部执行完成，触发 onSuccess
+			if f.onSuccess != nil {
+				err := f.onSuccess(ctx)
+				if err != nil {
+					return err
+				}
+			}
+
+			return err
 		}()
 		if err != nil {
+			// 如果返回错误，则会进入到消息队列的默认重试机制。
+			// 通常是调用消息队列新增任务等无法正常进入下一步流程等致命错误，程序逻辑已经无法处理，只能交由消息队列处理。
 			return err
 		}
 		//
 		//if f.onSuccess != nil {
 		//	// 如果什么都没做，默认就是完成状态
 		//	taskStatus := TaskStatus{
-		//		Status: "done",
+		//		Type: "done",
 		//	}
 		//	err := f.onSuccess(ctx, taskStatus)
 		//	if err != nil {
@@ -1164,6 +1204,20 @@ func (n *KvNodeStatusStore) Clear() error {
 
 func NewKvNodeStatusStore(store store.KVStore, key string) *KvNodeStatusStore {
 	return &KvNodeStatusStore{store: store, key: key}
+}
+
+func (n *KvNodeStatusStore) UpdateNodeStatus(key string, fu func(status TaskStatus, isNew bool) TaskStatus) (TaskStatus, error) {
+	old, ok, err := n.GetNodeStatus(key)
+	if err != nil {
+		return old, err
+	}
+
+	nw := fu(old, !ok)
+	err = n.SetNodeStatus(key, nw)
+	if err != nil {
+		return old, err
+	}
+	return nw, nil
 }
 
 func (n *KvNodeStatusStore) GetNodeStatus(key string) (TaskStatus, bool, error) {
@@ -1353,39 +1407,4 @@ func NewDelayedAsyncQueue(redis store.DelayedQueue, key string, wg *sync.WaitGro
 		wg:           wg,
 		closeChan:    closeChan,
 	}
-}
-
-// Sleep means the task is exec success and sleep for d.
-func BreakSleep(s TaskStatus, task string, d time.Duration) BreakStatus {
-	return BreakStatus{Task: task, Status: "sleep", RunAt: time.Now().Add(d), TaskStatus: s}
-}
-
-// BreakDone means the task is exec success
-func BreakDone(s TaskStatus, task string) BreakStatus {
-	return BreakStatus{Status: "done", Task: task, TaskStatus: s}
-}
-
-// Abort means abort the flow
-func BreakAbort() BreakStatus {
-	return BreakStatus{Status: "abort"}
-}
-
-// Abort means abort the flow
-func BreakRetry(s TaskStatus, task string, err error) BreakStatus {
-	return BreakStatus{Status: "retry", Task: task, Err: err, TaskStatus: s}
-}
-
-// BreakFail means abort the flow
-func BreakFail(s TaskStatus, task string, err error) BreakStatus {
-	return BreakStatus{Status: "fail", Task: task, Err: err, TaskStatus: s}
-}
-
-// BreakContinue 始终再次执行
-func BreakContinue() BreakStatus {
-	return BreakStatus{Status: "continue"}
-}
-
-// BreakContuil
-func BreakWait(t time.Duration) BreakStatus {
-	return BreakStatus{Status: "wait", RunAt: time.Now().Add(t)}
 }

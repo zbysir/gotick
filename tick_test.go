@@ -9,7 +9,7 @@ import (
 func TestDag(t *testing.T) {
 	f := Flow{
 		Id: "",
-		fun: func(ctx *Context) error {
+		fun: func(ctx *Context) {
 			Task(ctx, "start", func(ctx *TaskContext) error {
 				return nil
 			})
@@ -28,7 +28,7 @@ func TestDag(t *testing.T) {
 
 			Task(ctx, "end", nil)
 
-			return nil
+			return
 		},
 		onFail:    nil,
 		onSuccess: nil,
