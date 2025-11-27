@@ -2,13 +2,14 @@ package store
 
 import (
 	"context"
-	"github.com/go-redis/redis/v8"
-	"github.com/hibiken/asynq"
 	"time"
+
+	"github.com/hibiken/asynq"
+	"github.com/redis/go-redis/v9"
 )
 
 type Asynq struct {
-	//srv *asynq.Server
+	opt asynq.Config
 	cli *asynq.Client
 
 	redisCli redis.UniversalClient
@@ -26,17 +27,18 @@ func (a *Asynq) Start(ctx context.Context) error {
 		queues[k+"_critical"] = 9
 	}
 
-	cli := &RawRedisClient{a.redisCli}
 	srv := asynq.NewServer(
-		cli,
+		&RawRedisClient{c: a.redisCli},
 		asynq.Config{
-			Concurrency:              10,
-			DelayedTaskCheckInterval: time.Millisecond * 10,
-			Queues:                   queues,
+			Concurrency: 10,
+			// DelayedTaskCheckInterval: time.Millisecond * 1000,
+			Queues:            queues,
+			TaskCheckInterval: time.Millisecond * 100,
 		},
 	)
 
 	err := srv.Start(asynq.HandlerFunc(func(ctx context.Context, task *asynq.Task) error {
+		// log.Printf("[gotick] ------ call: queue: %v ------", task.Type())
 		for _, c := range a.callback[task.Type()] {
 			err := c(ctx, task)
 			if err != nil {
@@ -69,6 +71,7 @@ func (a *Asynq) Publish(ctx context.Context, topic string, data []byte, delay ti
 	if opt.Critical {
 		queueName = queueName + "_critical"
 	}
+	// log.Printf("[gotick] ------ publish: %v, queue: %v, runat: %v ------", topic, queueName, time.Now().Add(delay))
 	_, err := a.cli.EnqueueContext(ctx, asynq.NewTask(topic, data),
 		asynq.ProcessAt(time.Now().Add(delay)),
 		asynq.Queue(queueName),
@@ -96,13 +99,12 @@ func (r *RawRedisClient) MakeRedisClient() interface{} {
 	return r.c
 }
 
-func NewAsynq(redisCli redis.UniversalClient) *Asynq {
-	cli := &RawRedisClient{redisCli}
+func NewAsynq(redisCli redis.UniversalClient, opt asynq.Config) *Asynq {
 
-	client := asynq.NewClient(cli)
+	client := asynq.NewClient(&RawRedisClient{c: redisCli})
 
 	return &Asynq{
-		//srv:      srv,
+		opt:      opt,
 		cli:      client,
 		redisCli: redisCli,
 		callback: map[string][]func(ctx context.Context, task *asynq.Task) error{},

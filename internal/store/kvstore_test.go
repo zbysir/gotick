@@ -2,10 +2,11 @@ package store
 
 import (
 	"context"
-	"github.com/go-redis/redis/v8"
-	"github.com/stretchr/testify/assert"
 	"testing"
 	"time"
+
+	"github.com/redis/go-redis/v9"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestStore(t *testing.T) {

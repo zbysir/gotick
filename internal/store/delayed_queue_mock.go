@@ -16,6 +16,8 @@ func NewMockRedisDelayedQueue() *MockDelayedQueue {
 }
 
 func (r *MockDelayedQueue) Publish(ctx context.Context, topic string, data []byte, delay time.Duration, option Option) error {
+	// 发布和执行的 ctx 需要分开
+	ctx = context.WithoutCancel(ctx)
 	go func() {
 		time.Sleep(delay)
 		for _, h := range r.callbacks[topic] {

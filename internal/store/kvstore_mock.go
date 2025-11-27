@@ -13,17 +13,17 @@ type LifeValue struct {
 	value interface{}
 }
 
-type MockNodeStatusStore struct {
+type MockKvStore struct {
 	m    map[string]LifeValue
 	hm   map[string]map[string]LifeValue
 	lock sync.Mutex
 }
 
-func NewMockNodeStatusStore() *MockNodeStatusStore {
-	return &MockNodeStatusStore{m: map[string]LifeValue{}, hm: map[string]map[string]LifeValue{}}
+func NewMockKvStore() *MockKvStore {
+	return &MockKvStore{m: map[string]LifeValue{}, hm: map[string]map[string]LifeValue{}}
 }
 
-func (m *MockNodeStatusStore) Get(ctx context.Context, key string, r interface{}) (bool, error) {
+func (m *MockKvStore) Get(ctx context.Context, key string, r interface{}) (bool, error) {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 	v, ok := m.m[key]
@@ -39,7 +39,7 @@ func (m *MockNodeStatusStore) Get(ctx context.Context, key string, r interface{}
 	return true, nil
 }
 
-func (m *MockNodeStatusStore) Set(ctx context.Context, key string, value interface{}, expiration time.Duration) error {
+func (m *MockKvStore) Set(ctx context.Context, key string, value interface{}, expiration time.Duration) error {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
@@ -56,7 +56,7 @@ func (m *MockNodeStatusStore) Set(ctx context.Context, key string, value interfa
 	return nil
 }
 
-func (m *MockNodeStatusStore) HGet(ctx context.Context, table string, key string, r interface{}) (bool, error) {
+func (m *MockKvStore) HGet(ctx context.Context, table string, key string, r interface{}) (bool, error) {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
@@ -80,7 +80,7 @@ func (m *MockNodeStatusStore) HGet(ctx context.Context, table string, key string
 	return true, nil
 }
 
-func (m *MockNodeStatusStore) HGetAll(ctx context.Context, table string) (map[string]string, bool, error) {
+func (m *MockKvStore) HGetAll(ctx context.Context, table string) (map[string]string, bool, error) {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
@@ -102,7 +102,7 @@ func (m *MockNodeStatusStore) HGetAll(ctx context.Context, table string) (map[st
 	return r, true, nil
 }
 
-func (m *MockNodeStatusStore) HSet(ctx context.Context, table string, key string, value interface{}, expiration time.Duration) error {
+func (m *MockKvStore) HSet(ctx context.Context, table string, key string, value interface{}, expiration time.Duration) error {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
@@ -130,7 +130,7 @@ func (m *MockNodeStatusStore) HSet(ctx context.Context, table string, key string
 	return nil
 }
 
-func (m *MockNodeStatusStore) Delete(ctx context.Context, key string) error {
+func (m *MockKvStore) Delete(ctx context.Context, key string) error {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 

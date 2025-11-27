@@ -1,22 +1,23 @@
 package gotick
 
 import (
+	"bysir/weave/internal/pkg/gotick/internal/pkg/flow"
+	"bysir/weave/internal/pkg/gotick/store"
 	"context"
 	rand2 "crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/gin-gonic/gin"
-	"github.com/go-redis/redis/v8"
-	"github.com/zbysir/gotick/internal/pkg/flow"
-	"github.com/zbysir/gotick/internal/store"
 	"log"
-	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/hibiken/asynq"
+	"github.com/redis/go-redis/v9"
 )
 
 type MetaData map[string]string
@@ -189,14 +190,14 @@ func (a *AsyncTask) Done() bool {
 func (a *AsyncTask) Exec() bool {
 	return true
 }
-func AsyncArray[T interface{}, A interface{}](ctx *Context, key string, arr []ArrayWrap[A], f func(ctx *TaskContext, a A) (T, error)) []Future {
+func AsyncArray[T interface{}, A interface{}](ctx *Context, key string, arr []ArrayWrap[A], f func(ctx *TaskContext, a A, index int) (T, error)) []Future {
 	var fs []Future
 
-	for _, t := range arr {
+	for index, t := range arr {
 		// 注意闭包问题
 		t := t
 		fs = append(fs, Async(ctx, t.Key(key), func(ctx *TaskContext) (T, error) {
-			return f(ctx, t.Val)
+			return f(ctx, t.Val, index)
 		}))
 	}
 
@@ -227,12 +228,155 @@ func Async[T interface{}](ctx *Context, key string, f func(ctx *TaskContext) (T,
 	return &future
 }
 
+type ParallelOption struct {
+	Parallel           int // 如果不设置，则不并发。
+	BatchSizePerRunner int // 如果不设置，则会在这个 runner 上运行完所有 Future
+}
+
+// WaitFast 等待所有任务完成。
+// 如果是不是快速模式，每个 task 都会被重新调度到任何一台 runner 上，并且会有一些延迟（任务队列的最低延迟）。
+// 如果是快速模式，那么在一个 runner 上会执行多次，直到达到 BatchSizePerRunner 才会让出任务。
+// 例如 BatchSizePerRunner = 10，那么每完成 10 个任务就会重新调度一次（可能会调度到其他 runner 上）。
+func WaitFast(ctx *Context, opt ParallelOption, fs ...Future) {
+	// log.Printf("[gotick] WaitFast start, opt: %v", opt)
+	runCount := int64(0)
+	wg := sync.WaitGroup{}
+
+	var maxParallelChan chan struct{}
+	if opt.Parallel > 0 {
+		maxParallelChan = make(chan struct{}, opt.Parallel)
+	}
+
+	doneCount := int64(0)
+
+	for _, f := range fs {
+		s, exist, _ := ctx.store.GetNodeStatus(f.key())
+		// 这里的 for 循环会导致过多的判断，也就是每次调度，都会再次判断之前所有的任务状态，也许可以优化？
+
+		if exist {
+			// 有任务正在运行中，跳过执行
+			switch s.Status {
+			case "done":
+				// 任务正在其他节点上（包括自己）执行，跳过而执行后面的任务
+				atomic.AddInt64(&doneCount, 1)
+				continue
+			case "fail":
+				// 如果有一个任务失败了，则算整个失败。
+				panic(BreakFail(f.key(), fmt.Errorf("task %v, error %v: ", s.Key, strings.Join(s.Errs, ";"))))
+			}
+
+			if s.Status == "retry" {
+				// 如果一个任务是 retry 状态，则需要重新执行
+			} else {
+				continue
+			}
+		}
+
+		// 如果任务没有状态，或则到了应该执行的时间，就需要执行
+		if !(s.RunAt.IsZero() || s.RunAt.Before(time.Now())) {
+			continue
+		}
+
+		if maxParallelChan != nil {
+			// 并发满了，则阻塞直到其他任务做完
+			maxParallelChan <- struct{}{}
+		}
+
+		wg.Add(1)
+		go func(future Future, s TaskStatus) {
+			defer func() {
+				wg.Done()
+				atomic.AddInt64(&doneCount, 1)
+
+				if maxParallelChan != nil {
+					<-maxParallelChan
+				}
+			}()
+			errorc := make(chan error)
+			datac := make(chan interface{})
+
+			responseChan := make(chan struct{})
+
+			// 启动心跳
+			go func() {
+				defer close(responseChan)
+				for {
+					select {
+					case e := <-errorc:
+						// 不重新调度，而是等待 BreakWait 自循环。
+						// 重新调度将面临并发问题：
+						// 多次任务同时执行成功，将并发调用，可能会导致 task 并发调用出错（状态检查），最好不要并发调度，否则需要加锁导致逻辑复杂。
+						if s.RetryCount > 5 {
+							_ = ctx.store.SetNodeStatus(future.key(), s.MakeFail(e))
+						} else {
+							_ = ctx.store.SetNodeStatus(future.key(), s.MakeRetry(e))
+
+							//log.Printf("step MakeRetry")
+						}
+						return
+					case data := <-datac:
+						_ = SetToStore(ctx.store, future.key(), data)
+						_ = ctx.store.SetNodeStatus(future.key(), s.MakeDone())
+
+						// log.Printf("[gotick] task done: %v", future.key())
+						return
+					case <-time.After(3 * time.Second):
+						// 心跳续期
+						_ = ctx.store.SetNodeStatus(future.key(), s.MakeRunning(), 6*time.Second)
+					}
+				}
+
+			}()
+
+			// log.Printf("[gotick] task running: %v, runCount: %v", future.key(), runCount)
+
+			t, err := future.exec()
+			if err != nil {
+				errorc <- err
+			} else {
+				datac <- t
+			}
+
+			<-responseChan // 等待后台的心跳任务完成
+
+		}(f, s)
+
+		// 如果达到了最大运行数，则跳出循环
+		if opt.BatchSizePerRunner > 0 {
+			if atomic.AddInt64(&runCount, 1) >= int64(opt.BatchSizePerRunner) {
+				break
+			}
+		}
+	}
+
+	wg.Wait()
+
+	// log.Printf("[gotick] WaitFast done, doneCount: %v", doneCount)
+
+	if atomic.LoadInt64(&doneCount) != int64(len(fs)) {
+		//log.Printf("step BreakWait 10")
+		// 如果还有任务没完成，则等待一会进行下一个调度
+		// 在下一个调度中，会再次检查任务状态，同时检查任务心跳，如果任务没有心跳则也会重启任务。
+		// log.Printf("[gotick] task next")
+
+		panic(BreakWait(0))
+	}
+
+}
+
 // Wait will wait all future done, if Parallel is not 0, then no limit for parallel.
+// Wait 在大量任务时，会出现明显的延迟，因为每执行完一次
 func Wait(ctx *Context, parallel int, fs ...Future) {
 	allDone := true
 	runCount := 0
+
+	// wg := sync.WaitGroup{}
+	// 获取并并行 parallel 个任务，等这些任务都完成了，才会开始下一个循环
+	// 可能出现短板，运行时间取决于 n 个任务中最长耗时的任务
+
 	for _, f := range fs {
 		s, exist, _ := ctx.store.GetNodeStatus(f.key())
+		// 这里的 for 循环会导致过多的判断，也就是每次调度，都会再次判断之前所有的任务状态，也许可以优化？
 
 		if exist {
 			// 有任务正在运行中，跳过执行
@@ -254,21 +398,30 @@ func Wait(ctx *Context, parallel int, fs ...Future) {
 			if s.Status == "retry" {
 				// 如果一个任务是 retry 状态，则需要重新执行
 			} else {
-				// 任务正在执行，跳过而执行后面的任务
+				// 任务正在其他节点上（包括自己）执行，跳过而执行后面的任务
 				runCount++
 				continue
 			}
+		} else {
+			allDone = false
 		}
 
+		// 如果任务是重试状态，或没有状态，就需要执行
 		if (s.RunAt.IsZero() || s.RunAt.Before(time.Now())) && (parallel <= 0 || runCount < parallel) {
-			// 如果任务重试状态，或没有状态，就需要执行
 			// 如果是 retry，也改为执行状态，让下次调度跳过这次任务
 			_ = ctx.store.SetNodeStatus(f.key(), s.MakeRunning(), 6*time.Second)
 
 			// 如果没到执行时间，则不执行
 
+			// wg.Add(1)
+
+			// 如果 fastMode 为 true
+			//
+
 			//log.Printf("step Run")
 			go func(future Future, s TaskStatus) {
+				// defer wg.Done()
+
 				errorc := make(chan error)
 				datac := make(chan interface{})
 				go func() {
@@ -290,6 +443,8 @@ func Wait(ctx *Context, parallel int, fs ...Future) {
 						case data := <-datac:
 							_ = SetToStore(ctx.store, future.key(), data)
 							_ = ctx.store.SetNodeStatus(future.key(), s.MakeDone())
+
+							// log.Printf("[gotick] task done: %v", future.key())
 							return
 						case <-time.After(3 * time.Second):
 							// 心跳续期
@@ -297,6 +452,8 @@ func Wait(ctx *Context, parallel int, fs ...Future) {
 						}
 					}
 				}()
+
+				log.Printf("[gotick] task running: %v, runCount: %v", future.key(), runCount)
 
 				t, err := future.exec()
 				if err != nil {
@@ -307,15 +464,21 @@ func Wait(ctx *Context, parallel int, fs ...Future) {
 			}(f, s)
 
 			// 并行
-			// log.Printf("step BreakWait %s ", nextCall)
+			log.Printf("step BreakWait nextCall: %s ", f.key())
 			panic(BreakWait(0))
 		}
 	}
 
+	// wg.Wait()
+
 	if !allDone {
 		//log.Printf("step BreakWait 10")
 		// 如果还有任务没完成，则等待任务完成
-		// 循环 1 s 调度一次，检查任务状态，同时检查任务心跳，如果任务没有心跳则重启任务。
+		// 循环 1 s 调度一次，检查任务状态，同时检查任务心跳，如果任务没有心跳则也会重启任务。
+		log.Printf("[gotick] task next")
+
+		// 为什么要等待 1s?
+		// 如果所有任务都在后台执行，那么 Wait 方法会快速的执行完成，导致很平凡的调度。
 		panic(BreakWait(time.Second / 1))
 	}
 }
@@ -355,7 +518,7 @@ func (a ArrayWrap[T]) Key(prefix string) string {
 	return fmt.Sprintf("%v/@/%v:%v", a.ProductKey, prefix, a.Index)
 }
 
-func Array[T interface{}](ctx *Context, key string, build func() ([]T, error)) []ArrayWrap[T] {
+func Array[T interface{}](ctx *Context, key string, build func(ctx *TaskContext) ([]T, error), opts ...TaskOption) []ArrayWrap[T] {
 	if ctx.collect != nil {
 		end := ctx.collect("array", key)
 		if end {
@@ -370,13 +533,29 @@ func Array[T interface{}](ctx *Context, key string, build func() ([]T, error)) [
 		}
 	}
 
+	// 如果没有数据，无论任务状态是什么都始终执行
 	v, exist, _ := GetFromStore[[]ArrayWrap[T]](ctx.store, key)
 	// todo panic error
 	if exist {
 		return v
 	}
 
-	t, _ := build()
+	s, exist, _ := ctx.store.GetNodeStatus(key)
+	opt := TaskOptions(opts).build()
+
+	taskContext := newTaskContext(ctx, s)
+
+	t, err := build(taskContext)
+	if err != nil {
+		if errors.Is(err, AbortError) {
+			panic(BreakAbort(key, err))
+		}
+		if s.RetryCount > opt.MaxRetry {
+			panic(BreakFail(key, err))
+		}
+		panic(BreakRetry(key, err))
+	}
+
 	a := make([]ArrayWrap[T], len(t))
 	for i, v := range t {
 		a[i] = ArrayWrap[T]{
@@ -386,7 +565,9 @@ func Array[T interface{}](ctx *Context, key string, build func() ([]T, error)) [
 		}
 	}
 	_ = SetToStore(ctx.store, key, a)
-	return a
+
+	// 执行成功也需要断点，因为需要依靠断点来存储任务状态。
+	panic(BreakDone(key))
 }
 
 //
@@ -461,7 +642,7 @@ func Task(c *Context, key string, fun TaskFun, opts ...TaskOption) {
 		return
 	}
 
-	o := TaskOptions(opts).build()
+	opt := TaskOptions(opts).build()
 
 	taskContext := newTaskContext(c, s)
 	if !exist || s.Status == "retry" {
@@ -470,7 +651,7 @@ func Task(c *Context, key string, fun TaskFun, opts ...TaskOption) {
 			if errors.Is(err, AbortError) {
 				panic(BreakAbort(key, err))
 			}
-			if s.RetryCount > o.MaxRetry {
+			if s.RetryCount > opt.MaxRetry {
 				panic(BreakFail(key, err))
 			}
 			panic(BreakRetry(key, err))
@@ -538,6 +719,7 @@ func (m *maxRetryOption) apply(option *taskOption) {
 	return
 }
 
+// maxRetry 最大重试次数, 如果为 -1，则不重试。
 func WithMaxRetry(maxRetry int) TaskOption {
 	return &maxRetryOption{maxRetry: maxRetry}
 }
@@ -620,9 +802,8 @@ type AsyncQueueFactory interface {
 }
 
 type TickServer struct {
-	scheduler  *Scheduler
-	httpServer *HttpServer
-	measure    Measure
+	scheduler *Scheduler
+	measure   Measure
 }
 
 type Measure interface {
@@ -676,45 +857,7 @@ func (r *RedisMeasure) GetCount(flow string) map[string]int64 {
 
 var _ Measure = (*RedisMeasure)(nil)
 
-type HttpServer struct {
-	flows         map[string]*Flow // to get flow info
-	scheduler     *Scheduler       // to trigger flow
-	measure       Measure
-	listenAddress string
-}
-
-func NewHttpServer(scheduler *Scheduler, measure Measure, listenAddress string) *HttpServer {
-	return &HttpServer{scheduler: scheduler, measure: measure, flows: map[string]*Flow{}, listenAddress: listenAddress}
-}
-
-func (s *HttpServer) Start(ctx context.Context) error {
-	r := gin.Default()
-	api := r.Group("/api")
-	api.GET("/flow_list", func(c *gin.Context) {
-		r := map[string]flow.DAG{}
-		for name, f := range s.flows {
-			dag, err := f.DAG()
-			if err != nil {
-				c.JSON(http.StatusBadGateway, gin.H{
-					"message": err.Error(),
-				})
-				return
-			}
-
-			r[name] = dag
-		}
-
-		c.JSON(http.StatusOK, r)
-	})
-	go r.Run()
-
-	return nil
-}
-
-func (s *HttpServer) register(f *Flow) {
-	s.flows[f.Id] = f
-}
-
+// TickClient 用于触发调度，和 TickServer 的区别是，TickClient 不会启动调度器。
 type TickClient struct {
 	scheduler *Scheduler
 }
@@ -895,10 +1038,6 @@ func (t *TickServer) Flow(id string, fun func(ctx *Context), opts ...FlowOption)
 
 	// 注册调度
 	t.scheduler.register(f)
-
-	if t.httpServer != nil {
-		t.httpServer.register(f)
-	}
 
 	return f
 }
@@ -1104,13 +1243,13 @@ func (s *Scheduler) register(f *Flow) {
 }
 
 // Trigger 触发一次流程运行
-func (s *Scheduler) Trigger(ctx context.Context, flowId string, initData MetaData) (string, error) {
+func (s *Scheduler) Trigger(ctx context.Context, flowId string, initData MetaData, delay time.Duration) (string, error) {
 	callId := randomStr()
 	event := Event{
 		CallId:       callId,
 		InitMetaData: initData,
 	}
-	err := s.asyncScheduler.New(flowId).Publish(ctx, event, 0)
+	err := s.asyncScheduler.New(flowId).Publish(ctx, event, delay)
 	if err != nil {
 		return "", err
 	}
@@ -1126,12 +1265,12 @@ func randomStr() string {
 
 // Trigger 触发一次流程运行，在服务端和客户端都可以调用。
 func (t *TickServer) Trigger(ctx context.Context, flowId string, data MetaData) (string, error) {
-	return t.scheduler.Trigger(ctx, flowId, data)
+	return t.scheduler.Trigger(ctx, flowId, data, 0)
 }
 
 // Trigger 触发一次流程运行，在服务端和客户端都可以调用。
-func (t *TickClient) Trigger(ctx context.Context, flowId string, data MetaData) (string, error) {
-	return t.scheduler.Trigger(ctx, flowId, data)
+func (t *TickClient) Trigger(ctx context.Context, flowId string, data MetaData, delay time.Duration) (string, error) {
+	return t.scheduler.Trigger(ctx, flowId, data, delay)
 }
 
 // StartServer 启动服务，在服务端应该调用此方法开始执行异步任务。
@@ -1146,17 +1285,6 @@ func (t *TickServer) StartServer(ctx context.Context) error {
 			log.Printf("async queue start error: %v", err)
 		}
 	}()
-
-	if t.httpServer != nil {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			err := t.httpServer.Start(ctx)
-			if err != nil {
-				log.Printf("async queue start error: %v", err)
-			}
-		}()
-	}
 
 	wg.Wait()
 
@@ -1273,10 +1401,9 @@ type Options struct {
 	RedisURL     string // "redis://<user>:<pass>@localhost:6379/<db>"
 	DelayedQueue store.DelayedQueue
 	KvStore      store.KVStore
-	ListenAddr   string // ":8080"
 }
 
-func NewTickServer(p Options) *TickServer {
+func newSchedulerFromConfig(p Options) *Scheduler {
 	if p.DelayedQueue == nil {
 		opt, err := redis.ParseURL(p.RedisURL)
 		if err != nil {
@@ -1284,7 +1411,9 @@ func NewTickServer(p Options) *TickServer {
 		}
 
 		redisClient := redis.NewClient(opt)
-		p.DelayedQueue = store.NewAsynq(redisClient)
+		p.DelayedQueue = store.NewAsynq(redisClient, asynq.Config{
+			Concurrency: 10,
+		})
 	}
 	if p.KvStore == nil {
 		opt, err := redis.ParseURL(p.RedisURL)
@@ -1301,34 +1430,24 @@ func NewTickServer(p Options) *TickServer {
 	_, debug := os.LookupEnv("GOTICK_DEBUG")
 
 	scheduler := NewScheduler(ap, st)
-	var server *HttpServer
-	if p.ListenAddr != "" {
-		server = NewHttpServer(scheduler, nil, p.ListenAddr)
-	}
+	scheduler.debug = debug
+
+	return scheduler
+}
+
+func NewServer(p Options) *TickServer {
+	scheduler := newSchedulerFromConfig(p)
 	t := &TickServer{
-		scheduler:  scheduler,
-		httpServer: server,
+		scheduler: scheduler,
 	}
-	t.scheduler.debug = debug
 
 	return t
 }
 
-func NewTickClient(p Options) *TickClient {
-	opt, err := redis.ParseURL(p.RedisURL)
-	if err != nil {
-		panic(err)
-	}
-
-	redisClient := redis.NewClient(opt)
-	st := NewKvStoreProduct(store.NewRedisStore(redisClient))
-	if p.DelayedQueue == nil {
-		p.DelayedQueue = store.NewAsynq(redisClient)
-	}
-	ap := NewAsyncQueueFactory(p.DelayedQueue)
-
+func NewClient(p Options) *TickClient {
+	scheduler := newSchedulerFromConfig(p)
 	t := &TickClient{
-		scheduler: NewScheduler(ap, st),
+		scheduler: scheduler,
 	}
 
 	return t
