@@ -1340,15 +1340,16 @@ func newScheduler(delayedQueue store.DelayedQueue, kvStore store.KVStore) *Sched
 	return scheduler
 }
 
-func newSchedulerFromConfig(p Config) *Scheduler {
-	opt, err := redis.ParseURL(p.RedisURL)
-	if err != nil {
-		panic(err)
-	}
+func newSchedulerFromConfig(p Config) (*Scheduler, error) {
 	var redisClient redis.UniversalClient
 	if p.RedisClient != nil {
 		redisClient = p.RedisClient
 	} else {
+		opt, err := redis.ParseURL(p.RedisURL)
+		if err != nil {
+			return nil, err
+		}
+
 		redisClient = redis.NewClient(opt)
 	}
 
@@ -1358,16 +1359,16 @@ func newSchedulerFromConfig(p Config) *Scheduler {
 	})
 	kvStore := store.NewRedisStore(redisClient)
 
-	return newScheduler(delayedQueue, kvStore)
+	return newScheduler(delayedQueue, kvStore), nil
 }
 
-func NewServerFromConfig(p Config) *Server {
-	scheduler := newSchedulerFromConfig(p)
-	t := &Server{
-		scheduler: scheduler,
+func NewServerFromConfig(p Config) (*Server, error) {
+	scheduler, err := newSchedulerFromConfig(p)
+	if err != nil {
+		return nil, err
 	}
 
-	return t
+	return &Server{scheduler: scheduler}, nil
 }
 
 type NewServerParams struct {
