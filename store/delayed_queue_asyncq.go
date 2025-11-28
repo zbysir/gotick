@@ -27,14 +27,18 @@ func (a *Asynq) Start(ctx context.Context) error {
 		queues[k+"_critical"] = 9
 	}
 
+	a.opt.Queues = queues
+
+	if a.opt.Concurrency == 0 {
+		a.opt.Concurrency = 10
+	}
+	if a.opt.TaskCheckInterval == 0 {
+		a.opt.TaskCheckInterval = time.Millisecond * 100
+	}
+
 	srv := asynq.NewServer(
 		&RawRedisClient{c: a.redisCli},
-		asynq.Config{
-			Concurrency: 10,
-			// DelayedTaskCheckInterval: time.Millisecond * 1000,
-			Queues:            queues,
-			TaskCheckInterval: time.Millisecond * 100,
-		},
+		a.opt,
 	)
 
 	err := srv.Start(asynq.HandlerFunc(func(ctx context.Context, task *asynq.Task) error {

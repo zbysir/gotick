@@ -857,9 +857,9 @@ func (r *RedisMeasure) GetCount(flow string) map[string]int64 {
 
 var _ Measure = (*RedisMeasure)(nil)
 
-// TickClient 用于触发调度，和 TickServer 的区别是，TickClient 不会启动调度器。
-type TickClient struct {
-	scheduler *Scheduler
+// Client 用于触发调度，和 TickServer 的区别是，Client 不会启动调度器。
+type Client struct {
+	trigger *Trigger
 }
 
 type Flow struct {
@@ -956,11 +956,12 @@ func (t *Server) Flow(id string, fun func(ctx *Context), opts ...FlowOption) *Fl
 type Scheduler struct {
 	asyncScheduler AsyncQueueFactory
 	statusFactory  StoreFactory
+	trigger        *Trigger
 	debug          bool
 }
 
 func NewScheduler(asyncScheduler AsyncQueueFactory, statusStore StoreFactory) *Scheduler {
-	return &Scheduler{asyncScheduler: asyncScheduler, statusFactory: statusStore}
+	return &Scheduler{asyncScheduler: asyncScheduler, statusFactory: statusStore, trigger: NewTrigger(asyncScheduler)}
 }
 func (s *Scheduler) Start(ctx context.Context) error {
 	return s.asyncScheduler.Start(ctx)
@@ -1155,12 +1156,25 @@ func (s *Scheduler) register(f *Flow) {
 
 // Trigger 触发一次流程运行
 func (s *Scheduler) Trigger(ctx context.Context, flowId string, initData MetaData, delay time.Duration) (string, error) {
+	return s.trigger.Trigger(ctx, flowId, initData, delay)
+}
+
+type Trigger struct {
+	asyncScheduler AsyncQueueFactory
+}
+
+func NewTrigger(asyncScheduler AsyncQueueFactory) *Trigger {
+	return &Trigger{asyncScheduler: asyncScheduler}
+}
+
+// Trigger 触发一次流程运行
+func (t *Trigger) Trigger(ctx context.Context, flowId string, initData MetaData, delay time.Duration) (string, error) {
 	callId := randomStr()
 	event := Event{
 		CallId:       callId,
 		InitMetaData: initData,
 	}
-	err := s.asyncScheduler.New(flowId).Publish(ctx, event, delay)
+	err := t.asyncScheduler.New(flowId).Publish(ctx, event, delay)
 	if err != nil {
 		return "", err
 	}
@@ -1180,8 +1194,8 @@ func (t *Server) Trigger(ctx context.Context, flowId string, data MetaData) (str
 }
 
 // Trigger 触发一次流程运行，在服务端和客户端都可以调用。
-func (t *TickClient) Trigger(ctx context.Context, flowId string, data MetaData, delay time.Duration) (string, error) {
-	return t.scheduler.Trigger(ctx, flowId, data, delay)
+func (t *Client) Trigger(ctx context.Context, flowId string, data MetaData, delay time.Duration) (string, error) {
+	return t.trigger.Trigger(ctx, flowId, data, delay)
 }
 
 // StartServer 启动服务，在服务端应该调用此方法开始执行异步任务。
@@ -1309,9 +1323,10 @@ func (n *KvNodeStatusStore) SetKV(k, v string) error {
 }
 
 type Config struct {
-	RedisURL    string                // "redis://<user>:<pass>@localhost:6379/<db>"
-	RedisClient redis.UniversalClient // if RedisURL is not set, use this client
-	Concurrency int                   // default 10
+	RedisURL          string                // "redis://<user>:<pass>@localhost:6379/<db>"
+	RedisClient       redis.UniversalClient // if RedisURL is not set, use this client
+	Concurrency       int                   // default 10
+	TaskCheckInterval time.Duration         // default 100ms
 }
 
 func newScheduler(delayedQueue store.DelayedQueue, kvStore store.KVStore) *Scheduler {
@@ -1338,7 +1353,8 @@ func newSchedulerFromConfig(p Config) *Scheduler {
 	}
 
 	delayedQueue := store.NewAsynq(redisClient, asynq.Config{
-		Concurrency: p.Concurrency,
+		Concurrency:       p.Concurrency,
+		TaskCheckInterval: p.TaskCheckInterval,
 	})
 	kvStore := store.NewRedisStore(redisClient)
 
@@ -1368,10 +1384,29 @@ func NewServer(p NewServerParams) *Server {
 	return t
 }
 
-func NewClient(p Config) *TickClient {
-	scheduler := newSchedulerFromConfig(p)
-	t := &TickClient{
-		scheduler: scheduler,
+type NewClientConfig struct {
+	RedisURL    string                // "redis://<user>:<pass>@localhost:6379/<db>"
+	RedisClient redis.UniversalClient // if RedisURL is not set, use this client
+}
+
+func NewClient(p NewClientConfig) *Client {
+	opt, err := redis.ParseURL(p.RedisURL)
+	if err != nil {
+		panic(err)
+	}
+	var redisClient redis.UniversalClient
+	if p.RedisClient != nil {
+		redisClient = p.RedisClient
+	} else {
+		redisClient = redis.NewClient(opt)
+	}
+
+	delayedQueue := store.NewAsynq(redisClient, asynq.Config{
+		Concurrency: 0, // Client not need run scheduler, concurrency is unused
+	})
+
+	t := &Client{
+		trigger: NewTrigger(NewAsyncQueueFactory(delayedQueue)),
 	}
 
 	return t
