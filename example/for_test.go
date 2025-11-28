@@ -2,13 +2,14 @@ package example
 
 import (
 	"errors"
-	"github.com/zbysir/gotick"
-	"github.com/zbysir/gotick/internal/pkg/signal"
-	"github.com/zbysir/gotick/internal/store"
 	"log"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/zbysir/gotick"
+	"github.com/zbysir/gotick/internal/pkg/signal"
+	"github.com/zbysir/gotick/internal/store"
 )
 
 // - UseStatus: 和 React Hooks 一样，它用于保存状态。
@@ -16,7 +17,7 @@ import (
 // - Array: 和 Memo 类似用于缓存数据，不过如果想构建一个循环流程的话应该使用 Array，它提供更合适的 API。
 
 func TestFor(t *testing.T) {
-	tick := gotick.NewTickServer(gotick.Options{KvStore: store.NewMockNodeStatusStore(), DelayedQueue: store.NewMockRedisDelayedQueue()})
+	tick := gotick.NewTickServer(gotick.Config{KvStore: store.NewMockNodeStatusStore(), DelayedQueue: store.NewMockRedisDelayedQueue()})
 	ctx, c := signal.NewContext()
 	var currentCallId string
 
@@ -91,7 +92,7 @@ func TestFor(t *testing.T) {
 }
 
 func TestSequence(t *testing.T) {
-	tick := gotick.NewTickServer(gotick.Options{KvStore: store.NewMockNodeStatusStore(), DelayedQueue: store.NewMockRedisDelayedQueue()})
+	tick := gotick.NewTickServer(gotick.Config{KvStore: store.NewMockNodeStatusStore(), DelayedQueue: store.NewMockRedisDelayedQueue()})
 	ctx, c := signal.NewContext()
 	var currentCallId string
 

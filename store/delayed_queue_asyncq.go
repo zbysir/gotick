@@ -100,7 +100,6 @@ func (r *RawRedisClient) MakeRedisClient() interface{} {
 }
 
 func NewAsynq(redisCli redis.UniversalClient, opt asynq.Config) *Asynq {
-
 	client := asynq.NewClient(&RawRedisClient{c: redisCli})
 
 	return &Asynq{

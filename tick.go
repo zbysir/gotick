@@ -14,7 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/zbysir/gotick/internal/store"
+	"github.com/zbysir/gotick/store"
 
 	"github.com/hibiken/asynq"
 	"github.com/redis/go-redis/v9"
@@ -801,7 +801,7 @@ type AsyncQueueFactory interface {
 	Start(ctx context.Context) error
 }
 
-type TickServer struct {
+type Server struct {
 	scheduler *Scheduler
 	measure   Measure
 }
@@ -935,7 +935,7 @@ func WithTimeout(t time.Duration) FlowOption {
 }
 
 // Flow Define a flow
-func (t *TickServer) Flow(id string, fun func(ctx *Context), opts ...FlowOption) *Flow {
+func (t *Server) Flow(id string, fun func(ctx *Context), opts ...FlowOption) *Flow {
 	f := &Flow{
 		Id:        id,
 		fun:       fun,
@@ -1175,7 +1175,7 @@ func randomStr() string {
 }
 
 // Trigger 触发一次流程运行，在服务端和客户端都可以调用。
-func (t *TickServer) Trigger(ctx context.Context, flowId string, data MetaData) (string, error) {
+func (t *Server) Trigger(ctx context.Context, flowId string, data MetaData) (string, error) {
 	return t.scheduler.Trigger(ctx, flowId, data, 0)
 }
 
@@ -1186,7 +1186,7 @@ func (t *TickClient) Trigger(ctx context.Context, flowId string, data MetaData, 
 
 // StartServer 启动服务，在服务端应该调用此方法开始执行异步任务。
 // 当 ctx 被关闭时，服务也会关闭。
-func (t *TickServer) StartServer(ctx context.Context) error {
+func (t *Server) StartServer(ctx context.Context) error {
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -1308,36 +1308,15 @@ func (n *KvNodeStatusStore) SetKV(k, v string) error {
 	return n.store.HSet(context.Background(), n.metaKey(), k, v, 0)
 }
 
-type Options struct {
-	RedisURL     string // "redis://<user>:<pass>@localhost:6379/<db>"
-	DelayedQueue store.DelayedQueue
-	KvStore      store.KVStore
+type Config struct {
+	RedisURL    string                // "redis://<user>:<pass>@localhost:6379/<db>"
+	RedisClient redis.UniversalClient // if RedisURL is not set, use this client
+	Concurrency int                   // default 10
 }
 
-func newSchedulerFromConfig(p Options) *Scheduler {
-	if p.DelayedQueue == nil {
-		opt, err := redis.ParseURL(p.RedisURL)
-		if err != nil {
-			panic(err)
-		}
-
-		redisClient := redis.NewClient(opt)
-		p.DelayedQueue = store.NewAsynq(redisClient, asynq.Config{
-			Concurrency: 10,
-		})
-	}
-	if p.KvStore == nil {
-		opt, err := redis.ParseURL(p.RedisURL)
-		if err != nil {
-			panic(err)
-		}
-
-		redisClient := redis.NewClient(opt)
-		p.KvStore = store.NewRedisStore(redisClient)
-	}
-
-	ap := NewAsyncQueueFactory(p.DelayedQueue)
-	st := NewKvStoreProduct(p.KvStore)
+func newScheduler(delayedQueue store.DelayedQueue, kvStore store.KVStore) *Scheduler {
+	ap := NewAsyncQueueFactory(delayedQueue)
+	st := NewKvStoreProduct(kvStore)
 	_, debug := os.LookupEnv("GOTICK_DEBUG")
 
 	scheduler := NewScheduler(ap, st)
@@ -1346,16 +1325,50 @@ func newSchedulerFromConfig(p Options) *Scheduler {
 	return scheduler
 }
 
-func NewServer(p Options) *TickServer {
+func newSchedulerFromConfig(p Config) *Scheduler {
+	opt, err := redis.ParseURL(p.RedisURL)
+	if err != nil {
+		panic(err)
+	}
+	var redisClient redis.UniversalClient
+	if p.RedisClient != nil {
+		redisClient = p.RedisClient
+	} else {
+		redisClient = redis.NewClient(opt)
+	}
+
+	delayedQueue := store.NewAsynq(redisClient, asynq.Config{
+		Concurrency: p.Concurrency,
+	})
+	kvStore := store.NewRedisStore(redisClient)
+
+	return newScheduler(delayedQueue, kvStore)
+}
+
+func NewServerFromConfig(p Config) *Server {
 	scheduler := newSchedulerFromConfig(p)
-	t := &TickServer{
+	t := &Server{
 		scheduler: scheduler,
 	}
 
 	return t
 }
 
-func NewClient(p Options) *TickClient {
+type NewServerParams struct {
+	DelayedQueue store.DelayedQueue
+	KVStore      store.KVStore
+}
+
+func NewServer(p NewServerParams) *Server {
+	scheduler := newScheduler(p.DelayedQueue, p.KVStore)
+	t := &Server{
+		scheduler: scheduler,
+	}
+
+	return t
+}
+
+func NewClient(p Config) *TickClient {
 	scheduler := newSchedulerFromConfig(p)
 	t := &TickClient{
 		scheduler: scheduler,

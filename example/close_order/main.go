@@ -1,16 +1,17 @@
 package main
 
 import (
-	"github.com/zbysir/gotick"
-	"github.com/zbysir/gotick/internal/pkg/signal"
-	"github.com/zbysir/gotick/internal/store"
 	"log"
 	"sync"
 	"time"
+
+	"github.com/zbysir/gotick"
+	"github.com/zbysir/gotick/internal/pkg/signal"
+	"github.com/zbysir/gotick/internal/store"
 )
 
 func main() {
-	tick := gotick.NewTickServer(gotick.Options{KvStore: store.NewMockNodeStatusStore(), DelayedQueue: store.NewMockRedisDelayedQueue()})
+	tick := gotick.NewTickServer(gotick.Config{KvStore: store.NewMockNodeStatusStore(), DelayedQueue: store.NewMockRedisDelayedQueue()})
 	ctx, c := signal.NewContext()
 	var currentCallId string
 

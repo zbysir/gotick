@@ -2,16 +2,17 @@ package example
 
 import (
 	"fmt"
-	"github.com/zbysir/gotick"
-	"github.com/zbysir/gotick/internal/pkg/signal"
-	"github.com/zbysir/gotick/internal/store"
 	"log"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/zbysir/gotick"
+	"github.com/zbysir/gotick/internal/pkg/signal"
+	"github.com/zbysir/gotick/internal/store"
 )
 
-var mockTick = gotick.NewTickServer(gotick.Options{
+var mockTick = gotick.NewTickServer(gotick.Config{
 	KvStore:      store.NewMockNodeStatusStore(),
 	DelayedQueue: store.NewMockRedisDelayedQueue(),
 	ListenAddr:   "",

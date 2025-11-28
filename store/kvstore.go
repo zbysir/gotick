@@ -56,7 +56,7 @@ func NewWithPrefix(prefix string, store KVStore) *WithPrefix {
 }
 
 type RedisStore struct {
-	redis *redis.Client
+	redis redis.UniversalClient
 }
 
 var _ KVStore = (*RedisStore)(nil)
@@ -104,7 +104,7 @@ func (r *RedisStore) Delete(ctx context.Context, table string) error {
 	return nil
 }
 
-func NewRedisStore(redis *redis.Client) *RedisStore {
+func NewRedisStore(redis redis.UniversalClient) *RedisStore {
 	return &RedisStore{
 		redis: redis,
 	}
