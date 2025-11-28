@@ -1,8 +1,6 @@
 package gotick
 
 import (
-	"bysir/weave/internal/pkg/gotick/internal/pkg/flow"
-	"bysir/weave/internal/pkg/gotick/store"
 	"context"
 	rand2 "crypto/rand"
 	"encoding/json"
@@ -15,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/zbysir/gotick/internal/store"
 
 	"github.com/hibiken/asynq"
 	"github.com/redis/go-redis/v9"
@@ -869,95 +869,6 @@ type Flow struct {
 	onError   func(ctx *Context, ts TaskStatus) error
 	onSuccess func(ctx *Context) error
 	opt       flowOpt
-}
-
-// DAG 生成一个数据流图
-// 可以使用 reactflow 绘制。
-func (f *Flow) DAG() (flow.DAG, error) {
-	dag := flow.DAG{}
-
-	f.fun(&Context{
-		Context: nil,
-		CallId:  "dag",
-		store:   nil,
-		collect: func(typ string, key string) bool {
-			ks := strings.Split(key, "/@/")
-
-			var parent string
-			if len(ks) > 1 {
-				parent = ks[len(ks)-2]
-				key = ks[len(ks)-1]
-			}
-
-			var node flow.Node
-			switch typ {
-			case "task":
-				node = flow.Node{
-					Id: key,
-					Data: flow.NodeData{
-						Label: fmt.Sprintf("[task] %s", key),
-						Data: map[string]interface{}{
-							"type": typ,
-						},
-					},
-					ParentNode: parent,
-				}
-			case "sleep":
-				node = flow.Node{
-					Id: key,
-					Data: flow.NodeData{
-						Label: fmt.Sprintf("[sleep] %s", key),
-						Data: map[string]interface{}{
-							"type": typ,
-						},
-					},
-				}
-			case "array":
-				node = flow.Node{
-					Id: key,
-					Data: flow.NodeData{
-						Label: fmt.Sprintf("[%v] %s", typ, key),
-						Data: map[string]interface{}{
-							"type": typ,
-						},
-					},
-				}
-			default:
-				node = flow.Node{
-					Id: key,
-					Data: flow.NodeData{
-						Label: fmt.Sprintf("[%v] %s", typ, key),
-						Data: map[string]interface{}{
-							"type": typ,
-						},
-					},
-				}
-			}
-
-			dag.AppendNode(node, parent)
-
-			// 连接上一个节点
-			if len(dag.Nodes) > 1 {
-				//l:=len(dag.Nodes)
-				//sourceId := dag.GetNodeByIndex(l-2).Id
-				//targetId := nodes[len(nodes)-1].Id
-				//edge = append(edge, flow.Edge{
-				//	Id:        fmt.Sprintf("%s--%s", sourceId, targetId),
-				//	Source:    sourceId,
-				//	Target:    targetId,
-				//	MarkerEnd: flow.Marker{Type: "arrow"},
-				//	Animated:  false,
-				//	Label:     "",
-				//	Data:      nil,
-				//	Style:     nil,
-				//})
-			}
-
-			return true
-		},
-	})
-
-	return dag, nil
 }
 
 func (f *Flow) OnSuccess(fun func(ctx *Context) error) *Flow {
