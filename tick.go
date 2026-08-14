@@ -782,6 +782,7 @@ func (t TaskStatus) MakeRetry(err error) TaskStatus {
 
 type NodeStatusStore interface {
 	GetNodeStatus(key string) (TaskStatus, bool, error) // 获取每个 task 的运行状态
+	GetAllNodeStatus() (map[string]TaskStatus, error)   // 获取这次调用中所有 task 的状态，用于 inspect / UI
 	SetNodeStatus(key string, value TaskStatus, ttl ...time.Duration) error
 	UpdateNodeStatus(key string, fu func(status TaskStatus, isNew bool) TaskStatus) (TaskStatus, error)
 	GetKVAll() (map[string]string, error)
@@ -1286,6 +1287,29 @@ func (n *KvNodeStatusStore) GetNodeStatus(key string) (TaskStatus, bool, error) 
 	return status, true, nil
 }
 
+func (n *KvNodeStatusStore) GetAllNodeStatus() (map[string]TaskStatus, error) {
+	raw, exist, err := n.store.HGetAll(context.Background(), n.statusKey())
+	if err != nil {
+		return nil, err
+	}
+	if !exist {
+		return nil, nil
+	}
+
+	all := make(map[string]TaskStatus, len(raw))
+	for k, v := range raw {
+		status := TaskStatus{Key: k}
+		if err := json.Unmarshal([]byte(v), &status); err != nil {
+			return nil, fmt.Errorf("decode status of task %q: %w", k, err)
+		}
+		// Key 不在序列化字段里，反序列化后要补回来
+		status.Key = k
+		all[k] = status
+	}
+
+	return all, nil
+}
+
 func (n *KvNodeStatusStore) SetNodeStatus(key string, value TaskStatus, ttl ...time.Duration) error {
 	var t time.Duration
 	if len(ttl) >= 1 {
@@ -1295,7 +1319,7 @@ func (n *KvNodeStatusStore) SetNodeStatus(key string, value TaskStatus, ttl ...t
 }
 
 func (n *KvNodeStatusStore) GetKVAll() (map[string]string, error) {
-	v, exist, err := n.store.HGetAll(context.Background(), n.metaKey())
+	raw, exist, err := n.store.HGetAll(context.Background(), n.metaKey())
 	if err != nil {
 		return nil, err
 	}
@@ -1303,7 +1327,24 @@ func (n *KvNodeStatusStore) GetKVAll() (map[string]string, error) {
 		return nil, nil
 	}
 
-	return v, nil
+	// HGetAll 返回的是存进去时 json.Marshal 的结果，而 GetKV 会 Unmarshal 一次。
+	// 不在这里解码的话，同一个 key 用 GetKV 读到 `bysir`、用 GetKVAll 读到 `"bysir"`。
+	//
+	// 这个 hash 里混着两类数据：用户的 metadata（一定是 JSON 字符串）和
+	// Memo / Array / Async 缓存的结果（任意 JSON）。所以只在能解成字符串时解码，
+	// 其余保持原始 JSON —— 这也正是 inspect 这类工具想看到的形式。
+	// TODO: 把两类数据拆到不同的 hash，这个特判就可以去掉了。
+	out := make(map[string]string, len(raw))
+	for k, v := range raw {
+		var s string
+		if err := json.Unmarshal([]byte(v), &s); err == nil {
+			out[k] = s
+		} else {
+			out[k] = v
+		}
+	}
+
+	return out, nil
 }
 
 func (n *KvNodeStatusStore) GetKV(k string) (string, bool, error) {

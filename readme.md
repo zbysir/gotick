@@ -104,6 +104,29 @@ flow 函数本身只负责编排。
 - 只依赖于 Redis。
 - 自身足够简单可信耐，依赖 [asynq](https://github.com/hibiken/asynq) 实现延时任务。
 
+## 排查问题
+
+流程卡住了想知道它停在哪一步，用 `gotick inspect`。它直接读 Redis，
+不需要连上正在运行的 worker，也不需要部署任何东西：
+
+```
+$ go install github.com/zbysir/gotick/cmd/gotick@latest
+$ gotick inspect -redis redis://localhost:6379/0 <callId>
+
+callId  9f2ac41b8e7d
+tasks   3
+
+TASK        STATUS  RETRY  RUN AT                LAST ERROR
+send-email  retry   1      2026-08-14T09:12:06Z  smtp timeout
+start       done    0      -                     -
+wait        sleep   0      2026-08-14T09:12:03Z  -
+
+metadata
+  name = bysir
+```
+
+callId 由 `Trigger` 返回，建议在业务侧记进日志。
+
 ## 为什么不？
 
 ### 延时 MQ

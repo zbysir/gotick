@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+# 同一分支上只保留最新一次运行
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.23', 'stable']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            gofmt -d .
+            exit 1
+          fi
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      # 测试跑在 miniredis 上，不需要外部服务。
+      # -race 是重点：调度器会起后台 goroutine 写共享状态，
+      # 竞态在这个项目里是真实存在的风险，不是理论问题。
+      - name: test
+        run: go test -race -timeout 10m ./...
+
+  tidy:
+    name: go mod tidy is clean
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+      - run: go mod tidy
+      - name: check for uncommitted changes
+        run: |
+          if ! git diff --exit-code -- go.mod go.sum; then
+            echo "go.mod/go.sum are not tidy — run 'go mod tidy' and commit the result"
+            exit 1
+          fi
