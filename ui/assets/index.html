@@ -432,6 +432,93 @@ function activityBanner(a) {
     </div>`;
 }
 
+// replayPanel 把每次重放画出来。
+//
+// 光有一个「重放了 5 次」的数字看不出问题：一次本该立刻继续、却等了 5 秒
+// 才被调度的重放，在计数里和正常重放长得一模一样，证据全在间隔里。
+const REPLAY_KIND = {
+  done:        "任务完成",
+  sleep:       "进入睡眠",
+  sleep_rearm: "重新计时",
+  retry:       "安排重试",
+  wait:        "等待并行任务",
+  fail:        "任务失败",
+  abort:       "流程终止",
+  finish:      "流程跑完",
+};
+
+// GAP_WARN 超过这个间隔就标黄。正常的「立刻继续」是毫秒级的，
+// 秒级说明这一跳花在了消息队列的调度开销上。
+const GAP_WARN = 2000;
+
+function replayPanel(run) {
+  const marks = run.marks || [];
+  if (!marks.length) {
+    return `<div class="panel">
+      <div class="panel-head"><span>重放</span><span>${run.replays || 0} 次</span></div>
+      <div class="empty">这次调用是在重放记录上线之前跑的。</div>
+    </div>`;
+  }
+
+  const rows = marks.map((m, i) => {
+    const at = Date.parse(m.at);
+    const gap = i === 0 ? 0 : at - Date.parse(marks[i - 1].at);
+    const slow = gap >= GAP_WARN;
+    const odd = m.kind === "sleep_rearm";
+
+    return `<tr>
+      <td class="num">#${i + 1}</td>
+      <td class="num">${esc(fmtTime(m.at).slice(11))}<span style="opacity:.5">${esc(fracSeconds(m.at))}</span></td>
+      <td>${esc(REPLAY_KIND[m.kind] || m.kind || "—")}${odd ? ` <span class="pill retry">早醒</span>` : ""}</td>
+      <td class="mono">${esc(m.task || "—")}</td>
+      <td class="num" ${slow ? 'style="color:var(--warn)"' : ""}>${i === 0 ? "—" : "+" + humanGap(gap)}</td>
+    </tr>`;
+  }).join("");
+
+  // 只有明显异常才提示，不然每次都挂一条横幅反而没人看
+  const worst = marks.reduce((acc, m, i) => {
+    if (i === 0) return acc;
+    const gap = Date.parse(m.at) - Date.parse(marks[i - 1].at);
+    return gap > acc.gap ? { gap, i } : acc;
+  }, { gap: 0, i: 0 });
+
+  const rearms = marks.filter(m => m.kind === "sleep_rearm").length;
+  let note = "";
+  if (rearms > 0) {
+    note = `<div class="activity-note" style="padding:10px 16px;border-top:1px solid var(--line)">` +
+      `有 ${rearms} 次重放是被提前唤醒后又重新计时的——这一轮什么都没推进，` +
+      `而且重新入队本身要花掉一次队列调度的时间。</div>`;
+  } else if (worst.gap >= GAP_WARN) {
+    note = `<div class="activity-note" style="padding:10px 16px;border-top:1px solid var(--line)">` +
+      `第 ${worst.i + 1} 次重放距上一次隔了 ${humanGap(worst.gap)}。` +
+      `如果这一跳本该是立刻继续的，说明时间花在了消息队列的调度上。</div>`;
+  }
+
+  return `<div class="panel">
+    <div class="panel-head">
+      <span>重放</span>
+      <span>${marks.length} 次${run.replays > marks.length ? `（另有 ${run.replays - marks.length} 次未记录完）` : ""}</span>
+    </div>
+    <div class="scroller">
+      <table>
+        <thead><tr><th>#</th><th>时刻</th><th>这一轮做了什么</th><th>Task</th><th>距上次</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+    ${note}
+  </div>`;
+}
+
+function fracSeconds(iso) {
+  const m = /\.(\d{1,3})/.exec(iso || "");
+  return m ? "." + m[1].padEnd(3, "0") : "";
+}
+
+function humanGap(ms) {
+  if (ms < 1000) return Math.round(ms) + "ms";
+  return (ms / 1000).toFixed(1) + "s";
+}
+
 async function renderDetail(callId) {
   let d;
   try {
@@ -500,6 +587,8 @@ async function renderDetail(callId) {
         ${run.error ? `<dt>错误</dt><dd><span class="err">${esc(run.error)}</span></dd>` : ""}
       </dl>
     </div>
+
+    ${replayPanel(run)}
 
     <div class="panel">
       <div class="panel-head"><span>任务</span><span>${tasks.length} 个</span></div>

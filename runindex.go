@@ -35,7 +35,25 @@ type RunInfo struct {
 	// FailedTask / Error 只在失败时有值，让列表页不用点进去就知道死在哪。
 	FailedTask string `json:"failed_task,omitempty"`
 	Error      string `json:"error,omitempty"`
+
+	// Marks 记录每次重放的开始时刻和它以什么方式结束。
+	//
+	// 只有计数是不够的：一次「本该立刻继续、却等了 5 秒才被调度」的重放，
+	// 在计数里和正常重放长得一模一样，证据全在时间间隔里。
+	Marks []ReplayMark `json:"marks,omitempty"`
 }
+
+// ReplayMark 是一次重放的记录。
+type ReplayMark struct {
+	At time.Time `json:"at"`
+	// Kind 这次重放以什么方式结束：done / sleep / retry / wait / fail / abort / finish。
+	Kind string `json:"kind,omitempty"`
+	Task string `json:"task,omitempty"`
+}
+
+// maxReplayMarks 最多保留多少条重放记录。
+// 超过之后丢掉最早的——排查问题时关心的总是最近发生了什么。
+const maxReplayMarks = 200
 
 // Duration 返回这次调用的耗时；还在运行中的返回到现在为止的时长。
 func (r RunInfo) Duration() time.Duration {
@@ -66,6 +84,9 @@ type RunIndex interface {
 	BeginRun(flowId, callId string, at time.Time) error
 	// FinishRun 在 flow 有了最终结论时调用。
 	FinishRun(callId, status, failedTask, errMsg string, at time.Time) error
+
+	// RecordReplay 记下一次重放的开始时刻和结束方式。
+	RecordReplay(callId string, mark ReplayMark) error
 
 	GetRun(callId string) (RunInfo, bool, error)
 	// ListRuns 按开始时间倒序返回实例。flowId 为空表示不限 flow。
@@ -140,6 +161,20 @@ func (k *KvRunIndex) BeginRun(flowId, callId string, at time.Time) error {
 	// 读-改-写在这里是安全的：同一个 callId 的重放已经被租约串行化了。
 	info.Replays++
 	info.UpdatedAt = at
+
+	return k.saveRun(info)
+}
+
+func (k *KvRunIndex) RecordReplay(callId string, mark ReplayMark) error {
+	info, exist, err := k.GetRun(callId)
+	if err != nil || !exist {
+		return err
+	}
+
+	info.Marks = append(info.Marks, mark)
+	if len(info.Marks) > maxReplayMarks {
+		info.Marks = info.Marks[len(info.Marks)-maxReplayMarks:]
+	}
 
 	return k.saveRun(info)
 }
@@ -235,6 +270,7 @@ func (noopRunIndex) RegisterFlow(string) error                                 {
 func (noopRunIndex) ListFlows() ([]string, error)                              { return nil, nil }
 func (noopRunIndex) BeginRun(string, string, time.Time) error                  { return nil }
 func (noopRunIndex) FinishRun(string, string, string, string, time.Time) error { return nil }
+func (noopRunIndex) RecordReplay(string, ReplayMark) error                     { return nil }
 func (noopRunIndex) GetRun(string) (RunInfo, bool, error)                      { return RunInfo{}, false, nil }
 func (noopRunIndex) ListRuns(string, int64, int64) ([]RunInfo, error)          { return nil, nil }
 func (noopRunIndex) CountRuns(string) (int64, error)                           { return 0, nil }

@@ -1295,12 +1295,15 @@ func (s *Scheduler) register(f *Flow) {
 			log.Printf("[gotick] index run %s failed: %v", callId, err)
 		}
 
+		replayStart := time.Now()
+
 		var (
 			next       *nextEvent // 本次重放之后要发的事件
 			terminal   bool       // flow 是否已经有了最终结论
 			runStatus  = RunStatusDone
 			failedTask string
 			failedErr  string
+			mark       = ReplayMark{At: replayStart}
 		)
 
 		err = func() (err error) {
@@ -1324,9 +1327,11 @@ func (s *Scheduler) register(f *Flow) {
 
 				switch breakpoint := ns.(type) {
 				case *breakWait:
+					mark.Kind = "wait"
 					next = &nextEvent{delay: time.Until(breakpoint.RunAt)}
 
 				case *breakRetry:
+					mark.Kind, mark.Task = "retry", breakpoint.Task
 					var newStatus TaskStatus
 					newStatus, err = statusStore.UpdateNodeStatus(breakpoint.Task, func(status TaskStatus, isNew bool) (TaskStatus, bool) {
 						return status.WithStartedAt(ctx.attemptStart).MakeRetry(breakpoint.Err), true
@@ -1351,6 +1356,7 @@ func (s *Scheduler) register(f *Flow) {
 					next = &nextEvent{delay: time.Until(newStatus.RunAt)}
 
 				case *breakAbort:
+					mark.Kind, mark.Task = "abort", breakpoint.Task
 					var newStatus TaskStatus
 					newStatus, err = statusStore.UpdateNodeStatus(breakpoint.Task, func(status TaskStatus, isNew bool) (TaskStatus, bool) {
 						if status.Status == TaskStatusAbort {
@@ -1375,6 +1381,7 @@ func (s *Scheduler) register(f *Flow) {
 					}
 
 				case *breakFail:
+					mark.Kind, mark.Task = "fail", breakpoint.Task
 					var newStatus TaskStatus
 					newStatus, err = statusStore.UpdateNodeStatus(breakpoint.Task, func(status TaskStatus, isNew bool) (TaskStatus, bool) {
 						// Wait 里的任务可能已经把自己标成 fail 了，
@@ -1401,8 +1408,16 @@ func (s *Scheduler) register(f *Flow) {
 					}
 
 				case *breakSleep:
+					mark.Kind, mark.Task = "sleep", breakpoint.Task
+
 					// TODO 考虑先入队，然后更改状态
 					_, err = statusStore.UpdateNodeStatus(breakpoint.Task, func(status TaskStatus, isNew bool) (TaskStatus, bool) {
+						// 已经在睡的又睡一次，说明上一次被提前唤醒了。
+						// 单独记一个类型，这样界面上能直接看出「这一轮是白跑的」，
+						// 而不用让人自己去对时间戳。
+						if !isNew && status.Status == TaskStatusSleep {
+							mark.Kind = "sleep_rearm"
+						}
 						return status.MakeSleep(breakpoint.RunAt), true
 					})
 					if err != nil {
@@ -1411,6 +1426,7 @@ func (s *Scheduler) register(f *Flow) {
 					next = &nextEvent{delay: time.Until(breakpoint.RunAt)}
 
 				case *breakDone:
+					mark.Kind, mark.Task = "done", breakpoint.Task
 					_, err = statusStore.UpdateNodeStatus(breakpoint.Task, func(status TaskStatus, isNew bool) (TaskStatus, bool) {
 						return status.WithStartedAt(ctx.attemptStart).MakeDone(), true
 					})
@@ -1426,6 +1442,7 @@ func (s *Scheduler) register(f *Flow) {
 			f.fun(ctx)
 
 			// 没有中断，说明整个 flow 跑完了
+			mark.Kind = "finish"
 			terminal = true
 			if f.onSuccess != nil {
 				ctx.inCallback = true
@@ -1446,6 +1463,10 @@ func (s *Scheduler) register(f *Flow) {
 		// 反过来的话，下一个事件的处理方会抢不到租约、被迫走消息队列的退避重试，
 		// 给流程的每一步都加上秒级延迟。
 		releaseLease()
+
+		if err := s.runIndex.RecordReplay(callId, mark); err != nil {
+			log.Printf("[gotick] record replay of %s failed: %v", callId, err)
+		}
 
 		if terminal {
 			if err := s.runIndex.FinishRun(callId, runStatus, failedTask, failedErr, time.Now()); err != nil {
@@ -1759,7 +1780,14 @@ type Config struct {
 	RedisURL          string                // "redis://<user>:<pass>@localhost:6379/<db>"
 	RedisClient       redis.UniversalClient // if RedisURL is not set, use this client
 	Concurrency       int                   // default 10
-	TaskCheckInterval time.Duration         // default 100ms
+	TaskCheckInterval time.Duration         // 队列空时多久查一次新任务，默认 100ms
+
+	// DelayedTaskCheckInterval 决定「已排期」的任务多久被搬到「待执行」，
+	// 也就是 Sleep 和重试退避的实际精度。默认 500ms。
+	//
+	// 调小会让唤醒更准，代价是每个队列多一点 Redis 轮询；
+	// 流程数量多而对延迟不敏感时可以调大。
+	DelayedTaskCheckInterval time.Duration
 }
 
 func newScheduler(delayedQueue store.DelayedQueue, kvStore store.KVStore) *Scheduler {
@@ -1788,8 +1816,9 @@ func newSchedulerFromConfig(p Config) (*Scheduler, error) {
 	}
 
 	delayedQueue := store.NewAsynq(redisClient, asynq.Config{
-		Concurrency:       p.Concurrency,
-		TaskCheckInterval: p.TaskCheckInterval,
+		Concurrency:              p.Concurrency,
+		TaskCheckInterval:        p.TaskCheckInterval,
+		DelayedTaskCheckInterval: p.DelayedTaskCheckInterval,
 	}, ownsClient)
 	kvStore := store.NewRedisStore(redisClient)
 

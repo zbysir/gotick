@@ -40,6 +40,14 @@ func (a *Asynq) Start(ctx context.Context) error {
 	if a.opt.TaskCheckInterval == 0 {
 		a.opt.TaskCheckInterval = time.Millisecond * 100
 	}
+	if a.opt.DelayedTaskCheckInterval == 0 {
+		// asynq 这一项的默认值是 5 秒，而它决定了「已排期」的任务多久才被搬到
+		// 「待执行」——也就是每一个 Sleep、每一次重试退避的实际精度。
+		// 用默认值的话，睡 2 秒实际要等 4 秒多，而且这个延迟对用户完全不可见。
+		//
+		// 注意它和 TaskCheckInterval 不是一回事：后者只管队列空时多久查一次新任务。
+		a.opt.DelayedTaskCheckInterval = 500 * time.Millisecond
+	}
 
 	srv := asynq.NewServer(
 		&RawRedisClient{c: a.redisCli, keepOpen: !a.ownsClient},
