@@ -1,10 +1,13 @@
 package gotick
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/zbysir/gotick/store"
@@ -216,6 +219,214 @@ func TestUpdateNodeStatusRespectsAbort(t *testing.T) {
 	got, _, err := st.GetNodeStatus("job")
 	require.NoError(t, err)
 	assert.Equal(t, TaskStatusDone, got.Status, "an aborted update must leave the value untouched")
+}
+
+func newTestContext() *Context {
+	return &Context{
+		Context: context.Background(),
+		CallId:  "call-test",
+		store:   newTestStatusStore(),
+	}
+}
+
+// catchBreak 捕获 fn 抛出的断点。fn 没有中断时返回 nil。
+func catchBreak(t *testing.T, fn func()) (bp Breakpoint) {
+	t.Helper()
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		b, ok := r.(Breakpoint)
+		if !ok {
+			t.Fatalf("expected a Breakpoint panic, got %#v", r)
+		}
+		bp = b
+	}()
+
+	fn()
+	return nil
+}
+
+// TestMemoDoesNotCacheFailure 是 Memo 那条 Critical 的回归测试。
+//
+// 旧实现是 `t, _ := build()`：build 失败时把零值当成功结果永久缓存，
+// 之后每次重放都命中缓存返回零值，错误被静默吞掉、永不重试。
+func TestMemoDoesNotCacheFailure(t *testing.T) {
+	ctx := newTestContext()
+
+	bp := catchBreak(t, func() {
+		Memo(ctx, "cfg", func() (string, error) {
+			return "", errors.New("network down")
+		})
+	})
+
+	require.NotNil(t, bp, "a failing Memo must break, not return a zero value")
+	assert.IsType(t, &breakRetry{}, bp, "a failing Memo should schedule a retry")
+
+	_, exist, err := GetFromStore[string](ctx.store, "cfg")
+	require.NoError(t, err)
+	assert.False(t, exist, "a failed Memo must not leave anything in the cache")
+}
+
+func TestMemoFailsAfterMaxRetry(t *testing.T) {
+	ctx := newTestContext()
+	require.NoError(t, ctx.store.SetNodeStatus("cfg", TaskStatus{
+		Status:     TaskStatusRetry,
+		RetryCount: 2,
+	}))
+
+	bp := catchBreak(t, func() {
+		Memo(ctx, "cfg", func() (string, error) {
+			return "", errors.New("still down")
+		}, WithMaxRetry(2))
+	})
+
+	require.NotNil(t, bp)
+	assert.IsType(t, &breakFail{}, bp, "Memo must give up once RetryCount reaches MaxRetry")
+}
+
+func TestMemoCachesSuccess(t *testing.T) {
+	ctx := newTestContext()
+
+	calls := 0
+	got := Memo(ctx, "cfg", func() (string, error) {
+		calls++
+		return "value", nil
+	})
+	assert.Equal(t, "value", got)
+
+	// 换一个 Context 模拟下一次重放
+	next := &Context{Context: context.Background(), CallId: ctx.CallId, store: ctx.store}
+	again := Memo(next, "cfg", func() (string, error) {
+		calls++
+		return "different", nil
+	})
+
+	assert.Equal(t, "value", again, "a replay must see the cached value, not rebuild it")
+	assert.Equal(t, 1, calls, "build must run exactly once")
+}
+
+// TestTaskStopsAfterFailure 是「上游失败、下游照跑」那条 High 的回归测试。
+//
+// 旧实现只处理 done 和 retry，遇到 fail 直接落到函数末尾正常返回，
+// 于是任何一次重放都会跳过失败的 task，继续执行它后面的 task。
+func TestTaskStopsAfterFailure(t *testing.T) {
+	ctx := newTestContext()
+	require.NoError(t, ctx.store.SetNodeStatus("upstream", TaskStatus{
+		Status: TaskStatusFail,
+		Errs:   []string{"boom"},
+	}))
+
+	ran := false
+	bp := catchBreak(t, func() {
+		Task(ctx, "upstream", func(*TaskContext) error {
+			ran = true
+			return nil
+		})
+	})
+
+	require.NotNil(t, bp, "a failed task must stop the replay, not fall through")
+	assert.IsType(t, &breakFail{}, bp)
+	assert.False(t, ran, "a failed task must not be executed again")
+}
+
+func TestTaskStopsAfterAbort(t *testing.T) {
+	ctx := newTestContext()
+	require.NoError(t, ctx.store.SetNodeStatus("t", TaskStatus{Status: TaskStatusAbort}))
+
+	bp := catchBreak(t, func() {
+		Task(ctx, "t", func(*TaskContext) error { return nil })
+	})
+
+	require.NotNil(t, bp)
+	assert.IsType(t, &breakAbort{}, bp)
+}
+
+func TestTaskWaitsForRetryBackoff(t *testing.T) {
+	ctx := newTestContext()
+	require.NoError(t, ctx.store.SetNodeStatus("t", TaskStatus{
+		Status: TaskStatusRetry,
+		RunAt:  time.Now().Add(30 * time.Second),
+	}))
+
+	ran := false
+	bp := catchBreak(t, func() {
+		Task(ctx, "t", func(*TaskContext) error {
+			ran = true
+			return nil
+		})
+	})
+
+	require.NotNil(t, bp)
+	assert.IsType(t, &breakWait{}, bp, "a task in backoff must wait rather than run early")
+	assert.False(t, ran)
+}
+
+// TestDuplicateKeyPanics 覆盖 key 重名检测。
+//
+// 两个 API 用同一个 key 会共用同一份状态并互相覆盖，而且完全没有报错。
+// 这是确定性的编码错误，应该在第一次重放就响亮地失败。
+func TestDuplicateKeyPanics(t *testing.T) {
+	ctx := newTestContext()
+
+	ctx.markKeyUsed("Task", "shared")
+
+	assert.PanicsWithValue(t,
+		`gotick: duplicate key "shared" (used by Task and Memo). `+
+			"每个 key 在一个 flow 里必须唯一，否则它们会共用同一份状态并互相覆盖。"+
+			"在循环里请用 Array/Sequence 生成的 key，不要写死。",
+		func() { ctx.markKeyUsed("Memo", "shared") })
+
+	// 不同的 key 不受影响
+	assert.NotPanics(t, func() { ctx.markKeyUsed("Memo", "other") })
+}
+
+// TestSequenceStateRoundTrips 覆盖 Sequence 的持久化。
+//
+// 旧实现写用 SetKV(name)、读用 GetFromStore(name)，后者会再加一层 "__" 前缀，
+// 于是状态永远读不回来；而且序列化的是整个 SequenceWrap，
+// 恢复出来的对象 ctx 是 nil，一旦读回来就会空指针。
+func TestSequenceStateRoundTrips(t *testing.T) {
+	st := newTestStatusStore()
+
+	first := Sequence(&Context{Context: context.Background(), store: st}, "seq", 5)
+	require.Equal(t, -1, first.Current)
+
+	require.True(t, first.Next())
+	require.Equal(t, 0, first.Current)
+	require.True(t, first.Next())
+	require.Equal(t, 1, first.Current)
+
+	// 模拟一次重放：新的 Context，从存储里恢复。
+	//
+	// Next() 存的是自增之前的序号，所以循环体在跑第 k 轮时，存储里是 k-1。
+	// 恢复后会重跑第 k 轮——因为我们无法知道它上次跑完没有。
+	// 这是对的：循环体里的 Task 靠自己的状态保证不会重复执行。
+	restored := Sequence(&Context{Context: context.Background(), store: st}, "seq", 5)
+	assert.Equal(t, 0, restored.Current, "the sequence must resume from the last checkpoint")
+	assert.Equal(t, 5, restored.max, "the bound must survive the round trip")
+	assert.NotNil(t, restored.ctx, "the restored wrapper must have a usable Context")
+
+	// 恢复出来的对象必须能继续用（旧实现反序列化后 ctx 为 nil，这里会空指针）
+	assert.NotPanics(t, func() { restored.Next() })
+	assert.Equal(t, 1, restored.Current, "the in-flight iteration is replayed")
+}
+
+func TestNewClientAcceptsRedisClientWithoutURL(t *testing.T) {
+	// 文档写明「RedisURL 未设置时使用 RedisClient」，
+	// 旧实现无条件先 ParseURL 并在失败时 panic，这条路径 100% 崩溃。
+	c, err := NewClient(NewClientConfig{
+		RedisClient: redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"}),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, c)
+}
+
+func TestNewClientRejectsBadURL(t *testing.T) {
+	_, err := NewClient(NewClientConfig{RedisURL: "not-a-redis-url"})
+	require.Error(t, err, "an invalid URL must be reported, not panicked")
 }
 
 func TestWaitDelay(t *testing.T) {

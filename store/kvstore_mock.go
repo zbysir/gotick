@@ -139,6 +139,52 @@ func (m *MockKvStore) HSetCAS(ctx context.Context, table string, key string, exp
 	return true, nil
 }
 
+func (m *MockKvStore) SetNX(ctx context.Context, key string, value string, ttl time.Duration) (bool, error) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	if v, ok := m.m[key]; ok && !v.expired(time.Now()) {
+		return false, nil
+	}
+
+	var live time.Time
+	if ttl > 0 {
+		live = time.Now().Add(ttl)
+	}
+	m.m[key] = lifeValue{live: live, value: []byte(value)}
+	return true, nil
+}
+
+func (m *MockKvStore) ExpireIf(ctx context.Context, key string, expect string, ttl time.Duration) (bool, error) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	v, ok := m.m[key]
+	if !ok || v.expired(time.Now()) || string(v.value) != expect {
+		return false, nil
+	}
+
+	var live time.Time
+	if ttl > 0 {
+		live = time.Now().Add(ttl)
+	}
+	m.m[key] = lifeValue{live: live, value: v.value}
+	return true, nil
+}
+
+func (m *MockKvStore) DeleteIf(ctx context.Context, key string, expect string) (bool, error) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	v, ok := m.m[key]
+	if !ok || v.expired(time.Now()) || string(v.value) != expect {
+		return false, nil
+	}
+
+	delete(m.m, key)
+	return true, nil
+}
+
 func (m *MockKvStore) Delete(ctx context.Context, key string) error {
 	m.lock.Lock()
 	defer m.lock.Unlock()

@@ -7,8 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,7 +27,41 @@ type Context struct {
 	collect func(typ string, key string) bool // 预运行来生成 flow 图
 	s       AsyncQueue
 
-	lock sync.Mutex
+	keyMu    sync.Mutex
+	usedKeys map[string]string // key -> 使用它的 API，用于检测重名
+}
+
+// markKeyUsed 记录一个 key 在本次重放中被哪个 API 使用了。
+//
+// 同一个 key 被用两次（无论是同一个 API 还是不同 API）会共用同一份任务状态和缓存，
+// 结果是它们互相覆盖、任务被跳过或重复执行，而且不会有任何报错。
+// 这里直接崩掉：这是确定性的编码错误，第一次重放就会暴露，
+// 让它在开发阶段响亮地失败，远好过在生产上悄悄算错。
+func (c *Context) markKeyUsed(api, key string) {
+	c.keyMu.Lock()
+	defer c.keyMu.Unlock()
+
+	if c.usedKeys == nil {
+		c.usedKeys = map[string]string{}
+	}
+	if prev, ok := c.usedKeys[key]; ok {
+		panic(fmt.Sprintf(
+			"gotick: duplicate key %q (used by %s and %s). "+
+				"每个 key 在一个 flow 里必须唯一，否则它们会共用同一份状态并互相覆盖。"+
+				"在循环里请用 Array/Sequence 生成的 key，不要写死。",
+			key, prev, api))
+	}
+	c.usedKeys[key] = api
+}
+
+// storeUnavailable 在存储读写失败时中断本次重放，稍后重来。
+//
+// 绝不能把「读失败」当成「数据不存在」：那会让已完成的任务被重新执行、
+// 让 Memo 的缓存被重新构建出一个不同的值。
+// 也绝不能抛裸 error：调度器的 recover 只认识 Breakpoint，
+// 其他 panic 会被重新抛出，把整个 asynq worker 打崩。
+func storeUnavailable() {
+	panic(BreakWait(waitRecheckDelay))
 }
 
 func (c *Context) MetaDataAll() MetaData {
@@ -38,7 +70,7 @@ func (c *Context) MetaDataAll() MetaData {
 	}
 	m, err := c.store.GetKVAll()
 	if err != nil {
-		panic(err)
+		storeUnavailable()
 	}
 
 	meta := MetaData{}
@@ -53,19 +85,38 @@ func (c *Context) MetaDataAll() MetaData {
 }
 
 func (c *Context) SetMetaData(k, v string) {
-	err := c.store.SetKV(k, v)
-	if err != nil {
-		panic(err)
+	if err := c.store.SetKV(k, v); err != nil {
+		storeUnavailable()
 	}
 }
 
 func (c *Context) MetaData(k string) (string, bool) {
 	v, ok, err := c.store.GetKV(k)
 	if err != nil {
-		panic(err)
+		storeUnavailable()
 	}
 
 	return v, ok
+}
+
+// mustGetNodeStatus 读取任务状态，读失败时中断重放而不是当作「不存在」。
+func mustGetNodeStatus(store NodeStatusStore, key string) (TaskStatus, bool) {
+	s, exist, err := store.GetNodeStatus(key)
+	if err != nil {
+		storeUnavailable()
+	}
+	return s, exist
+}
+
+// breakOnTaskError 按重试策略把任务错误转成对应的断点。
+func breakOnTaskError(key string, err error, retryCount, maxRetry int) {
+	if errors.Is(err, AbortError) {
+		panic(BreakAbort(key, err))
+	}
+	if retryCount >= maxRetry {
+		panic(BreakFail(key, err))
+	}
+	panic(BreakRetry(key, err))
 }
 
 type SequenceWrap struct {
@@ -79,6 +130,16 @@ func (s *SequenceWrap) TaskKey(prefix string) string {
 	return fmt.Sprintf("%s:%v", prefix, s.Current)
 }
 
+// sequenceState 是 Sequence 需要持久化的部分。
+//
+// SequenceWrap 里的 ctx / max / name 都是运行期的东西，不能序列化：
+// 旧实现直接 json.Marshal 整个 SequenceWrap，恢复出来的对象 ctx 是 nil，
+// 一调用 Next() 就会空指针。
+type sequenceState struct {
+	Current int `json:"current"`
+	Max     int `json:"max"`
+}
+
 func (s *SequenceWrap) Next() bool {
 	if s.ctx.collect != nil {
 		end := s.ctx.collect("sequence", s.name)
@@ -87,12 +148,15 @@ func (s *SequenceWrap) Next() bool {
 			return s.Current <= 0
 		}
 	}
-	// 存储当前的序列号，而不是下一个
-	bs, _ := json.Marshal(s)
-	_ = s.ctx.store.SetKV(s.name, string(bs))
+
+	// 存储当前的序列号，而不是下一个：
+	// 如果在循环体里中断，恢复后要重跑当前这一轮。
+	if err := SetToStore(s.ctx.store, s.name, sequenceState{Current: s.Current, Max: s.max}); err != nil {
+		storeUnavailable()
+	}
 
 	s.Current += 1
-	if s.max == -1 {
+	if s.max < 0 {
 		return true
 	}
 	return s.Current < s.max
@@ -136,18 +200,30 @@ func Sequence(ctx *Context, key string, maxLen int) SequenceWrap {
 		}
 	}
 
-	key = fmt.Sprintf("__%v", key)
-	s, ok, _ := GetFromStore[SequenceWrap](ctx.store, key)
+	ctx.markKeyUsed("Sequence", key)
+
+	// 读写必须走同一条路径。旧实现写用 SetKV(name)、读用 GetFromStore(name)，
+	// 而 GetFromStore 会再加一层 "__" 前缀，于是状态永远读不回来，
+	// 每次重放都从头再数一遍。
+	st, ok, err := GetFromStore[sequenceState](ctx.store, key)
+	if err != nil {
+		storeUnavailable()
+	}
 	if !ok {
 		return SequenceWrap{
-			Current: -1, // skip first next()
+			Current: -1, // 让第一次 Next() 把它推到 0
 			max:     maxLen,
 			name:    key,
 			ctx:     ctx,
 		}
 	}
 
-	return s
+	return SequenceWrap{
+		Current: st.Current,
+		max:     st.Max,
+		name:    key,
+		ctx:     ctx,
+	}
 }
 
 type FutureT[T interface{}] struct {
@@ -200,10 +276,12 @@ func AsyncArray[T interface{}, A interface{}](ctx *Context, key string, arr []Ar
 // 这里只读取已经缓存的结果，不查任务状态：任务是否已完成、能不能执行，
 // 由 Wait 一次性读全量状态来判断，避免每个 future 各查一次 Redis。
 func Async[T interface{}](ctx *Context, key string, f func(ctx *TaskContext) (T, error)) *FutureT[T] {
+	ctx.markKeyUsed("Async", key)
+
 	val, _, err := GetFromStore[T](ctx.store, key)
 	if err != nil {
 		// 读失败绝不能当作「没有缓存」，否则已完成的任务会被重新执行一遍。
-		panic(BreakWait(time.Second))
+		storeUnavailable()
 	}
 
 	return &FutureT[T]{
@@ -453,7 +531,10 @@ func startHeartbeat(ctx *Context, key string, epoch int64) (stop func()) {
 	}
 }
 
-func Memo[T interface{}](ctx *Context, key string, build func() (T, error)) T {
+// Memo 执行 build 并缓存它的结果，重放时直接返回缓存。
+//
+// 如果 build 返回错误，会按重试策略重试；超过上限则整个 flow 失败。
+func Memo[T interface{}](ctx *Context, key string, build func() (T, error), opts ...TaskOption) T {
 	if ctx.collect != nil {
 		end := ctx.collect("memo", key)
 		if end {
@@ -462,14 +543,33 @@ func Memo[T interface{}](ctx *Context, key string, build func() (T, error)) T {
 		}
 	}
 
-	key = fmt.Sprintf("__%v", key)
-	v, exist, _ := GetFromStore[T](ctx.store, key)
+	ctx.markKeyUsed("Memo", key)
+
+	v, exist, err := GetFromStore[T](ctx.store, key)
+	if err != nil {
+		storeUnavailable()
+	}
 	if exist {
 		return v
 	}
 
-	t, _ := build()
-	_ = SetToStore(ctx.store, key, t)
+	s, _ := mustGetNodeStatus(ctx.store, key)
+	opt := TaskOptions(opts).build()
+
+	t, err := build()
+	if err != nil {
+		// 旧实现是 `t, _ := build()`：构建失败时把零值当成功结果永久缓存下来，
+		// 之后所有重放都命中缓存返回零值，错误被静默吞掉且永不重试。
+		// 现在和 Task / Array 用同一套重试语义。
+		breakOnTaskError(key, err, s.RetryCount, opt.MaxRetry)
+	}
+
+	if err := SetToStore(ctx.store, key, t); err != nil {
+		// 存不下来就不能返回，否则下一次重放会重新执行 build，
+		// 拿到一个和这次不同的值，破坏下游的确定性。
+		panic(BreakRetry(key, err))
+	}
+
 	return t
 }
 
@@ -503,27 +603,23 @@ func Array[T interface{}](ctx *Context, key string, build func(ctx *TaskContext)
 		}
 	}
 
-	// 如果没有数据，无论任务状态是什么都始终执行
-	v, exist, _ := GetFromStore[[]ArrayWrap[T]](ctx.store, key)
-	// todo panic error
+	ctx.markKeyUsed("Array", key)
+
+	// 只要缓存里有数据就直接用，不管任务状态是什么
+	v, exist, err := GetFromStore[[]ArrayWrap[T]](ctx.store, key)
+	if err != nil {
+		storeUnavailable()
+	}
 	if exist {
 		return v
 	}
 
-	s, exist, _ := ctx.store.GetNodeStatus(key)
+	s, _ := mustGetNodeStatus(ctx.store, key)
 	opt := TaskOptions(opts).build()
 
-	taskContext := newTaskContext(ctx, s)
-
-	t, err := build(taskContext)
+	t, err := build(newTaskContext(ctx, s))
 	if err != nil {
-		if errors.Is(err, AbortError) {
-			panic(BreakAbort(key, err))
-		}
-		if s.RetryCount > opt.MaxRetry {
-			panic(BreakFail(key, err))
-		}
-		panic(BreakRetry(key, err))
+		breakOnTaskError(key, err, s.RetryCount, opt.MaxRetry)
 	}
 
 	a := make([]ArrayWrap[T], len(t))
@@ -540,43 +636,6 @@ func Array[T interface{}](ctx *Context, key string, build func(ctx *TaskContext)
 	panic(BreakDone(key))
 }
 
-//
-//func UseStatus[T interface{}](ctx *Context, key string, def T) (T, func(T)) {
-//	// 从上下文中获取变量
-//	// 如果不存在则创建
-//	// 如果存在则返回
-//	// 返回一个函数，用于设置变量
-//	m, ok, _ := ctx.store.GetKV()
-//	if ok {
-//		if v, ok := m[key]; ok {
-//			var t T
-//			_ = json.Unmarshal([]byte(v), &t)
-//			return t, func(t T) {
-//				m, ok, _ := ctx.store.GetKV()
-//				if !ok {
-//					m = make(map[string]string)
-//				}
-//				bs, _ := json.Marshal(t)
-//				m[key] = string(bs)
-//				_ = ctx.store.SetKV(m)
-//			}
-//		}
-//	}
-//
-//	setV := func(t T) {
-//		m, ok, _ := ctx.store.GetKV()
-//		if !ok {
-//			m = make(map[string]string)
-//		}
-//		bs, _ := json.Marshal(t)
-//		m[key] = string(bs)
-//		_ = ctx.store.SetKV(m)
-//	}
-//	setV(def)
-//
-//	return def, setV
-//}
-
 type TaskContext struct {
 	*Context
 	Retry int
@@ -591,14 +650,6 @@ func newTaskContext(c *Context, taskStatus TaskStatus) *TaskContext {
 	}
 }
 
-func (t *Context) Lock() func() {
-	t.lock.Lock()
-
-	return func() {
-		t.lock.Unlock()
-	}
-}
-
 // Task 同名的 task 在同一时间只能执行一次
 func Task(c *Context, key string, fun TaskFun, opts ...TaskOption) {
 	if c.collect != nil {
@@ -607,29 +658,40 @@ func Task(c *Context, key string, fun TaskFun, opts ...TaskOption) {
 		}
 	}
 
-	s, exist, _ := c.store.GetNodeStatus(key)
-	if s.Status == "done" {
+	c.markKeyUsed("Task", key)
+
+	s, exist := mustGetNodeStatus(c.store, key)
+
+	switch s.Status {
+	case TaskStatusDone:
 		return
+	case TaskStatusFail:
+		// 旧实现在这里直接放行，于是只要发生任何一次重放，
+		// 失败的 task 会被静默跳过，后面的 task 照常执行——上游失败、下游照跑。
+		panic(BreakFail(key, fmt.Errorf("task %v已经失败: %v", key, strings.Join(s.Errs, "; "))))
+	case TaskStatusAbort:
+		panic(BreakAbort(key, fmt.Errorf("task %v 已经被终止", key)))
 	}
 
-	opt := TaskOptions(opts).build()
+	if !exist || s.Status == TaskStatusRetry {
+		// 还没到重试时间就先等着，别把退避时间空转掉
+		if exist && s.RunAt.After(time.Now()) {
+			panic(BreakWait(time.Until(s.RunAt)))
+		}
 
-	taskContext := newTaskContext(c, s)
-	if !exist || s.Status == "retry" {
-		err := fun(taskContext)
-		if err != nil {
-			if errors.Is(err, AbortError) {
-				panic(BreakAbort(key, err))
-			}
-			if s.RetryCount > opt.MaxRetry {
-				panic(BreakFail(key, err))
-			}
-			panic(BreakRetry(key, err))
+		opt := TaskOptions(opts).build()
+
+		if err := fun(newTaskContext(c, s)); err != nil {
+			breakOnTaskError(key, err, s.RetryCount, opt.MaxRetry)
 		}
 
 		// 执行成功也需要断点，因为需要依靠断点来存储状态。
 		panic(BreakDone(key))
 	}
+
+	// running / sleep 不该出现在 Task 上：这个 key 一定是被别的 API 也用了。
+	panic(fmt.Sprintf("gotick: task %q found in unexpected state %q; "+
+		"这个 key 很可能同时被 Sleep 或 Async 用了", key, s.Status))
 }
 
 func Sleep(c *Context, key string, duration time.Duration) {
@@ -638,10 +700,11 @@ func Sleep(c *Context, key string, duration time.Duration) {
 			return
 		}
 	}
-	s, exist, _ := c.store.GetNodeStatus(key)
-	// todo panic error，这个错误应该直接交给 MQ 重试兜底
+	c.markKeyUsed("Sleep", key)
 
-	if s.Status == "done" {
+	s, exist := mustGetNodeStatus(c.store, key)
+
+	if s.Status == TaskStatusDone {
 		return
 	}
 
@@ -649,26 +712,41 @@ func Sleep(c *Context, key string, duration time.Duration) {
 		panic(BreakSleep(key, duration))
 	}
 
-	if s.Status == "sleep" {
-		d := s.RunAt.Sub(time.Now())
-		if d > 0 {
+	if s.Status == TaskStatusSleep {
+		if d := time.Until(s.RunAt); d > 0 {
 			panic(BreakSleep(key, d))
 		}
 
-		_ = c.store.SetNodeStatus(key, s.MakeDone())
-		// todo panic error，这个错误应该直接交给 MQ 重试兜底
+		_, err := c.store.UpdateNodeStatus(key, func(st TaskStatus, isNew bool) (TaskStatus, bool) {
+			if st.Status == TaskStatusDone {
+				return st, false
+			}
+			return st.MakeDone(), true
+		})
+		if err != nil {
+			storeUnavailable()
+		}
+		return
 	}
+
+	panic(fmt.Sprintf("gotick: sleep %q found in unexpected state %q; "+
+		"这个 key 很可能同时被 Task 或 Async 用了", key, s.Status))
 }
 
+// defaultMaxRetry 是 Task / Memo / Array 默认的重试次数上限（不含第一次执行）。
+const defaultMaxRetry = 3
+
 type taskOption struct {
-	MaxRetry int // 这个 Task 最大重试次数，默认为 5
+	// MaxRetry 最大重试次数，不包含第一次执行。
+	// MaxRetry = 0 表示失败即失败，不重试。
+	MaxRetry int
 }
 
 type TaskOptions []TaskOption
 
 func (os TaskOptions) build() taskOption {
 	option := taskOption{
-		MaxRetry: 1,
+		MaxRetry: defaultMaxRetry,
 	}
 	for _, o := range os {
 		o.apply(&option)
@@ -689,13 +767,11 @@ func (m *maxRetryOption) apply(option *taskOption) {
 	return
 }
 
-// maxRetry 最大重试次数, 如果为 -1，则不重试。
+// WithMaxRetry 设置最大重试次数（不含第一次执行）。0 表示失败即失败。
+//
+// 注意：目前对 Async / AsyncArray 无效，它们用的是 defaultAsyncMaxRetry。
 func WithMaxRetry(maxRetry int) TaskOption {
 	return &maxRetryOption{maxRetry: maxRetry}
-}
-
-type Set interface {
-	Push(i interface{})
 }
 
 // Task 的状态取值。
@@ -905,61 +981,9 @@ type AsyncQueueFactory interface {
 
 type Server struct {
 	scheduler *Scheduler
-	measure   Measure
 }
 
-type Measure interface {
-	OnExec(flow, key string)
-	GetCount(flow string) map[string]int64
-}
-
-type MockMeasure struct {
-	m map[string]map[string]int64
-}
-
-func NewMockMeasure() *MockMeasure {
-	return &MockMeasure{
-		m: map[string]map[string]int64{},
-	}
-}
-
-func (m *MockMeasure) OnExec(flow, key string) {
-	if _, ok := m.m[flow]; !ok {
-		m.m[flow] = map[string]int64{}
-	}
-	m.m[flow][key] += 1
-}
-
-func (m *MockMeasure) GetCount(flow string) map[string]int64 {
-	return m.m[flow]
-}
-
-var _ Measure = (*MockMeasure)(nil)
-
-type RedisMeasure struct {
-	redis *redis.Client
-}
-
-func NewRedisMeasure(redis *redis.Client) *RedisMeasure {
-	return &RedisMeasure{redis: redis}
-}
-
-func (r *RedisMeasure) OnExec(flow, key string) {
-	r.redis.HIncrBy(context.Background(), "measure:"+flow, key, 1)
-}
-
-func (r *RedisMeasure) GetCount(flow string) map[string]int64 {
-	x, _ := r.redis.HGetAll(context.Background(), "measure:"+flow).Result()
-	rsp := map[string]int64{}
-	for k, v := range x {
-		rsp[k], _ = strconv.ParseInt(v, 10, 64)
-	}
-	return rsp
-}
-
-var _ Measure = (*RedisMeasure)(nil)
-
-// Client 用于触发调度，和 TickServer 的区别是，Client 不会启动调度器。
+// Client 用于触发调度，和 Server 的区别是 Client 不会启动调度器。
 type Client struct {
 	trigger *Trigger
 }
@@ -1000,13 +1024,6 @@ type AsyncQueue interface {
 	// uniqueKey 通常为 callId
 	Publish(ctx context.Context, data Event, delay time.Duration) error
 	Subscribe(h func(ctx context.Context, data Event) error)
-}
-
-type BreakStatus struct {
-	Type  string    // abort, sleep, retry, done, fail
-	RunAt time.Time // 当 sleep 时，表示下次调度的时间
-	Task  string    // 表示触发的是哪一个 task 内部断点
-	Err   error
 }
 
 func WithCallId(ctx context.Context, callId string) context.Context {
@@ -1059,7 +1076,6 @@ type Scheduler struct {
 	asyncScheduler AsyncQueueFactory
 	statusFactory  StoreFactory
 	trigger        *Trigger
-	debug          bool
 }
 
 func NewScheduler(asyncScheduler AsyncQueueFactory, statusStore StoreFactory) *Scheduler {
@@ -1110,16 +1126,6 @@ func (s *Scheduler) register(f *Flow) {
 				}
 
 				switch breakpoint := ns.(type) {
-				case *breakContinue:
-					// 立即调度，实现并行
-					err = aw.Publish(ctx, Event{
-						CallId:   callId,
-						Critical: true,
-					}, 0)
-					if err != nil {
-						log.Printf("scheduler event error: %v", err)
-						return
-					}
 				case *breakWait:
 					err = aw.Publish(ctx, Event{
 						CallId:   callId,
@@ -1525,14 +1531,7 @@ type Config struct {
 }
 
 func newScheduler(delayedQueue store.DelayedQueue, kvStore store.KVStore) *Scheduler {
-	ap := NewAsyncQueueFactory(delayedQueue)
-	st := NewKvStoreProduct(kvStore)
-	_, debug := os.LookupEnv("GOTICK_DEBUG")
-
-	scheduler := NewScheduler(ap, st)
-	scheduler.debug = debug
-
-	return scheduler
+	return NewScheduler(NewAsyncQueueFactory(delayedQueue), NewKvStoreProduct(kvStore))
 }
 
 func newSchedulerFromConfig(p Config) (*Scheduler, error) {
@@ -1585,27 +1584,29 @@ type NewClientConfig struct {
 	RedisClient redis.UniversalClient // if RedisURL is not set, use this client
 }
 
-func NewClient(p NewClientConfig) *Client {
-	opt, err := redis.ParseURL(p.RedisURL)
-	if err != nil {
-		panic(err)
-	}
+// NewClient 创建一个只能触发 flow、不启动调度器的客户端。
+func NewClient(p NewClientConfig) (*Client, error) {
+	// 先看 RedisClient 再解析 URL。
+	// 旧实现无条件先 ParseURL 并在失败时 panic，
+	// 于是文档里写明支持的「只传 RedisClient」这条路径 100% 崩溃。
 	var redisClient redis.UniversalClient
 	if p.RedisClient != nil {
 		redisClient = p.RedisClient
 	} else {
+		opt, err := redis.ParseURL(p.RedisURL)
+		if err != nil {
+			return nil, fmt.Errorf("parse RedisURL: %w", err)
+		}
 		redisClient = redis.NewClient(opt)
 	}
 
 	delayedQueue := store.NewAsynq(redisClient, asynq.Config{
-		Concurrency: 0, // Client not need run scheduler, concurrency is unused
+		Concurrency: 0, // Client 不跑调度器，并发度用不上
 	})
 
-	t := &Client{
+	return &Client{
 		trigger: NewTrigger(NewAsyncQueueFactory(delayedQueue)),
-	}
-
-	return t
+	}, nil
 }
 
 type DelayedAsyncQueueProduct struct {

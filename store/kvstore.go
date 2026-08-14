@@ -21,6 +21,17 @@ type KVStore interface {
 	// 多个节点同时调度同一个 callId 时会互相覆盖重试计数和状态。
 	HSetCAS(ctx context.Context, table string, key string, expect *string, value interface{}) (bool, error)
 	Delete(ctx context.Context, key string) error
+
+	// 下面三个用于实现带自动过期的租约（同一个 callId 同时只允许一个节点重放）。
+	// 值是一个随机 token，只有持有者才能续期和释放，
+	// 否则一个已经超时的持有者会误删别人刚拿到的租约。
+
+	// SetNX 仅当 key 不存在时写入，返回是否写入成功。
+	SetNX(ctx context.Context, key string, value string, ttl time.Duration) (bool, error)
+	// ExpireIf 仅当 key 的当前值等于 expect 时刷新过期时间。
+	ExpireIf(ctx context.Context, key string, expect string, ttl time.Duration) (bool, error)
+	// DeleteIf 仅当 key 的当前值等于 expect 时删除。
+	DeleteIf(ctx context.Context, key string, expect string) (bool, error)
 }
 
 var _ KVStore = (*WithPrefix)(nil)
@@ -56,6 +67,18 @@ func (w *WithPrefix) Get(ctx context.Context, key string, r interface{}) (bool, 
 
 func (w *WithPrefix) Set(ctx context.Context, key string, value interface{}, expiration time.Duration) error {
 	return w.store.Set(ctx, w.prefix+key, value, expiration)
+}
+
+func (w *WithPrefix) SetNX(ctx context.Context, key string, value string, ttl time.Duration) (bool, error) {
+	return w.store.SetNX(ctx, w.prefix+key, value, ttl)
+}
+
+func (w *WithPrefix) ExpireIf(ctx context.Context, key string, expect string, ttl time.Duration) (bool, error) {
+	return w.store.ExpireIf(ctx, w.prefix+key, expect, ttl)
+}
+
+func (w *WithPrefix) DeleteIf(ctx context.Context, key string, expect string) (bool, error) {
+	return w.store.DeleteIf(ctx, w.prefix+key, expect)
 }
 
 func NewWithPrefix(prefix string, store KVStore) *WithPrefix {
@@ -176,4 +199,40 @@ func (r *RedisStore) Set(ctx context.Context, key string, value interface{}, exp
 		return err
 	}
 	return r.redis.Set(ctx, key, bs, expiration).Err()
+}
+
+// expireIfScript 只在值匹配时续期，避免一个已经超时的持有者把别人的租约续走。
+var expireIfScript = redis.NewScript(`
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+end
+return 0
+`)
+
+// deleteIfScript 只在值匹配时删除，避免释放掉别人刚拿到的租约。
+var deleteIfScript = redis.NewScript(`
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+`)
+
+func (r *RedisStore) SetNX(ctx context.Context, key string, value string, ttl time.Duration) (bool, error) {
+	return r.redis.SetNX(ctx, key, value, ttl).Result()
+}
+
+func (r *RedisStore) ExpireIf(ctx context.Context, key string, expect string, ttl time.Duration) (bool, error) {
+	res, err := expireIfScript.Run(ctx, r.redis, []string{key}, expect, ttl.Milliseconds()).Int64()
+	if err != nil {
+		return false, err
+	}
+	return res == 1, nil
+}
+
+func (r *RedisStore) DeleteIf(ctx context.Context, key string, expect string) (bool, error) {
+	res, err := deleteIfScript.Run(ctx, r.redis, []string{key}, expect).Int64()
+	if err != nil {
+		return false, err
+	}
+	return res == 1, nil
 }

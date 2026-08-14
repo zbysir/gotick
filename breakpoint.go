@@ -43,14 +43,6 @@ func BreakAbort(task string, err error) Breakpoint {
 	return &breakAbort{Task: task, Error: err}
 }
 
-type breakStatus struct {
-	Task string
-}
-
-func (b *breakStatus) GetTask() string {
-	return b.Task
-}
-
 type breakRetry struct {
 	Task string
 	Err  error
@@ -94,16 +86,4 @@ func (b *breakWait) GetTask() string {
 // BreakWait 和 BreakSleep 的区别是 BreakSleep 只会在执行指定的 task 时才会 sleep，而 Wait 始终会 sleep。
 func BreakWait(t time.Duration) Breakpoint {
 	return &breakWait{Task: "*", RunAt: time.Now().Add(t)} // * 表示不是针对某个 task 的断点，而是系统断点。
-}
-
-type breakContinue struct {
-	Task string
-}
-
-func (b *breakContinue) GetTask() string {
-	return b.Task
-}
-
-func BreakContinue(t time.Duration) Breakpoint {
-	return &breakContinue{Task: "*"} // * 表示不是针对某个 task 的断点，而是系统断点。
 }

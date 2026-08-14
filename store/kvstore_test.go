@@ -191,6 +191,75 @@ func TestHSetCAS(t *testing.T) {
 	}
 }
 
+// TestLeasePrimitives 覆盖 SetNX / ExpireIf / DeleteIf。
+// 它们是「同一个 callId 同时只允许一个节点重放」的基础。
+func TestLeasePrimitives(t *testing.T) {
+	ctx := context.Background()
+
+	impls := map[string]KVStore{
+		"redis": newTestRedisStore(t),
+		"mock":  NewMockKvStore(),
+	}
+
+	for name, s := range impls {
+		t.Run(name, func(t *testing.T) {
+			ok, err := s.SetNX(ctx, "lease", "token-a", time.Minute)
+			require.NoError(t, err)
+			assert.True(t, ok, "acquiring a free lease should succeed")
+
+			ok, err = s.SetNX(ctx, "lease", "token-b", time.Minute)
+			require.NoError(t, err)
+			assert.False(t, ok, "a held lease must not be acquirable")
+
+			// 别人的 token 既不能续期也不能释放
+			ok, err = s.ExpireIf(ctx, "lease", "token-b", time.Minute)
+			require.NoError(t, err)
+			assert.False(t, ok, "renewing someone else's lease must fail")
+
+			ok, err = s.DeleteIf(ctx, "lease", "token-b")
+			require.NoError(t, err)
+			assert.False(t, ok, "releasing someone else's lease must fail")
+
+			// 持有者可以续期和释放
+			ok, err = s.ExpireIf(ctx, "lease", "token-a", time.Minute)
+			require.NoError(t, err)
+			assert.True(t, ok)
+
+			ok, err = s.DeleteIf(ctx, "lease", "token-a")
+			require.NoError(t, err)
+			assert.True(t, ok)
+
+			// 释放之后别人才能拿到
+			ok, err = s.SetNX(ctx, "lease", "token-b", time.Minute)
+			require.NoError(t, err)
+			assert.True(t, ok, "a released lease must be acquirable again")
+		})
+	}
+}
+
+// TestLeaseExpires 确认租约会自动过期——持有者进程直接被 kill 时靠的就是它。
+func TestLeaseExpires(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { rdb.Close() })
+	r := NewRedisStore(rdb)
+	ctx := context.Background()
+
+	ok, err := r.SetNX(ctx, "lease", "token-a", 100*time.Millisecond)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	ok, err = r.SetNX(ctx, "lease", "token-b", time.Minute)
+	require.NoError(t, err)
+	require.False(t, ok)
+
+	mr.FastForward(200 * time.Millisecond)
+
+	ok, err = r.SetNX(ctx, "lease", "token-b", time.Minute)
+	require.NoError(t, err)
+	assert.True(t, ok, "an expired lease must be acquirable by another worker")
+}
+
 // TestHSetCASIsAtomic 让一群 goroutine 用 CAS 抢同一个字段，
 // 断言恰好只有一个赢家——这正是「抢占任务执行权」依赖的性质。
 func TestHSetCASIsAtomic(t *testing.T) {
