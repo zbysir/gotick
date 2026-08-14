@@ -304,3 +304,130 @@ func TestRunIndexRecordsFailure(t *testing.T) {
 	assert.Equal(t, "explodes", run.FailedTask)
 	assert.Contains(t, run.Error, "disk on fire")
 }
+
+// TestQueueCountDoesNotGrowWithFlows 是这次改动的核心断言。
+//
+// 早期实现给每个 flow 建一对队列，而消息队列的轮询要遍历所有队列——
+// 50 个 flow 就是 100 个队列，完全空闲时也在持续刷 Redis。
+// 现在所有 flow 共用一对队列，靠事件里的 flowId 分发。
+func TestQueueCountDoesNotGrowWithFlows(t *testing.T) {
+	mr := miniredis.RunT(t)
+
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { rdb.Close() })
+
+	tick := newRedisServer(t, mr.Addr())
+
+	const flows = 8
+	fin := newSignaler()
+	done := newCounter()
+
+	for i := 0; i < flows; i++ {
+		id := fmt.Sprintf("demo/flow-%02d", i)
+		tick.Flow(id, func(ctx *gotick.Context) {
+			gotick.Task(ctx, "step", func(*gotick.TaskContext) error {
+				done.inc(id)
+				return nil
+			})
+		}).OnSuccess(func(ctx *gotick.Context) error {
+			if len(done.snapshot()) == flows {
+				fin.fire()
+			}
+			return nil
+		})
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = tick.StartServer(ctx)
+	}()
+
+	for i := 0; i < flows; i++ {
+		_, err := tick.Trigger(ctx, fmt.Sprintf("demo/flow-%02d", i), nil)
+		require.NoError(t, err)
+	}
+
+	select {
+	case <-fin.ch:
+	case <-time.After(60 * time.Second):
+		t.Fatalf("not all flows finished: %v", done.snapshot())
+	}
+
+	queues, err := rdb.SMembers(ctx, "asynq:queues").Result()
+	require.NoError(t, err)
+	assert.Len(t, queues, 2,
+		"%d 个 flow 应该只用 2 个队列（普通 + critical），实际是 %v", flows, queues)
+	assert.ElementsMatch(t, []string{"gotick", "gotick_critical"}, queues)
+
+	cancel()
+	wg.Wait()
+}
+
+// TestSharedQueueRoutesToTheRightWorker 覆盖共用队列带来的新风险：
+// 一个 worker 会收到它没有注册的 flow 的事件。
+//
+// 它绝不能默默 ack——那等于把别人的流程吞掉，那个流程再也不会往下走。
+func TestSharedQueueRoutesToTheRightWorker(t *testing.T) {
+	mr := miniredis.RunT(t)
+
+	ran := newCounter()
+	finA := newSignaler()
+	finB := newSignaler()
+
+	// 两台 worker 各自只注册一个 flow，但消费的是同一对队列
+	makeWorker := func(flowId string, fin *signaler) *gotick.Server {
+		tick := newRedisServer(t, mr.Addr())
+		tick.Flow(flowId, func(ctx *gotick.Context) {
+			gotick.Task(ctx, "step", func(*gotick.TaskContext) error {
+				ran.inc(flowId)
+				return nil
+			})
+		}).OnSuccess(func(ctx *gotick.Context) error {
+			fin.fire()
+			return nil
+		})
+		return tick
+	}
+
+	workerA := makeWorker("demo/only-on-a", finA)
+	workerB := makeWorker("demo/only-on-b", finB)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for _, w := range []*gotick.Server{workerA, workerB} {
+		w := w
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = w.StartServer(ctx)
+		}()
+	}
+
+	// 从 A 触发两个 flow——其中一个只有 B 认识
+	for _, id := range []string{"demo/only-on-a", "demo/only-on-b"} {
+		_, err := workerA.Trigger(ctx, id, nil)
+		require.NoError(t, err)
+	}
+
+	for name, fin := range map[string]*signaler{"only-on-a": finA, "only-on-b": finB} {
+		select {
+		case <-fin.ch:
+		case <-time.After(90 * time.Second):
+			t.Fatalf("flow %s 没有跑完——它可能被没注册它的 worker 吞掉了；计数：%v",
+				name, ran.snapshot())
+		}
+	}
+
+	cancel()
+	wg.Wait()
+
+	assert.Equal(t, 1, ran.get("demo/only-on-a"))
+	assert.Equal(t, 1, ran.get("demo/only-on-b"))
+}

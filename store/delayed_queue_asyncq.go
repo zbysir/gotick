@@ -2,63 +2,159 @@ package store
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"log"
+	"sync"
 	"time"
 
 	"github.com/hibiken/asynq"
 	"github.com/redis/go-redis/v9"
 )
 
+// DefaultQueue 是所有 flow 共用的队列命名空间。
+const DefaultQueue = "gotick"
+
+// ErrUnknownFlow 表示任务落到了没有注册这个 flow 的 worker 上。
+//
+// 它不是真的失败：事件是好的，只是来错了地方，需要尽快换一个 worker 重投。
+var ErrUnknownFlow = errors.New("gotick: no flow registered for this task on this worker")
+
+// unknownFlowRetryDelay 是「来错 worker」的重投间隔。
+//
+// 不能用默认的指数退避：那是分钟级的，而正确的 worker 可能就在旁边，
+// 流程会毫无理由地卡上几分钟。
+const unknownFlowRetryDelay = 200 * time.Millisecond
+
+// criticalSuffix 标记优先调度的队列。
+//
+// 已经开始的流程比新触发的流程优先，这样在积压时它们能尽快跑完让出资源，
+// 而不是所有流程一起龟速前进。
+const criticalSuffix = "_critical"
+
+// AsynqOptions 是 gotick 自己的队列配置，和 asynq.Config 分开放。
+type AsynqOptions struct {
+	// Queue 队列命名空间，默认 DefaultQueue。
+	//
+	// 所有 flow 共用 {Queue} 和 {Queue}_critical 两个队列，靠任务自带的 flowId 分发。
+	// 早期实现是一个 flow 一对队列，于是队列数随 flow 数线性增长，
+	// 而消息队列的轮询要遍历所有队列——50 个 flow 就是 100 个队列，
+	// 完全空闲时也在持续刷 Redis。
+	//
+	// 需要把某个重负载的 flow 和其他流程隔开时，给它单独起一个 Server 并换个命名空间。
+	Queue string
+
+	// OwnsClient 表示 redis 连接是调用方专门为这个队列创建的，关停时可以连同关闭。
+	// 传入应用共享的连接时必须为 false。
+	OwnsClient bool
+
+	// ConsumeLegacyPerFlowQueues 让 worker 额外消费旧的「一个 flow 一个队列」。
+	//
+	// 从旧版本升级时打开它，等旧队列里的任务排空之后再关掉。
+	// 不打开的话，升级前还留在旧队列里的任务不会有任何人处理。
+	ConsumeLegacyPerFlowQueues bool
+}
+
 type Asynq struct {
-	opt asynq.Config
+	cfg asynq.Config
+	opt AsynqOptions
 	cli *asynq.Client
 
 	redisCli redis.UniversalClient
 
-	// ownsClient 表示这个 redis 连接是我们自己创建的，关闭时应该由我们负责。
-	// 调用方传进来的共享连接绝不能关——那是别人的连接，
-	// 关掉它会让用户的整个应用失去 Redis。
-	ownsClient bool
-
-	// topic => callback
+	mu sync.RWMutex
+	// callback 按 flowId 分发。注册发生在 Start 之前，但读发生在 handler 里，
+	// 所以要加锁。
 	callback map[string][]func(ctx context.Context, task *asynq.Task) error
+	started  bool
+	// warned 记录已经报过警的 flow，避免刷屏。
+	warned map[string]bool
 }
 
+func (a *Asynq) queue() string {
+	if a.opt.Queue != "" {
+		return a.opt.Queue
+	}
+	return DefaultQueue
+}
+
+func (a *Asynq) criticalQueue() string { return a.queue() + criticalSuffix }
+
 func (a *Asynq) Start(ctx context.Context) error {
-	queues := map[string]int{}
-
-	// 只监听注册了的 topic
-	for k := range a.callback {
-		queues[k] = 1
-		queues[k+"_critical"] = 9
+	// 所有 flow 共用这两个队列，不再随 flow 数量增长。
+	queues := map[string]int{
+		a.queue():         1,
+		a.criticalQueue(): 9,
 	}
 
-	a.opt.Queues = queues
+	a.mu.Lock()
+	a.started = true
+	if a.opt.ConsumeLegacyPerFlowQueues {
+		for topic := range a.callback {
+			if topic == a.queue() {
+				continue
+			}
+			queues[topic] = 1
+			queues[topic+criticalSuffix] = 9
+		}
+	}
+	a.mu.Unlock()
 
-	if a.opt.Concurrency == 0 {
-		a.opt.Concurrency = 10
+	a.cfg.Queues = queues
+
+	if a.cfg.Concurrency == 0 {
+		a.cfg.Concurrency = 10
 	}
-	if a.opt.TaskCheckInterval == 0 {
-		a.opt.TaskCheckInterval = time.Millisecond * 100
+	if a.cfg.TaskCheckInterval == 0 {
+		a.cfg.TaskCheckInterval = time.Millisecond * 100
 	}
-	if a.opt.DelayedTaskCheckInterval == 0 {
+	if a.cfg.DelayedTaskCheckInterval == 0 {
 		// asynq 这一项的默认值是 5 秒，而它决定了「已排期」的任务多久才被搬到
 		// 「待执行」——也就是每一个 Sleep、每一次重试退避的实际精度。
 		// 用默认值的话，睡 2 秒实际要等 4 秒多，而且这个延迟对用户完全不可见。
 		//
 		// 注意它和 TaskCheckInterval 不是一回事：后者只管队列空时多久查一次新任务。
-		a.opt.DelayedTaskCheckInterval = 500 * time.Millisecond
+		a.cfg.DelayedTaskCheckInterval = 500 * time.Millisecond
+	}
+
+	// 「来错 worker」要快速重投，其余错误保持调用方或 asynq 的退避策略。
+	userRetryDelay := a.cfg.RetryDelayFunc
+	a.cfg.RetryDelayFunc = func(n int, err error, task *asynq.Task) time.Duration {
+		if errors.Is(err, ErrUnknownFlow) {
+			return unknownFlowRetryDelay
+		}
+		if userRetryDelay != nil {
+			return userRetryDelay(n, err, task)
+		}
+		return asynq.DefaultRetryDelayFunc(n, err, task)
 	}
 
 	srv := asynq.NewServer(
-		&RawRedisClient{c: a.redisCli, keepOpen: !a.ownsClient},
-		a.opt,
+		&RawRedisClient{c: a.redisCli, keepOpen: !a.opt.OwnsClient},
+		a.cfg,
 	)
 
 	err := srv.Start(asynq.HandlerFunc(func(ctx context.Context, task *asynq.Task) error {
-		// log.Printf("[gotick] ------ call: queue: %v ------", task.Type())
-		for _, c := range a.callback[task.Type()] {
-			err := c(ctx, task)
-			if err != nil {
+		a.mu.RLock()
+		handlers := a.callback[task.Type()]
+		a.mu.RUnlock()
+
+		if len(handlers) == 0 {
+			// 共用队列意味着这个 worker 会收到它没有注册的 flow 的事件。
+			//
+			// 必须返回错误而不是默默 ack：ack 等于把别人的事件吞掉，
+			// 那个流程就再也不会往下走了。返回错误会让它被快速重投，
+			// 落到真正注册了这个 flow 的 worker 上。
+			//
+			// 滚动发布期间新旧 worker 混跑会短暂走到这里。如果一直重试到归档，
+			// 说明整个集群里没人注册这个 flow——通常是两个不相干的服务
+			// 共用了同一个队列命名空间。
+			a.warnUnknownFlow(task.Type())
+			return fmt.Errorf("%w: %q", ErrUnknownFlow, task.Type())
+		}
+
+		for _, c := range handlers {
+			if err := c(ctx, task); err != nil {
 				return err
 			}
 		}
@@ -69,13 +165,11 @@ func (a *Asynq) Start(ctx context.Context) error {
 		return err
 	}
 
-	select {
-	case <-ctx.Done():
-	}
+	<-ctx.Done()
 
 	srv.Shutdown()
 
-	if a.ownsClient {
+	if a.opt.OwnsClient {
 		_ = a.cli.Close()
 	}
 
@@ -87,26 +181,50 @@ type Option struct {
 }
 
 func (a *Asynq) Publish(ctx context.Context, topic string, data []byte, delay time.Duration, opt Option) error {
-	queueName := topic
+	queueName := a.queue()
 	if opt.Critical {
-		queueName = queueName + "_critical"
+		queueName = a.criticalQueue()
 	}
-	// log.Printf("[gotick] ------ publish: %v, queue: %v, runat: %v ------", topic, queueName, time.Now().Add(delay))
+
+	// 任务的 type 就是 flowId，消费端靠它分发——所以队列不需要按 flow 分。
+	// 这也让 Client 不必知道任何 flow 的信息就能触发流程。
 	_, err := a.cli.EnqueueContext(ctx, asynq.NewTask(topic, data),
 		asynq.ProcessAt(time.Now().Add(delay)),
 		asynq.Queue(queueName),
 	)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return err
 }
 
 func (a *Asynq) Subscribe(topic string, h func(ctx context.Context, data []byte) error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	// 启动之后再注册是允许的：队列集合是固定的，handler 在分发时才读这张表。
+	// 早期实现按 flow 建队列，队列集合在 Start 时就定死了，
+	// 于是启动后注册的 flow 永远收不到任何事件——共用队列顺带消除了这个问题。
+	//
+	// 唯一的例外是旧队列兼容模式，那批队列名确实要在 Start 时就知道。
+	if a.started && a.opt.ConsumeLegacyPerFlowQueues {
+		log.Printf("[gotick] flow %q registered after start; its legacy per-flow queue will not be consumed", topic)
+	}
+
 	a.callback[topic] = append(a.callback[topic], func(ctx context.Context, task *asynq.Task) error {
-		return h(context.TODO(), task.Payload())
+		return h(ctx, task.Payload())
 	})
+}
+
+// warnUnknownFlow 每个 flow 只报一次，让配置错误在日志里立刻可见，又不至于刷屏。
+func (a *Asynq) warnUnknownFlow(topic string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.warned[topic] {
+		return
+	}
+	a.warned[topic] = true
+	log.Printf("[gotick] received an event for flow %q which is not registered on this worker; "+
+		"it will be retried elsewhere. If no worker in the cluster registers it, the event will be "+
+		"archived — check that unrelated services are not sharing one queue namespace.", topic)
 }
 
 var _ DelayedQueue = (*Asynq)(nil)
@@ -136,15 +254,13 @@ type nonClosingClient struct {
 func (nonClosingClient) Close() error { return nil }
 
 // NewAsynq 创建延时队列。
-//
-// ownsClient 表示 redisCli 是调用方专门为这个队列创建的，
-// 关停时可以连同关闭。传入应用共享的连接时必须为 false。
-func NewAsynq(redisCli redis.UniversalClient, opt asynq.Config, ownsClient bool) *Asynq {
+func NewAsynq(redisCli redis.UniversalClient, cfg asynq.Config, opt AsynqOptions) *Asynq {
 	return &Asynq{
-		opt:        opt,
-		cli:        asynq.NewClient(&RawRedisClient{c: redisCli, keepOpen: !ownsClient}),
-		redisCli:   redisCli,
-		ownsClient: ownsClient,
-		callback:   map[string][]func(ctx context.Context, task *asynq.Task) error{},
+		cfg:      cfg,
+		opt:      opt,
+		cli:      asynq.NewClient(&RawRedisClient{c: redisCli, keepOpen: !opt.OwnsClient}),
+		redisCli: redisCli,
+		callback: map[string][]func(ctx context.Context, task *asynq.Task) error{},
+		warned:   map[string]bool{},
 	}
 }

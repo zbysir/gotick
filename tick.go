@@ -1799,6 +1799,20 @@ type Config struct {
 	// 调小会让唤醒更准，代价是每个队列多一点 Redis 轮询；
 	// 流程数量多而对延迟不敏感时可以调大。
 	DelayedTaskCheckInterval time.Duration
+
+	// Queue 队列命名空间，默认 "gotick"。
+	//
+	// 所有 flow 共用 {Queue} 和 {Queue}_critical 两个队列，靠事件里的 flowId 分发。
+	// 消费同一个命名空间的所有 worker 应该注册同一组 flow——
+	// 收到自己没注册的 flow 时，worker 会报错让消息队列重投，
+	// 而不是默默把别人的事件吞掉。
+	//
+	// 要把某组 flow 和其他流程隔开时，给它们单独起一个 Server 并换个命名空间。
+	Queue string
+
+	// ConsumeLegacyPerFlowQueues 让 worker 额外消费旧版本「一个 flow 一个队列」的遗留任务。
+	// 从旧版本升级时打开，等旧队列排空后关掉。
+	ConsumeLegacyPerFlowQueues bool
 }
 
 func newScheduler(delayedQueue store.DelayedQueue, kvStore store.KVStore) *Scheduler {
@@ -1830,7 +1844,11 @@ func newSchedulerFromConfig(p Config) (*Scheduler, error) {
 		Concurrency:              p.Concurrency,
 		TaskCheckInterval:        p.TaskCheckInterval,
 		DelayedTaskCheckInterval: p.DelayedTaskCheckInterval,
-	}, ownsClient)
+	}, store.AsynqOptions{
+		Queue:                      p.Queue,
+		OwnsClient:                 ownsClient,
+		ConsumeLegacyPerFlowQueues: p.ConsumeLegacyPerFlowQueues,
+	})
 	kvStore := store.NewRedisStore(redisClient)
 
 	return newScheduler(delayedQueue, kvStore), nil
@@ -1862,6 +1880,9 @@ func NewServer(p NewServerParams) *Server {
 type NewClientConfig struct {
 	RedisURL    string                // "redis://<user>:<pass>@localhost:6379/<db>"
 	RedisClient redis.UniversalClient // RedisURL 未设置时使用这个 client
+
+	// Queue 队列命名空间，必须和目标 Server 一致。默认 "gotick"。
+	Queue string
 }
 
 // NewClientParams 用于直接注入队列实现，和 NewServerParams 对称。
@@ -1901,7 +1922,10 @@ func NewClient(p NewClientConfig) (*Client, error) {
 
 	delayedQueue := store.NewAsynq(redisClient, asynq.Config{
 		Concurrency: 0, // Client 不跑调度器，并发度用不上
-	}, ownsClient)
+	}, store.AsynqOptions{
+		Queue:      p.Queue,
+		OwnsClient: ownsClient,
+	})
 
 	return &Client{
 		trigger: NewTrigger(NewAsyncQueueFactory(delayedQueue)),
