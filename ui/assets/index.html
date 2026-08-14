@@ -447,9 +447,15 @@ const REPLAY_KIND = {
   finish:      "流程跑完",
 };
 
-// GAP_WARN 超过这个间隔就标黄。正常的「立刻继续」是毫秒级的，
-// 秒级说明这一跳花在了消息队列的调度开销上。
+// GAP_WARN 超过这个间隔才值得看一眼。
 const GAP_WARN = 2000;
+
+// CONTINUES_IMMEDIATELY 是那些「做完就该立刻继续」的结束方式。
+//
+// 只有它们后面的间隔才说明问题：sleep 和 retry 后面本来就该有间隔，
+// 那是用户自己要求的等待。分不清这两者的告警会一直误报，
+// 而一个总在误报的告警等于没有告警。
+const CONTINUES_IMMEDIATELY = { done: true, sleep_rearm: true };
 
 function replayPanel(run) {
   const marks = run.marks || [];
@@ -463,7 +469,7 @@ function replayPanel(run) {
   const rows = marks.map((m, i) => {
     const at = Date.parse(m.at);
     const gap = i === 0 ? 0 : at - Date.parse(marks[i - 1].at);
-    const slow = gap >= GAP_WARN;
+    const slow = i > 0 && gap >= GAP_WARN && CONTINUES_IMMEDIATELY[marks[i - 1].kind];
     const odd = m.kind === "sleep_rearm";
 
     return `<tr>
@@ -477,7 +483,7 @@ function replayPanel(run) {
 
   // 只有明显异常才提示，不然每次都挂一条横幅反而没人看
   const worst = marks.reduce((acc, m, i) => {
-    if (i === 0) return acc;
+    if (i === 0 || !CONTINUES_IMMEDIATELY[marks[i - 1].kind]) return acc;
     const gap = Date.parse(m.at) - Date.parse(marks[i - 1].at);
     return gap > acc.gap ? { gap, i } : acc;
   }, { gap: 0, i: 0 });
@@ -490,8 +496,8 @@ function replayPanel(run) {
       `而且重新入队本身要花掉一次队列调度的时间。</div>`;
   } else if (worst.gap >= GAP_WARN) {
     note = `<div class="activity-note" style="padding:10px 16px;border-top:1px solid var(--line)">` +
-      `第 ${worst.i + 1} 次重放距上一次隔了 ${humanGap(worst.gap)}。` +
-      `如果这一跳本该是立刻继续的，说明时间花在了消息队列的调度上。</div>`;
+      `第 ${worst.i} 次重放做完之后本该立刻继续，实际隔了 ${humanGap(worst.gap)}——` +
+      `这段时间花在了消息队列的调度上。</div>`;
   }
 
   return `<div class="panel">
