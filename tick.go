@@ -37,6 +37,12 @@ type Context struct {
 	keyMu    sync.Mutex
 	usedKeys map[string]string // key -> 使用它的 API，用于检测重名
 
+	// inCallback 表示正在执行 OnSuccess / OnFail / OnError 回调。
+	//
+	// 回调里再读一次 Memo 的缓存值是合法用法——比如用 start_at 算总耗时——
+	// 那不是重复声明，所以不做重名检查。
+	inCallback bool
+
 	// attemptStart 是当前同步任务（Task / Memo / Array）开始执行的时间。
 	// 它们只在断点处写状态，没有别的地方能记下开始时间。
 	// 同步执行保证了同一时刻只有一个值有效。
@@ -52,6 +58,11 @@ type Context struct {
 func (c *Context) markKeyUsed(api, key string) {
 	c.keyMu.Lock()
 	defer c.keyMu.Unlock()
+
+	// 回调不是 flow 体的一部分，在那里读缓存不算重复声明
+	if c.inCallback {
+		return
+	}
 
 	if c.usedKeys == nil {
 		c.usedKeys = map[string]string{}
@@ -1301,6 +1312,7 @@ func (s *Scheduler) register(f *Flow) {
 					}
 
 					if f.onError != nil {
+						ctx.inCallback = true
 						if cbErr := f.onError(ctx, newStatus); cbErr != nil {
 							// TODO 支持 onError 回调失败后的重试
 							log.Printf("[gotick] onError callback failed: %v", cbErr)
@@ -1329,6 +1341,7 @@ func (s *Scheduler) register(f *Flow) {
 						failedErr = breakpoint.Error.Error()
 					}
 					if f.onFail != nil {
+						ctx.inCallback = true
 						if cbErr := f.onFail(ctx, newStatus); cbErr != nil {
 							log.Printf("[gotick] onFail callback failed: %v", cbErr)
 						}
@@ -1354,6 +1367,7 @@ func (s *Scheduler) register(f *Flow) {
 						failedErr = breakpoint.Err.Error()
 					}
 					if f.onFail != nil {
+						ctx.inCallback = true
 						if cbErr := f.onFail(ctx, newStatus); cbErr != nil {
 							log.Printf("[gotick] onFail callback failed: %v", cbErr)
 						}
@@ -1387,6 +1401,7 @@ func (s *Scheduler) register(f *Flow) {
 			// 没有中断，说明整个 flow 跑完了
 			terminal = true
 			if f.onSuccess != nil {
+				ctx.inCallback = true
 				if err := f.onSuccess(ctx); err != nil {
 					return err
 				}
