@@ -32,6 +32,9 @@ type KVStore interface {
 	ExpireIf(ctx context.Context, key string, expect string, ttl time.Duration) (bool, error)
 	// DeleteIf 仅当 key 的当前值等于 expect 时删除。
 	DeleteIf(ctx context.Context, key string, expect string) (bool, error)
+
+	// Expire 给一个已存在的 key 设置过期时间，用于回收已经结束的 flow 数据。
+	Expire(ctx context.Context, key string, ttl time.Duration) error
 }
 
 var _ KVStore = (*WithPrefix)(nil)
@@ -79,6 +82,10 @@ func (w *WithPrefix) ExpireIf(ctx context.Context, key string, expect string, tt
 
 func (w *WithPrefix) DeleteIf(ctx context.Context, key string, expect string) (bool, error) {
 	return w.store.DeleteIf(ctx, w.prefix+key, expect)
+}
+
+func (w *WithPrefix) Expire(ctx context.Context, key string, ttl time.Duration) error {
+	return w.store.Expire(ctx, w.prefix+key, ttl)
 }
 
 func NewWithPrefix(prefix string, store KVStore) *WithPrefix {
@@ -227,6 +234,10 @@ func (r *RedisStore) ExpireIf(ctx context.Context, key string, expect string, tt
 		return false, err
 	}
 	return res == 1, nil
+}
+
+func (r *RedisStore) Expire(ctx context.Context, key string, ttl time.Duration) error {
+	return r.redis.Expire(ctx, key, ttl).Err()
 }
 
 func (r *RedisStore) DeleteIf(ctx context.Context, key string, expect string) (bool, error) {

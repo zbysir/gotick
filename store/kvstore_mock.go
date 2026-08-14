@@ -14,9 +14,10 @@ import (
 // （比如 HGetAll 返回的编码形式不同），测试因此测不到真实语义。
 // 一个说谎的 mock 比没有 mock 更糟。
 type MockKvStore struct {
-	lock sync.Mutex
-	m    map[string]lifeValue
-	hm   map[string]map[string][]byte
+	lock  sync.Mutex
+	m     map[string]lifeValue
+	hm    map[string]map[string][]byte
+	hLive map[string]time.Time // hash 表的过期时间，零值表示不过期
 }
 
 type lifeValue struct {
@@ -30,8 +31,9 @@ func (l lifeValue) expired(now time.Time) bool {
 
 func NewMockKvStore() *MockKvStore {
 	return &MockKvStore{
-		m:  map[string]lifeValue{},
-		hm: map[string]map[string][]byte{},
+		m:     map[string]lifeValue{},
+		hm:    map[string]map[string][]byte{},
+		hLive: map[string]time.Time{},
 	}
 }
 
@@ -70,6 +72,10 @@ func (m *MockKvStore) HGet(ctx context.Context, table string, key string, r inte
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
+	if m.hashExpired(table) {
+		return false, nil
+	}
+
 	v, ok := m.hm[table][key]
 	if !ok {
 		return false, nil
@@ -83,7 +89,7 @@ func (m *MockKvStore) HGetAll(ctx context.Context, table string) (map[string]str
 	defer m.lock.Unlock()
 
 	tbl, ok := m.hm[table]
-	if !ok {
+	if !ok || m.hashExpired(table) {
 		// Redis 对不存在的 key 返回空 map 而不是 nil，这里保持一致
 		return map[string]string{}, true, nil
 	}
@@ -185,11 +191,37 @@ func (m *MockKvStore) DeleteIf(ctx context.Context, key string, expect string) (
 	return true, nil
 }
 
+// hashLife 记录 hash 表的过期时间。Redis 的过期是整个 key 级别的，这里保持一致。
+func (m *MockKvStore) Expire(ctx context.Context, key string, ttl time.Duration) error {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	var live time.Time
+	if ttl > 0 {
+		live = time.Now().Add(ttl)
+	}
+
+	if v, ok := m.m[key]; ok {
+		m.m[key] = lifeValue{live: live, value: v.value}
+	}
+	if _, ok := m.hm[key]; ok {
+		m.hLive[key] = live
+	}
+	return nil
+}
+
 func (m *MockKvStore) Delete(ctx context.Context, key string) error {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
 	delete(m.m, key)
 	delete(m.hm, key)
+	delete(m.hLive, key)
 	return nil
+}
+
+// hashExpired 调用方必须已经持有锁。
+func (m *MockKvStore) hashExpired(table string) bool {
+	live, ok := m.hLive[table]
+	return ok && !live.IsZero() && live.Before(time.Now())
 }

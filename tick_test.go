@@ -429,6 +429,76 @@ func TestNewClientRejectsBadURL(t *testing.T) {
 	require.Error(t, err, "an invalid URL must be reported, not panicked")
 }
 
+// TestReplayLeaseIsExclusive 覆盖「同一个 callId 同时只能有一个节点重放」。
+//
+// 消息队列是 at-least-once 的，任何一次重复投递都会让两个节点同时重放同一个 callId，
+// 而 Task / Memo / Array 只看状态、没有抢占保护，于是会被并发执行两次。
+func TestReplayLeaseIsExclusive(t *testing.T) {
+	st := newTestStatusStore()
+
+	ok, err := st.AcquireLease("worker-a", replayLeaseTTL)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	ok, err = st.AcquireLease("worker-b", replayLeaseTTL)
+	require.NoError(t, err)
+	assert.False(t, ok, "a second worker must not be able to replay the same call")
+
+	// 别人的 token 不能续期，也不能释放
+	held, err := st.RenewLease("worker-b", replayLeaseTTL)
+	require.NoError(t, err)
+	assert.False(t, held)
+
+	require.NoError(t, st.ReleaseLease("worker-b"))
+	ok, err = st.AcquireLease("worker-b", replayLeaseTTL)
+	require.NoError(t, err)
+	assert.False(t, ok, "releasing with the wrong token must not free the lease")
+
+	// 持有者释放后别人才能接手
+	require.NoError(t, st.ReleaseLease("worker-a"))
+	ok, err = st.AcquireLease("worker-b", replayLeaseTTL)
+	require.NoError(t, err)
+	assert.True(t, ok)
+}
+
+func TestLeaseRenewalStopsWhenLost(t *testing.T) {
+	st := newTestStatusStore()
+
+	ok, err := st.AcquireLease("worker-a", replayLeaseTTL)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	stop := startLeaseRenewal(st, "worker-a")
+
+	// stop 必须等续期 goroutine 真正退出，调用后不会再有写入
+	stop()
+	stop() // 幂等
+
+	require.NoError(t, st.ReleaseLease("worker-a"))
+}
+
+// TestExpireAllKeepsDataReadable 确认结束的 flow 是「设置过期」而不是「立即删除」。
+//
+// 直接删除的话，一条迟到的重复事件会看不到任何状态，把整个 flow 从头再跑一遍。
+func TestExpireAllKeepsDataReadable(t *testing.T) {
+	st := newTestStatusStore()
+
+	require.NoError(t, st.SetNodeStatus("t1", TaskStatus{Status: TaskStatusDone}))
+	require.NoError(t, st.SetKV("name", "bysir"))
+
+	require.NoError(t, st.ExpireAll(time.Hour))
+
+	got, exist, err := st.GetNodeStatus("t1")
+	require.NoError(t, err)
+	require.True(t, exist, "data must stay readable during the retention window")
+	assert.Equal(t, TaskStatusDone, got.Status)
+
+	v, ok, err := st.GetKV("name")
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, "bysir", v)
+}
+
 func TestWaitDelay(t *testing.T) {
 	now := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
 

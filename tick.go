@@ -917,6 +917,15 @@ type NodeStatusStore interface {
 	SetKV(k string, v string) error
 	GetKV(k string) (string, bool, error)
 	Clear() error // 删除这次调用的所有数据
+
+	// AcquireLease 尝试获取这次调用的重放租约，保证同一时刻只有一个节点在重放它。
+	// token 是本次持有的凭证，只有它能续期和释放。
+	AcquireLease(token string, ttl time.Duration) (bool, error)
+	RenewLease(token string, ttl time.Duration) (bool, error)
+	ReleaseLease(token string) error
+
+	// ExpireAll 给这次调用的所有数据设置过期时间，用于回收已经结束的 flow。
+	ExpireAll(ttl time.Duration) error
 }
 
 // claimTask 原子地抢占一个 task 的执行权。
@@ -1076,37 +1085,126 @@ type Scheduler struct {
 	asyncScheduler AsyncQueueFactory
 	statusFactory  StoreFactory
 	trigger        *Trigger
+
+	// retainCompleted 已结束的 flow 数据保留多久，<=0 表示永久保留。
+	retainCompleted time.Duration
 }
 
 func NewScheduler(asyncScheduler AsyncQueueFactory, statusStore StoreFactory) *Scheduler {
-	return &Scheduler{asyncScheduler: asyncScheduler, statusFactory: statusStore, trigger: NewTrigger(asyncScheduler)}
+	return &Scheduler{
+		asyncScheduler:  asyncScheduler,
+		statusFactory:   statusStore,
+		trigger:         NewTrigger(asyncScheduler),
+		retainCompleted: defaultRetainCompleted,
+	}
 }
 func (s *Scheduler) Start(ctx context.Context) error {
 	return s.asyncScheduler.Start(ctx)
 }
 
+const (
+	// replayLeaseTTL 一次重放持有租约的时长。
+	// 进程被 kill 时租约靠它自动释放，别的节点才能接手。
+	replayLeaseTTL = 30 * time.Second
+	// replayLeaseRenew 续期间隔，必须显著小于 replayLeaseTTL。
+	replayLeaseRenew = 10 * time.Second
+	// defaultRetainCompleted 已结束的 flow 数据默认保留多久。
+	defaultRetainCompleted = 7 * 24 * time.Hour
+)
+
+// ErrReplayInFlight 表示同一个 callId 正在别的节点上重放。
+//
+// 它会被返回给消息队列，让这个事件稍后重投，而不是被丢掉。
+var ErrReplayInFlight = errors.New("gotick: another worker is replaying this call")
+
+// nextEvent 描述本次重放结束后要发出的下一个调度事件。
+type nextEvent struct {
+	delay time.Duration
+}
+
+// startLeaseRenewal 起一个后台 goroutine 持续续期重放租约，返回停止它的函数。
+func startLeaseRenewal(store NodeStatusStore, token string) (stop func()) {
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+
+	go func() {
+		defer close(stopped)
+
+		t := time.NewTicker(replayLeaseRenew)
+		defer t.Stop()
+
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				held, err := store.RenewLease(token, replayLeaseTTL)
+				if err == nil && !held {
+					// 租约已经不在自己手上了，继续续期只会把别人的租约续走
+					return
+				}
+			}
+		}
+	}()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() { close(done) })
+		<-stopped
+	}
+}
+
 func (s *Scheduler) register(f *Flow) {
 	aw := s.asyncScheduler.New(f.Id)
-	aw.Subscribe(func(ctx context.Context, event Event) error {
-		//log.Printf("-----------------------------")
 
+	aw.Subscribe(func(ctx context.Context, event Event) error {
 		callId := event.CallId
 		ctx = WithCallId(ctx, callId)
 
 		statusStore := s.statusFactory.New(callId)
 
-		if event.InitMetaData != nil {
-			for k, v := range event.InitMetaData {
-				_ = statusStore.SetKV(k, v)
+		// 同一个 callId 同一时刻只允许一个节点重放。
+		//
+		// 消息队列是 at-least-once 的：worker 卡住、租约到期、任务被重投，
+		// 都会让两个节点同时重放同一个 callId。Task / Memo / Array 只看状态、
+		// 没有抢占保护，于是它们会被并发执行两次。
+		token := randomStr()
+		acquired, err := statusStore.AcquireLease(token, replayLeaseTTL)
+		if err != nil {
+			return err
+		}
+		if !acquired {
+			return ErrReplayInFlight
+		}
+
+		stopRenewal := startLeaseRenewal(statusStore, token)
+		leaseHeld := true
+		releaseLease := func() {
+			if !leaseHeld {
+				return
+			}
+			leaseHeld = false
+			stopRenewal()
+			if err := statusStore.ReleaseLease(token); err != nil {
+				log.Printf("[gotick] release replay lease of %s failed: %v", callId, err)
 			}
 		}
-		// 从缓存中拿出上次的运行状态
-		//m, _, := statusStore.GetKVAll()
-		//if m != nil {
-		//	ctx = WithMetaData(ctx, m)
-		//}
+		defer releaseLease()
 
-		err := func() (err error) {
+		if event.InitMetaData != nil {
+			for k, v := range event.InitMetaData {
+				if err := statusStore.SetKV(k, v); err != nil {
+					return err
+				}
+			}
+		}
+
+		var (
+			next     *nextEvent // 本次重放之后要发的事件
+			terminal bool       // flow 是否已经有了最终结论
+		)
+
+		err = func() (err error) {
 			ctx := &Context{
 				Context: ctx,
 				CallId:  callId,
@@ -1127,14 +1225,8 @@ func (s *Scheduler) register(f *Flow) {
 
 				switch breakpoint := ns.(type) {
 				case *breakWait:
-					err = aw.Publish(ctx, Event{
-						CallId:   callId,
-						Critical: true,
-					}, breakpoint.RunAt.Sub(time.Now()))
-					if err != nil {
-						log.Printf("scheduler event error: %v", err)
-						return
-					}
+					next = &nextEvent{delay: time.Until(breakpoint.RunAt)}
+
 				case *breakRetry:
 					var newStatus TaskStatus
 					newStatus, err = statusStore.UpdateNodeStatus(breakpoint.Task, func(status TaskStatus, isNew bool) (TaskStatus, bool) {
@@ -1143,7 +1235,7 @@ func (s *Scheduler) register(f *Flow) {
 					if err != nil {
 						// 重试次数落不了盘就不能继续调度：RetryCount 永远涨不上去，
 						// 就永远到不了 MaxRetry，会无限重试下去。
-						// 直接把错误交给消息队列，让它重投这个事件。
+						// 把错误交给消息队列，让它重投这个事件。
 						return
 					}
 
@@ -1154,16 +1246,10 @@ func (s *Scheduler) register(f *Flow) {
 						}
 					}
 
-					// 进入下次调度。退避时间由 MakeRetry 写在 RunAt 里。
+					// 退避时间由 MakeRetry 写在 RunAt 里。
 					// TODO 支持自定义退避算法
-					err = aw.Publish(ctx, Event{
-						CallId:   callId,
-						Critical: true,
-					}, time.Until(newStatus.RunAt))
-					if err != nil {
-						log.Printf("[gotick] publish retry event failed: %v", err)
-						return
-					}
+					next = &nextEvent{delay: time.Until(newStatus.RunAt)}
+
 				case *breakAbort:
 					var newStatus TaskStatus
 					newStatus, err = statusStore.UpdateNodeStatus(breakpoint.Task, func(status TaskStatus, isNew bool) (TaskStatus, bool) {
@@ -1175,15 +1261,17 @@ func (s *Scheduler) register(f *Flow) {
 					if err != nil {
 						return
 					}
+					terminal = true
 					if f.onFail != nil {
 						if cbErr := f.onFail(ctx, newStatus); cbErr != nil {
 							log.Printf("[gotick] onFail callback failed: %v", cbErr)
 						}
 					}
+
 				case *breakFail:
 					var newStatus TaskStatus
 					newStatus, err = statusStore.UpdateNodeStatus(breakpoint.Task, func(status TaskStatus, isNew bool) (TaskStatus, bool) {
-						// Wait 里的任务可能已经把自己标成 fail 了。
+						// Wait 里的任务可能已经把自己标成 fail 了，
 						// 再标一次会重复累加 RetryCount 和 Errs。
 						if status.Status == TaskStatusFail {
 							return status, false
@@ -1193,11 +1281,13 @@ func (s *Scheduler) register(f *Flow) {
 					if err != nil {
 						return
 					}
+					terminal = true
 					if f.onFail != nil {
 						if cbErr := f.onFail(ctx, newStatus); cbErr != nil {
 							log.Printf("[gotick] onFail callback failed: %v", cbErr)
 						}
 					}
+
 				case *breakSleep:
 					// TODO 考虑先入队，然后更改状态
 					_, err = statusStore.UpdateNodeStatus(breakpoint.Task, func(status TaskStatus, isNew bool) (TaskStatus, bool) {
@@ -1206,15 +1296,8 @@ func (s *Scheduler) register(f *Flow) {
 					if err != nil {
 						return
 					}
+					next = &nextEvent{delay: time.Until(breakpoint.RunAt)}
 
-					err = aw.Publish(ctx, Event{
-						CallId:   callId,
-						Critical: true,
-					}, time.Until(breakpoint.RunAt))
-					if err != nil {
-						log.Printf("[gotick] publish sleep event failed: %v", err)
-						return
-					}
 				case *breakDone:
 					_, err = statusStore.UpdateNodeStatus(breakpoint.Task, func(status TaskStatus, isNew bool) (TaskStatus, bool) {
 						return status.MakeDone(), true
@@ -1222,52 +1305,52 @@ func (s *Scheduler) register(f *Flow) {
 					if err != nil {
 						return
 					}
-
-					err = aw.Publish(ctx, Event{
-						CallId:   callId,
-						Critical: true,
-					}, 0)
-					if err != nil {
-						log.Printf("[gotick] publish done event failed: %v", err)
-						return
-					}
+					next = &nextEvent{delay: 0}
 				}
 			}()
 
-			// 正确情况下不应该返回 error，因为这个 error 会直接交给 asyncq 处理，脱离了框架控制。
-			// 都应该在 gotick.Task 中返回 error
+			// flow 函数不应该返回错误：错误会直接交给消息队列，脱离框架的控制。
+			// 所有错误都应该从 gotick.Task 里返回。
 			f.fun(ctx)
 
-			if err != nil {
-				return nil
-			}
-
-			// 全部执行完成，触发 onSuccess
+			// 没有中断，说明整个 flow 跑完了
+			terminal = true
 			if f.onSuccess != nil {
-				err := f.onSuccess(ctx)
-				if err != nil {
+				if err := f.onSuccess(ctx); err != nil {
 					return err
 				}
 			}
 
-			return err
+			return nil
 		}()
 		if err != nil {
-			// 如果返回错误，则会进入到消息队列的默认重试机制。
-			// 通常是调用消息队列新增任务等无法正常进入下一步流程等致命错误，程序逻辑已经无法处理，只能交由消息队列处理。
+			// 返回错误会进入消息队列的重试机制。
+			// 通常是入队失败这种框架已经无法处理的致命错误。
 			return err
 		}
-		//
-		//if f.onSuccess != nil {
-		//	// 如果什么都没做，默认就是完成状态
-		//	taskStatus := TaskStatus{
-		//		Type: "done",
-		//	}
-		//	err := f.onSuccess(ctx, taskStatus)
-		//	if err != nil {
-		//		return err
-		//	}
-		//}
+
+		// 先释放租约再发下一个事件。
+		// 反过来的话，下一个事件的处理方会抢不到租约、被迫走消息队列的退避重试，
+		// 给流程的每一步都加上秒级延迟。
+		releaseLease()
+
+		if terminal && s.retainCompleted > 0 {
+			// 已经结束的 flow 不再需要长期保留。
+			// 用过期而不是直接删除：迟到的重复事件仍然能看到「已完成」，
+			// 否则它会把整个 flow 从头再跑一遍。
+			if err := statusStore.ExpireAll(s.retainCompleted); err != nil {
+				log.Printf("[gotick] set retention on finished call %s failed: %v", callId, err)
+			}
+		}
+
+		if next != nil {
+			if err := aw.Publish(ctx, Event{
+				CallId:   callId,
+				Critical: true,
+			}, next.delay); err != nil {
+				return err
+			}
+		}
 
 		return nil
 	})
@@ -1358,6 +1441,31 @@ func (n *KvNodeStatusStore) metaKey() string {
 
 func (n *KvNodeStatusStore) statusKey() string {
 	return n.key + "_status"
+}
+
+func (n *KvNodeStatusStore) leaseKey() string {
+	return n.key + "_lease"
+}
+
+func (n *KvNodeStatusStore) AcquireLease(token string, ttl time.Duration) (bool, error) {
+	return n.store.SetNX(context.Background(), n.leaseKey(), token, ttl)
+}
+
+func (n *KvNodeStatusStore) RenewLease(token string, ttl time.Duration) (bool, error) {
+	return n.store.ExpireIf(context.Background(), n.leaseKey(), token, ttl)
+}
+
+func (n *KvNodeStatusStore) ReleaseLease(token string) error {
+	_, err := n.store.DeleteIf(context.Background(), n.leaseKey(), token)
+	return err
+}
+
+func (n *KvNodeStatusStore) ExpireAll(ttl time.Duration) error {
+	ctx := context.Background()
+	if err := n.store.Expire(ctx, n.metaKey(), ttl); err != nil {
+		return err
+	}
+	return n.store.Expire(ctx, n.statusKey(), ttl)
 }
 
 func (n *KvNodeStatusStore) Clear() error {
