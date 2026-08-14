@@ -9,6 +9,8 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/zbysir/gotick"
 )
 
@@ -239,4 +241,66 @@ func TestMetaDataRoundTrip(t *testing.T) {
 		t.Errorf("MetaDataAll()[%q] = %q but MetaData(%q) = %q — 同一个 key 两个方法结果不一致",
 			"name", all["name"], "name", single)
 	}
+}
+
+// TestRunIndexTracksRealFlow 验证跑一个真实的 flow 之后，索引里能查到它。
+// 这是 UI 列表页的数据来源——没有它，状态都在 Redis 里但没有入口找到。
+func TestRunIndexTracksRealFlow(t *testing.T) {
+	mr := miniredis.RunT(t)
+	tick := newRedisServer(t, mr.Addr())
+	fin := newSignaler()
+
+	tick.Flow("demo/indexed", func(ctx *gotick.Context) {
+		gotick.Task(ctx, "step-1", func(*gotick.TaskContext) error { return nil })
+		gotick.Task(ctx, "step-2", func(*gotick.TaskContext) error { return nil })
+	}).OnSuccess(func(ctx *gotick.Context) error {
+		fin.fire()
+		return nil
+	})
+
+	callId := runFlow(t, tick, "demo/indexed", gotick.MetaData{"name": "bysir"}, fin, 30*time.Second)
+
+	idx := tick.RunIndex()
+
+	flows, err := idx.ListFlows()
+	require.NoError(t, err)
+	assert.Contains(t, flows, "demo/indexed")
+
+	run, exist, err := idx.GetRun(callId)
+	require.NoError(t, err)
+	require.True(t, exist, "a completed run must be findable in the index")
+	assert.Equal(t, "demo/indexed", run.FlowId)
+	assert.Equal(t, gotick.RunStatusDone, run.Status)
+	assert.True(t, run.Finished())
+	assert.Greater(t, run.Replays, 1, "a two-task flow replays more than once")
+
+	runs, err := idx.ListRuns("demo/indexed", 0, 10)
+	require.NoError(t, err)
+	require.Len(t, runs, 1)
+	assert.Equal(t, callId, runs[0].CallId)
+}
+
+// TestRunIndexRecordsFailure 确认失败的实例在列表里就能看出死在哪个 task。
+func TestRunIndexRecordsFailure(t *testing.T) {
+	mr := miniredis.RunT(t)
+	tick := newRedisServer(t, mr.Addr())
+	fin := newSignaler()
+
+	tick.Flow("demo/failing", func(ctx *gotick.Context) {
+		gotick.Task(ctx, "explodes", func(*gotick.TaskContext) error {
+			return fmt.Errorf("disk on fire")
+		}, gotick.WithMaxRetry(0))
+	}).OnFail(func(ctx *gotick.Context, ts gotick.TaskStatus) error {
+		fin.fire()
+		return nil
+	})
+
+	callId := runFlow(t, tick, "demo/failing", nil, fin, 30*time.Second)
+
+	run, exist, err := tick.RunIndex().GetRun(callId)
+	require.NoError(t, err)
+	require.True(t, exist)
+	assert.Equal(t, gotick.RunStatusFailed, run.Status)
+	assert.Equal(t, "explodes", run.FailedTask)
+	assert.Contains(t, run.Error, "disk on fire")
 }

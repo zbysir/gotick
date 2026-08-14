@@ -14,6 +14,11 @@ type Asynq struct {
 
 	redisCli redis.UniversalClient
 
+	// ownsClient 表示这个 redis 连接是我们自己创建的，关闭时应该由我们负责。
+	// 调用方传进来的共享连接绝不能关——那是别人的连接，
+	// 关掉它会让用户的整个应用失去 Redis。
+	ownsClient bool
+
 	// topic => callback
 	callback map[string][]func(ctx context.Context, task *asynq.Task) error
 }
@@ -37,7 +42,7 @@ func (a *Asynq) Start(ctx context.Context) error {
 	}
 
 	srv := asynq.NewServer(
-		&RawRedisClient{c: a.redisCli},
+		&RawRedisClient{c: a.redisCli, keepOpen: !a.ownsClient},
 		a.opt,
 	)
 
@@ -61,7 +66,10 @@ func (a *Asynq) Start(ctx context.Context) error {
 	}
 
 	srv.Shutdown()
-	_ = a.cli.Close()
+
+	if a.ownsClient {
+		_ = a.cli.Close()
+	}
 
 	return nil
 }
@@ -97,19 +105,38 @@ var _ DelayedQueue = (*Asynq)(nil)
 
 type RawRedisClient struct {
 	c redis.UniversalClient
+	// keepOpen 为 true 时交给 asynq 一个屏蔽了 Close 的包装。
+	keepOpen bool
 }
 
 func (r *RawRedisClient) MakeRedisClient() interface{} {
+	if r.keepOpen {
+		return nonClosingClient{r.c}
+	}
 	return r.c
 }
 
-func NewAsynq(redisCli redis.UniversalClient, opt asynq.Config) *Asynq {
-	client := asynq.NewClient(&RawRedisClient{c: redisCli})
+// nonClosingClient 屏蔽 Close()。
+//
+// asynq 的 Client.Close 和 Server.Shutdown 都会关闭它拿到的 redis 连接。
+// 当这个连接是调用方共享进来的（Config.RedisClient），
+// 关停 gotick 就会顺手关掉用户整个应用的 Redis 连接。
+type nonClosingClient struct {
+	redis.UniversalClient
+}
 
+func (nonClosingClient) Close() error { return nil }
+
+// NewAsynq 创建延时队列。
+//
+// ownsClient 表示 redisCli 是调用方专门为这个队列创建的，
+// 关停时可以连同关闭。传入应用共享的连接时必须为 false。
+func NewAsynq(redisCli redis.UniversalClient, opt asynq.Config, ownsClient bool) *Asynq {
 	return &Asynq{
-		opt:      opt,
-		cli:      client,
-		redisCli: redisCli,
-		callback: map[string][]func(ctx context.Context, task *asynq.Task) error{},
+		opt:        opt,
+		cli:        asynq.NewClient(&RawRedisClient{c: redisCli, keepOpen: !ownsClient}),
+		redisCli:   redisCli,
+		ownsClient: ownsClient,
+		callback:   map[string][]func(ctx context.Context, task *asynq.Task) error{},
 	}
 }

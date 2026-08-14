@@ -36,6 +36,11 @@ type Context struct {
 
 	keyMu    sync.Mutex
 	usedKeys map[string]string // key -> 使用它的 API，用于检测重名
+
+	// attemptStart 是当前同步任务（Task / Memo / Array）开始执行的时间。
+	// 它们只在断点处写状态，没有别的地方能记下开始时间。
+	// 同步执行保证了同一时刻只有一个值有效。
+	attemptStart time.Time
 }
 
 // markKeyUsed 记录一个 key 在本次重放中被哪个 API 使用了。
@@ -563,6 +568,7 @@ func Memo[T interface{}](ctx *Context, key string, build func() (T, error), opts
 	s, _ := mustGetNodeStatus(ctx.store, key)
 	opt := TaskOptions(opts).build()
 
+	ctx.attemptStart = time.Now()
 	t, err := build()
 	if err != nil {
 		// 旧实现是 `t, _ := build()`：构建失败时把零值当成功结果永久缓存下来，
@@ -624,6 +630,7 @@ func Array[T interface{}](ctx *Context, key string, build func(ctx *TaskContext)
 	s, _ := mustGetNodeStatus(ctx.store, key)
 	opt := TaskOptions(opts).build()
 
+	ctx.attemptStart = time.Now()
 	t, err := build(newTaskContext(ctx, s))
 	if err != nil {
 		breakOnTaskError(key, err, s.RetryCount, opt.MaxRetry)
@@ -688,6 +695,7 @@ func Task(c *Context, key string, fun TaskFun, opts ...TaskOption) {
 
 		opt := TaskOptions(opts).build()
 
+		c.attemptStart = time.Now()
 		if err := fun(newTaskContext(c, s)); err != nil {
 			breakOnTaskError(key, err, s.RetryCount, opt.MaxRetry)
 		}
@@ -818,6 +826,10 @@ type TaskStatus struct {
 	// 于是节点崩溃后任务会永远停在 running，flow 永久卡死。
 	Heartbeat time.Time `json:"heartbeat,omitempty"`
 
+	// StartedAt / EndedAt 是最近一次尝试的起止时间，用于时间轴和耗时统计。
+	StartedAt time.Time `json:"started_at,omitempty"`
+	EndedAt   time.Time `json:"ended_at,omitempty"`
+
 	// Epoch 是执行权的代号，每被抢占一次 +1。
 	//
 	// 心跳和写结果时都要带上自己抢到的 epoch，不匹配就说明任务已经被别人接管，
@@ -858,12 +870,33 @@ func (t TaskStatus) Runnable(now time.Time, exist bool) bool {
 func (t TaskStatus) MakeDone() TaskStatus {
 	t.Status = TaskStatusDone
 	t.Heartbeat = time.Time{}
+	t.EndedAt = time.Now()
 	return t
+}
+
+// WithStartedAt 记录这次尝试的开始时间。
+//
+// Task / Memo / Array 是同步执行的，只在断点处写状态，
+// 所以开始时间要由调用方带过来，否则时间轴上只有终点没有起点。
+func (t TaskStatus) WithStartedAt(at time.Time) TaskStatus {
+	if !at.IsZero() {
+		t.StartedAt = at
+	}
+	return t
+}
+
+// Elapsed 返回最近一次尝试的耗时。
+func (t TaskStatus) Elapsed() time.Duration {
+	if t.StartedAt.IsZero() || t.EndedAt.IsZero() || t.EndedAt.Before(t.StartedAt) {
+		return 0
+	}
+	return t.EndedAt.Sub(t.StartedAt)
 }
 
 func (t TaskStatus) MakeFail(err error) TaskStatus {
 	t.Status = TaskStatusFail
 	t.Heartbeat = time.Time{}
+	t.EndedAt = time.Now()
 	t.RetryCount += 1
 	if err != nil {
 		t.Errs = append(t.Errs, err.Error())
@@ -874,6 +907,7 @@ func (t TaskStatus) MakeFail(err error) TaskStatus {
 func (t TaskStatus) MakeAbort() TaskStatus {
 	t.Status = TaskStatusAbort
 	t.Heartbeat = time.Time{}
+	t.EndedAt = time.Now()
 	return t
 }
 
@@ -888,6 +922,8 @@ func (t TaskStatus) MakeRunning(now time.Time) TaskStatus {
 func (t TaskStatus) MakeClaimed(now time.Time) TaskStatus {
 	t.Status = TaskStatusRunning
 	t.Heartbeat = now
+	t.StartedAt = now
+	t.EndedAt = time.Time{}
 	t.Epoch += 1
 	return t
 }
@@ -901,6 +937,7 @@ func (t TaskStatus) MakeSleep(runAt time.Time) TaskStatus {
 func (t TaskStatus) MakeRetry(err error) TaskStatus {
 	t.Status = TaskStatusRetry
 	t.Heartbeat = time.Time{}
+	t.EndedAt = time.Now()
 	t.RetryCount += 1
 	if err != nil {
 		t.Errs = append(t.Errs, err.Error())
@@ -1095,6 +1132,10 @@ type Scheduler struct {
 
 	// retainCompleted 已结束的 flow 数据保留多久，<=0 表示永久保留。
 	retainCompleted time.Duration
+
+	// runIndex 记录 flow 与运行实例的索引，供 inspect 和 UI 使用。
+	// 默认是 no-op，不产生任何额外写入。
+	runIndex RunIndex
 }
 
 func NewScheduler(asyncScheduler AsyncQueueFactory, statusStore StoreFactory) *Scheduler {
@@ -1103,6 +1144,7 @@ func NewScheduler(asyncScheduler AsyncQueueFactory, statusStore StoreFactory) *S
 		statusFactory:   statusStore,
 		trigger:         NewTrigger(asyncScheduler),
 		retainCompleted: defaultRetainCompleted,
+		runIndex:        noopRunIndex{},
 	}
 }
 func (s *Scheduler) Start(ctx context.Context) error {
@@ -1164,6 +1206,10 @@ func startLeaseRenewal(store NodeStatusStore, token string) (stop func()) {
 func (s *Scheduler) register(f *Flow) {
 	aw := s.asyncScheduler.New(f.Id)
 
+	if err := s.runIndex.RegisterFlow(f.Id); err != nil {
+		log.Printf("[gotick] register flow %s in the run index failed: %v", f.Id, err)
+	}
+
 	aw.Subscribe(func(ctx context.Context, event Event) error {
 		callId := event.CallId
 		ctx = WithCallId(ctx, callId)
@@ -1206,9 +1252,17 @@ func (s *Scheduler) register(f *Flow) {
 			}
 		}
 
+		// 索引写失败不该让流程停下来——可观测性坏了比业务停摆好。
+		if err := s.runIndex.BeginRun(f.Id, callId, time.Now()); err != nil {
+			log.Printf("[gotick] index run %s failed: %v", callId, err)
+		}
+
 		var (
-			next     *nextEvent // 本次重放之后要发的事件
-			terminal bool       // flow 是否已经有了最终结论
+			next       *nextEvent // 本次重放之后要发的事件
+			terminal   bool       // flow 是否已经有了最终结论
+			runStatus  = RunStatusDone
+			failedTask string
+			failedErr  string
 		)
 
 		err = func() (err error) {
@@ -1237,7 +1291,7 @@ func (s *Scheduler) register(f *Flow) {
 				case *breakRetry:
 					var newStatus TaskStatus
 					newStatus, err = statusStore.UpdateNodeStatus(breakpoint.Task, func(status TaskStatus, isNew bool) (TaskStatus, bool) {
-						return status.MakeRetry(breakpoint.Err), true
+						return status.WithStartedAt(ctx.attemptStart).MakeRetry(breakpoint.Err), true
 					})
 					if err != nil {
 						// 重试次数落不了盘就不能继续调度：RetryCount 永远涨不上去，
@@ -1263,12 +1317,17 @@ func (s *Scheduler) register(f *Flow) {
 						if status.Status == TaskStatusAbort {
 							return status, false
 						}
-						return status.MakeAbort(), true
+						return status.WithStartedAt(ctx.attemptStart).MakeAbort(), true
 					})
 					if err != nil {
 						return
 					}
 					terminal = true
+					runStatus = RunStatusAborted
+					failedTask = breakpoint.Task
+					if breakpoint.Error != nil {
+						failedErr = breakpoint.Error.Error()
+					}
 					if f.onFail != nil {
 						if cbErr := f.onFail(ctx, newStatus); cbErr != nil {
 							log.Printf("[gotick] onFail callback failed: %v", cbErr)
@@ -1283,12 +1342,17 @@ func (s *Scheduler) register(f *Flow) {
 						if status.Status == TaskStatusFail {
 							return status, false
 						}
-						return status.MakeFail(breakpoint.Err), true
+						return status.WithStartedAt(ctx.attemptStart).MakeFail(breakpoint.Err), true
 					})
 					if err != nil {
 						return
 					}
 					terminal = true
+					runStatus = RunStatusFailed
+					failedTask = breakpoint.Task
+					if breakpoint.Err != nil {
+						failedErr = breakpoint.Err.Error()
+					}
 					if f.onFail != nil {
 						if cbErr := f.onFail(ctx, newStatus); cbErr != nil {
 							log.Printf("[gotick] onFail callback failed: %v", cbErr)
@@ -1307,7 +1371,7 @@ func (s *Scheduler) register(f *Flow) {
 
 				case *breakDone:
 					_, err = statusStore.UpdateNodeStatus(breakpoint.Task, func(status TaskStatus, isNew bool) (TaskStatus, bool) {
-						return status.MakeDone(), true
+						return status.WithStartedAt(ctx.attemptStart).MakeDone(), true
 					})
 					if err != nil {
 						return
@@ -1340,6 +1404,12 @@ func (s *Scheduler) register(f *Flow) {
 		// 反过来的话，下一个事件的处理方会抢不到租约、被迫走消息队列的退避重试，
 		// 给流程的每一步都加上秒级延迟。
 		releaseLease()
+
+		if terminal {
+			if err := s.runIndex.FinishRun(callId, runStatus, failedTask, failedErr, time.Now()); err != nil {
+				log.Printf("[gotick] index finished run %s failed: %v", callId, err)
+			}
+		}
 
 		if terminal && s.retainCompleted > 0 {
 			// 已经结束的 flow 不再需要长期保留。
@@ -1395,6 +1465,11 @@ func randomStr() string {
 	b := make([]byte, 16)
 	_, _ = rand2.Read(b)
 	return fmt.Sprintf("%x", b)
+}
+
+// RunIndex 返回运行索引，UI 和运维工具用它查询有哪些实例在跑。
+func (t *Server) RunIndex() RunIndex {
+	return t.scheduler.runIndex
 }
 
 // Trigger 触发一次流程运行，在服务端和客户端都可以调用。
@@ -1646,11 +1721,18 @@ type Config struct {
 }
 
 func newScheduler(delayedQueue store.DelayedQueue, kvStore store.KVStore) *Scheduler {
-	return NewScheduler(NewAsyncQueueFactory(delayedQueue), NewKvStoreProduct(kvStore))
+	s := NewScheduler(NewAsyncQueueFactory(delayedQueue), NewKvStoreProduct(kvStore))
+	// 索引和状态存在同一个 KVStore 上，所以只要有存储就能有可观测性，
+	// 不需要额外配置任何东西。
+	s.runIndex = NewKvRunIndex(kvStore, s.retainCompleted)
+	return s
 }
 
 func newSchedulerFromConfig(p Config) (*Scheduler, error) {
-	var redisClient redis.UniversalClient
+	var (
+		redisClient redis.UniversalClient
+		ownsClient  bool
+	)
 	if p.RedisClient != nil {
 		redisClient = p.RedisClient
 	} else {
@@ -1660,12 +1742,13 @@ func newSchedulerFromConfig(p Config) (*Scheduler, error) {
 		}
 
 		redisClient = redis.NewClient(opt)
+		ownsClient = true
 	}
 
 	delayedQueue := store.NewAsynq(redisClient, asynq.Config{
 		Concurrency:       p.Concurrency,
 		TaskCheckInterval: p.TaskCheckInterval,
-	})
+	}, ownsClient)
 	kvStore := store.NewRedisStore(redisClient)
 
 	return newScheduler(delayedQueue, kvStore), nil
@@ -1719,7 +1802,10 @@ func NewClient(p NewClientConfig) (*Client, error) {
 	// 先看 RedisClient 再解析 URL。
 	// 旧实现无条件先 ParseURL 并在失败时 panic，
 	// 于是文档里写明支持的「只传 RedisClient」这条路径 100% 崩溃。
-	var redisClient redis.UniversalClient
+	var (
+		redisClient redis.UniversalClient
+		ownsClient  bool
+	)
 	if p.RedisClient != nil {
 		redisClient = p.RedisClient
 	} else {
@@ -1728,11 +1814,12 @@ func NewClient(p NewClientConfig) (*Client, error) {
 			return nil, fmt.Errorf("parse RedisURL: %w", err)
 		}
 		redisClient = redis.NewClient(opt)
+		ownsClient = true
 	}
 
 	delayedQueue := store.NewAsynq(redisClient, asynq.Config{
 		Concurrency: 0, // Client 不跑调度器，并发度用不上
-	})
+	}, ownsClient)
 
 	return &Client{
 		trigger: NewTrigger(NewAsyncQueueFactory(delayedQueue)),
