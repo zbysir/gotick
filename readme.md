@@ -18,32 +18,41 @@ temporal 大而全，有部署成本和开发成本，而 gotick 只依赖于 Re
 package main
 
 import (
-  "github.com/zbysir/gotick"
-  "time"
+	"context"
+	"log"
+	"time"
+
+	"github.com/zbysir/gotick"
 )
 
 func main() {
-  tick := gotick.NewServerFromConfig({
-      RedisURL: "redis://<user>:<pass>@localhost:6379/<db>"
-  })
+	tick, err := gotick.NewServerFromConfig(gotick.Config{
+		RedisURL: "redis://localhost:6379/0",
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
 
-  tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
-    startAt, _ := gotick.UseStatus(ctx, "start_at", time.Now())
+	tick.Flow("demo/close-order", func(ctx *gotick.Context) {
+		startAt := gotick.Memo(ctx, "start_at", func() (time.Time, error) {
+			return time.Now(), nil
+		})
 
-    gotick.Sleep(ctx, "wait-close", 3*time.Second)
+		gotick.Sleep(ctx, "wait-close", 3*time.Second)
 
-    gotick.Task(ctx, "close-order", func() error {
-      log.Printf("close-order at %v", time.Now().Sub(startAt))
-      return nil
-    })
-    return nil
-  })
+		gotick.Task(ctx, "close-order", func(ctx *gotick.TaskContext) error {
+			log.Printf("close-order at %v", time.Since(startAt))
+			return nil
+		})
+	})
 
-  tick.Trigger("demo/close-order")
+	ctx := context.Background()
+	if _, err := tick.Trigger(ctx, "demo/close-order", nil); err != nil {
+		log.Fatal(err)
+	}
 
-  tick.Start()
+	log.Fatal(tick.StartServer(ctx))
 }
-
 ```
 
 运行代码打印如下
@@ -58,10 +67,39 @@ func main() {
 
 更多例子可以查看 [example](./example/parallel_download) 目录。
 
+## 重要：你的 Flow 函数会被反复重放
+
+这是使用 gotick 前必须理解的唯一一件事。
+
+gotick 没有把工作流序列化成状态机，而是**每次调度都从头重新执行你的 flow 函数**，
+已完成的 Task 靠存在 Redis 里的状态被跳过。所以一个跑了 10 步的 flow，
+它的函数体可能已经被执行了 10 次以上。
+
+这意味着 flow 函数里、Task 之外的代码必须是**确定性**的——每次重放都得走同样的分支：
+
+```go
+tick.Flow("demo/bad", func(ctx *gotick.Context) {
+    // ✗ 错：每次重放拿到的时间都不一样，可能走进不同分支
+    if time.Now().Hour() > 12 {
+        gotick.Task(ctx, "afternoon", ...)
+    }
+
+    // ✗ 错：每次重放都会真的查一次库，且结果可能变化
+    user, _ := db.GetUser(id)
+
+    // ✓ 对：用 Memo 把结果固化下来，重放时读缓存
+    user := gotick.Memo(ctx, "user", func() (User, error) {
+        return db.GetUser(id)
+    })
+})
+```
+
+规则很简单：**任何有副作用或结果可能变化的操作，都要放进 `Task` / `Memo` / `Array` 里。**
+flow 函数本身只负责编排。
+
 ## 特性
 
 - 简单得像魔法一样的语法。
-- 保证任务至少执行一次。
 - 支持分布式架构，支持在多个节点中调度任务。
 - 只依赖于 Redis。
 - 自身足够简单可信耐，依赖 [asynq](https://github.com/hibiken/asynq) 实现延时任务。
@@ -88,10 +126,10 @@ func main() {
 
 使用到的：
 
-- TickClient: 客户端，用于触发 Flow，目前客户端通过 http 协议来连接服务端。
-- TickServer: 服务端，调度所有 Flow；也可以和 Client 一样触发 Flow
-- Flow: 定义一个工作流。
-- Task: 任务，每一个任务需要有一个唯一的名字。
+- `Client`: 客户端，只用于触发 Flow，不启动调度器。它和服务端之间没有直连，通过 Redis 通信。
+- `Server`: 服务端，调度所有 Flow；也可以和 Client 一样触发 Flow。
+- `Flow`: 定义一个工作流。
+- `Task`: 任务，每一个任务需要有一个唯一的名字。
 
 一个 TickServer 包含多个 Flow，一个 Flow 包含多个 Task。
 
@@ -130,15 +168,14 @@ flowchart TB
 用一个例子简单的说下程序是如何挂起的，这个例子实现了睡眠一段时间后打印一段信息：
 
 ```go
-tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
+tick.Flow("demo/close-order", func(ctx *gotick.Context) {
     startAt := gotick.Memo(ctx, "start_at", func() (time.Time, error) {
         return time.Now(), nil
     })
     gotick.Sleep(ctx, "wait-close", 3*time.Second)
 
-    log.Printf("wait end at %v", time.Now().Sub(startAt))
-    return nil
-  })
+    log.Printf("wait end at %v", time.Since(startAt))
+})
 ```
 
 代码中 gotick.Sleep 方法会将当前任务中断（使用 panic），然后触发延时任务队列再次调度整个流程。
@@ -181,7 +218,7 @@ gotick.Sleep(ctx, "wait-close", 3*time.Second)
 运行任务并存储数组结果，如果一个任务返回的是一个数组，并且想要通过这个数组来循环执行另一个任务，那么应该使用 Array 代替 Memo。
 
 ```go
-tasks := gotick.Array(ctx, "split", func() ([]string, error) {
+tasks := gotick.Array(ctx, "split", func(ctx *gotick.TaskContext) ([]string, error) {
     return strings.Split(src, ""), nil
 })
 ```
@@ -215,11 +252,11 @@ gotick.Wait(ctx, 2, toEnF, lenF)
 AsyncArray 是 使用 Array 生成 Async 数组的简写形式，用于方便的生成多个并行任务。
 
 ```go
-tasks := gotick.Array(ctx, "split", func() ([]string, error) {
+tasks := gotick.Array(ctx, "split", func(ctx *gotick.TaskContext) ([]string, error) {
     return strings.Split(src, ""), nil
 })
 
-fs := gotick.AsyncArray(ctx, "download", tasks, func(ctx *gotick.TaskContext, v string) (string, error) {
+fs := gotick.AsyncArray(ctx, "download", tasks, func(ctx *gotick.TaskContext, v string, index int) (string, error) {
     log.Printf("[%s] execing download(%v)", time.Since(start), v)
     time.Sleep(2 * time.Second)
     return fmt.Sprintf("download(%s)", v), nil

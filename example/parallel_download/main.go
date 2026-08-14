@@ -9,23 +9,26 @@ import (
 
 	"github.com/zbysir/gotick"
 	"github.com/zbysir/gotick/internal/pkg/signal"
-	"github.com/zbysir/gotick/internal/store"
+	"github.com/zbysir/gotick/store"
 )
 
 func main() {
-	tick := gotick.NewTickServer(gotick.Config{KvStore: store.NewMockNodeStatusStore(), DelayedQueue: store.NewMockRedisDelayedQueue()})
+	tick := gotick.NewServer(gotick.NewServerParams{
+		DelayedQueue: store.NewMockRedisDelayedQueue(),
+		KVStore:      store.NewMockKvStore(),
+	})
 	ctx, c := signal.NewContext()
 	var currentCallId string
 
 	var start time.Time
-	tick.Flow("demo/download", func(ctx *gotick.Context) error {
+	tick.Flow("demo/download", func(ctx *gotick.Context) {
 		src, _ := ctx.MetaData("src")
 
-		tasks := gotick.Array(ctx, "split", func() ([]string, error) {
+		tasks := gotick.Array(ctx, "split", func(ctx *gotick.TaskContext) ([]string, error) {
 			return strings.Split(src, ""), nil
 		})
 
-		fs := gotick.AsyncArray(ctx, "download", tasks, func(ctx *gotick.TaskContext, v string) (string, error) {
+		fs := gotick.AsyncArray(ctx, "download", tasks, func(ctx *gotick.TaskContext, v string, index int) (string, error) {
 			log.Printf("[%s] execing download(%v)", time.Since(start), v)
 			time.Sleep(2 * time.Second)
 			return fmt.Sprintf("download(%s)", v), nil
@@ -44,7 +47,6 @@ func main() {
 		if ctx.CallId == currentCallId {
 			c()
 		}
-		return nil
 	}).OnFail(func(ctx *gotick.Context, ts gotick.TaskStatus) error {
 		log.Printf("[%s] fail %+v", time.Since(start), ts.Errs)
 		if ctx.CallId == currentCallId {

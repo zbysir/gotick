@@ -8,21 +8,21 @@ import (
 
 	"github.com/zbysir/gotick"
 	"github.com/zbysir/gotick/internal/pkg/signal"
-	"github.com/zbysir/gotick/internal/store"
+	"github.com/zbysir/gotick/store"
 )
 
 func main() {
-	tick := gotick.NewTickServer(gotick.Config{KvStore: store.NewMockNodeStatusStore(), DelayedQueue: store.NewMockRedisDelayedQueue()})
+	tick := gotick.NewServer(gotick.NewServerParams{
+		DelayedQueue: store.NewMockRedisDelayedQueue(),
+		KVStore:      store.NewMockKvStore(),
+	})
 	ctx, c := signal.NewContext()
 	var currentCallId string
 
 	var start time.Time
-	tick.Flow("demo/translate", func(ctx *gotick.Context) error {
-		//log.Printf("schedule callId: %v", ctx.CallId)
-
+	tick.Flow("demo/translate", func(ctx *gotick.Context) {
 		src, _ := ctx.MetaData("src")
 
-		//log.Printf("-- to_en")
 		toEnF := gotick.Async(ctx, "to_en", func(ctx *gotick.TaskContext) (string, error) {
 			log.Printf("[%s] execing to_en", time.Since(start))
 			time.Sleep(2 * time.Second)
@@ -30,14 +30,12 @@ func main() {
 			if ctx.Retry < 5 {
 				log.Printf("[%s] exec to_en, retry:%v", time.Since(start), ctx.Retry)
 				return "", fmt.Errorf("retry")
-			} else {
-				log.Printf("[%s] exec to_en success", time.Since(start))
 			}
+			log.Printf("[%s] exec to_en success", time.Since(start))
 
 			return fmt.Sprintf("en(%s)", src), nil
 		})
 
-		//log.Printf("-- to_jp")
 		lenF := gotick.Async(ctx, "token_len", func(ctx *gotick.TaskContext) (int, error) {
 			log.Printf("[%s] execing token_len", time.Since(start))
 
@@ -45,9 +43,8 @@ func main() {
 			if ctx.Retry < 5 {
 				log.Printf("[%s] exec token_len, retry:%v", time.Since(start), ctx.Retry)
 				return 0, fmt.Errorf("retry")
-			} else {
-				log.Printf("[%s] exec token_len success", time.Since(start))
 			}
+			log.Printf("[%s] exec token_len success", time.Since(start))
 			return len(src), nil
 		})
 
@@ -61,7 +58,6 @@ func main() {
 		if ctx.CallId == currentCallId {
 			c()
 		}
-		return nil
 	}).OnFail(func(ctx *gotick.Context, ts gotick.TaskStatus) error {
 		log.Printf("[%s] fail %+v", time.Since(start), ts.Errs)
 		if ctx.CallId == currentCallId {

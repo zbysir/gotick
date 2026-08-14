@@ -7,16 +7,21 @@ import (
 
 	"github.com/zbysir/gotick"
 	"github.com/zbysir/gotick/internal/pkg/signal"
-	"github.com/zbysir/gotick/internal/store"
+	"github.com/zbysir/gotick/store"
 )
 
 func main() {
-	tick := gotick.NewTickServer(gotick.Config{KvStore: store.NewMockNodeStatusStore(), DelayedQueue: store.NewMockRedisDelayedQueue()})
+	// 这个例子用内存实现，无需 Redis 即可运行。
+	// 生产环境请改用:
+	//   tick, err := gotick.NewServerFromConfig(gotick.Config{RedisURL: "redis://localhost:6379/0"})
+	tick := gotick.NewServer(gotick.NewServerParams{
+		DelayedQueue: store.NewMockRedisDelayedQueue(),
+		KVStore:      store.NewMockKvStore(),
+	})
 	ctx, c := signal.NewContext()
 	var currentCallId string
 
-	tick.Flow("demo/close-order", func(ctx *gotick.Context) error {
-		//log.Printf("schedule callId: %v", ctx.CallId)
+	tick.Flow("demo/close-order", func(ctx *gotick.Context) {
 		startAt := gotick.Memo(ctx, "start_at", func() (time.Time, error) {
 			return time.Now(), nil
 		})
@@ -41,7 +46,6 @@ func main() {
 		if ctx.CallId == currentCallId {
 			c()
 		}
-		return nil
 	})
 
 	var wg sync.WaitGroup

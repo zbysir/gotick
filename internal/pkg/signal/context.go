@@ -20,7 +20,8 @@ func NewContext(sig ...os.Signal) (ctx context.Context, cancel func()) {
 		sig = []os.Signal{syscall.SIGINT, syscall.SIGTERM}
 	}
 	go func() {
-		ch := make(chan os.Signal)
+		// signal.Notify 不会阻塞发送，channel 必须有缓冲，否则信号会被丢弃。
+		ch := make(chan os.Signal, 1)
 		signal.Notify(ch, sig...)
 		<-ch
 

@@ -2,155 +2,133 @@ package example
 
 import (
 	"errors"
-	"log"
-	"sync"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/zbysir/gotick"
-	"github.com/zbysir/gotick/internal/pkg/signal"
-	"github.com/zbysir/gotick/internal/store"
 )
 
-// - UseStatus: 和 React Hooks 一样，它用于保存状态。
-// - Memo: 缓存数据，当数据不存在时会执行 build 方法。
-// - Array: 和 Memo 类似用于缓存数据，不过如果想构建一个循环流程的话应该使用 Array，它提供更合适的 API。
-
+// TestFor 用 Array 生成一组任务并逐个执行，其中一个任务前 5 次失败。
+// 断言：每个任务最终都成功执行，失败的那个确实重试了。
 func TestFor(t *testing.T) {
-	tick := gotick.NewTickServer(gotick.Config{KvStore: store.NewMockNodeStatusStore(), DelayedQueue: store.NewMockRedisDelayedQueue()})
-	ctx, c := signal.NewContext()
-	var currentCallId string
+	tick := newTestServer()
+	fin := newSignaler()
+	succeeded := newCounter()
+	attempts := newCounter()
 
-	tick.Flow("demo/close-order", func(ctx *gotick.Context) {
-		//log.Printf("schedule callId: %v", ctx.CallId)
-		startAt := gotick.Memo(ctx, "start_at", func() (time.Time, error) {
-			return time.Now(), nil
-		})
+	const flakyItem = "f"
+	const flakyRetries = 5
+
+	items := []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+
+	tick.Flow("demo/for", func(ctx *gotick.Context) {
 		gotick.Task(ctx, "start", func(ctx *gotick.TaskContext) error {
-			log.Printf("[%v] start at %v", ctx.CallId, time.Now())
+			t.Logf("[%v] start", ctx.CallId)
 			return nil
 		})
 
-		// 生成 10 个任务
-		tasks := gotick.Array(ctx, "gen-tasks", func() ([]string, error) {
-			log.Printf("call gen-tasks at %v", time.Now().Sub(startAt))
-			return []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}, nil
+		tasks := gotick.Array(ctx, "gen-tasks", func(ctx *gotick.TaskContext) ([]string, error) {
+			t.Logf("gen-tasks called")
+			return items, nil
 		})
 
 		for _, task := range tasks {
-			//log.Printf("key: %+v", key)
+			task := task
 			gotick.Task(ctx, task.Key("send-email"), func(ctx *gotick.TaskContext) error {
-				if task.Value() == "f" {
-					// 模拟错误 5 次后成功
-					log.Printf("[%v] send email to '%v' error, retrying %v", ctx.CallId, task.Value(), ctx.Retry)
-					if ctx.Retry < 5 {
-						return errors.New("err")
-					}
+				v := task.Value()
+				attempts.inc(v)
+
+				// 模拟一个不稳定的任务：前 5 次失败，第 6 次成功。
+				if v == flakyItem && ctx.Retry < flakyRetries {
+					t.Logf("send-email to %q failed, retry=%v", v, ctx.Retry)
+					return errors.New("transient failure")
 				}
-				log.Printf("[%v] send email to '%v' success at %v", ctx.CallId, task.Value(), time.Now().Sub(startAt))
+
+				succeeded.inc(v)
+				t.Logf("send-email to %q ok (retry=%v)", v, ctx.Retry)
 				return nil
-			}, gotick.WithMaxRetry(6))
+			}, gotick.WithMaxRetry(flakyRetries+1))
 		}
 
 		gotick.Task(ctx, "done", func(ctx *gotick.TaskContext) error {
-			log.Printf("done at %v", time.Now().Sub(startAt))
+			t.Logf("all done")
 			return nil
 		})
-
-		if ctx.CallId == currentCallId {
-			c()
-		}
-		return
+	}).OnSuccess(func(ctx *gotick.Context) error {
+		fin.fire()
+		return nil
 	}).OnFail(func(ctx *gotick.Context, ts gotick.TaskStatus) error {
-		if ctx.CallId == currentCallId {
-			c()
-		}
-		log.Printf("breakFail: %+v", ts)
+		t.Errorf("flow failed on task %q: %v", ts.Key, ts.Errs)
+		fin.fire()
 		return nil
 	})
 
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		err := tick.StartServer(ctx)
-		if err != nil {
-			t.Fatal(err)
+	runFlow(t, tick, "demo/for", gotick.MetaData{"name": "bysir"}, fin, 60*time.Second)
+
+	for _, v := range items {
+		if got := succeeded.get(v); got != 1 {
+			t.Errorf("item %q: expected exactly 1 successful execution, got %d", v, got)
 		}
-	}()
-
-	callId, err := tick.Trigger(ctx, "demo/close-order", map[string]string{"name": "bysir"})
-	if err != nil {
-		t.Fatal(err)
 	}
-	currentCallId = callId
 
-	t.Logf("Triggered callid: %v", callId)
-
-	wg.Wait()
-
+	// 那个不稳定的任务应该被尝试了 flakyRetries+1 次，其余各一次。
+	if got := attempts.get(flakyItem); got != flakyRetries+1 {
+		t.Errorf("item %q: expected %d attempts, got %d", flakyItem, flakyRetries+1, got)
+	}
+	for _, v := range items {
+		if v == flakyItem {
+			continue
+		}
+		if got := attempts.get(v); got != 1 {
+			t.Errorf("item %q: expected 1 attempt, got %d", v, got)
+		}
+	}
 }
 
+// TestSequence 用 Sequence 驱动一个固定长度的循环。
+// 断言：循环体恰好执行 seqLen 次，且每次的序号互不重复。
 func TestSequence(t *testing.T) {
-	tick := gotick.NewTickServer(gotick.Config{KvStore: store.NewMockNodeStatusStore(), DelayedQueue: store.NewMockRedisDelayedQueue()})
-	ctx, c := signal.NewContext()
-	var currentCallId string
+	tick := newTestServer()
+	fin := newSignaler()
+	ran := newCounter()
 
-	tick.Flow("demo/close-order", func(ctx *gotick.Context) {
-		//log.Printf("schedule callId: %v", ctx.CallId)
-		startAt := gotick.Memo(ctx, "start_at", func() (time.Time, error) {
-			return time.Now(), nil
-		})
-		gotick.Task(ctx, "start", func(ctx *gotick.TaskContext) error {
-			log.Printf("start at %v", time.Now())
-			return nil
-		})
+	const seqLen = 10
 
-		// 生成 100 个任务
-		seq := gotick.Sequence(ctx, "gen-tasks", 10)
+	tick.Flow("demo/sequence", func(ctx *gotick.Context) {
+		seq := gotick.Sequence(ctx, "gen-tasks", seqLen)
 
 		for seq.Next() {
+			current := seq.Current
 			gotick.Task(ctx, seq.TaskKey("send-email"), func(ctx *gotick.TaskContext) error {
-				time.Sleep(1 * time.Second / 2)
-				log.Printf("send email to '%v' at %v", seq.Current, time.Now().Sub(startAt))
+				ran.inc(fmt.Sprintf("%d", current))
+				t.Logf("send-email #%d", current)
 				return nil
 			})
 		}
 
 		gotick.Task(ctx, "done", func(ctx *gotick.TaskContext) error {
-			log.Printf("done at %v", time.Now().Sub(startAt))
+			t.Logf("all done, meta=%v", ctx.MetaDataAll())
 			return nil
 		})
-
-		log.Printf("meta %+v", ctx.MetaDataAll())
-
-		if ctx.CallId == currentCallId {
-			c()
-		}
-		return
 	}).OnSuccess(func(ctx *gotick.Context) error {
-		log.Printf("onSuccess")
+		fin.fire()
+		return nil
+	}).OnFail(func(ctx *gotick.Context, ts gotick.TaskStatus) error {
+		t.Errorf("flow failed on task %q: %v", ts.Key, ts.Errs)
+		fin.fire()
 		return nil
 	})
 
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		err := tick.StartServer(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}()
+	runFlow(t, tick, "demo/sequence", gotick.MetaData{"name": "bysir"}, fin, 60*time.Second)
 
-	callId, err := tick.Trigger(ctx, "demo/close-order", map[string]string{"name": "bysir"})
-	if err != nil {
-		t.Fatal(err)
+	got := ran.snapshot()
+	if len(got) != seqLen {
+		t.Errorf("expected %d distinct iterations, got %d: %v", seqLen, len(got), got)
 	}
-	currentCallId = callId
-
-	t.Logf("Triggered callid: %v", callId)
-
-	wg.Wait()
-
+	for k, n := range got {
+		if n != 1 {
+			t.Errorf("iteration %s ran %d times, expected exactly 1", k, n)
+		}
+	}
 }
