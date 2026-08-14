@@ -333,9 +333,13 @@ const defaultAsyncMaxRetry = 5
 // waitRecheckDelay 是没有明确重试时间时，下一次回来查看的间隔。
 const waitRecheckDelay = time.Second
 
-// sleepSpinTolerance 是 Sleep 允许就地等待的最大剩余时长。
-// 超过它才值得重新入队，让出这个 worker。
-const sleepSpinTolerance = time.Second
+// shortWaitTolerance 是允许就地等完的最大剩余时长。
+//
+// 唤醒事件常常比预定时刻早到一点。为这点差距重新入队要付出一整轮队列调度的代价，
+// 还会多出一次什么都没推进的重放。差得不多就地等，比绕一圈便宜得多。
+//
+// 上限必须很小：等待期间持有着重放租约，占着一个 worker。
+const shortWaitTolerance = time.Second
 
 // Wait 执行并等待所有 future 完成。
 // parallel 限制同时执行的任务数，<=0 表示不限制。
@@ -703,9 +707,16 @@ func Task(c *Context, key string, fun TaskFun, opts ...TaskOption) {
 	}
 
 	if !exist || s.Status == TaskStatusRetry {
-		// 还没到重试时间就先等着，别把退避时间空转掉
-		if exist && s.RunAt.After(time.Now()) {
-			panic(BreakWait(time.Until(s.RunAt)))
+		// 还没到重试时间就先等着，别把退避时间空转掉。
+		// 和 Sleep 一样：只差一点点就就地等完，不然每次重试都要多赔一次
+		// 什么都没推进的重放，外加一轮队列调度的延迟。
+		if exist {
+			if d := time.Until(s.RunAt); d > 0 {
+				if d > shortWaitTolerance {
+					panic(BreakWait(d))
+				}
+				time.Sleep(d)
+			}
 		}
 
 		opt := TaskOptions(opts).build()
@@ -752,7 +763,7 @@ func Sleep(c *Context, key string, duration time.Duration) {
 		//
 		// 差得不多就地等一下，比绕一圈便宜得多。这段等待期间持有着重放租约，
 		// 所以上限必须很小；进程在这期间挂掉也没有任何损失——重放会重做。
-		if d > 0 && d <= sleepSpinTolerance {
+		if d > 0 && d <= shortWaitTolerance {
 			time.Sleep(d)
 			d = 0
 		}

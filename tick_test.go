@@ -592,5 +592,5 @@ func TestSleepYieldsForLongRemainders(t *testing.T) {
 
 	require.NotNil(t, bp, "还早得很就必须让出 worker，不能占着它干等")
 	assert.IsType(t, &breakSleep{}, bp)
-	assert.Less(t, time.Since(start), sleepSpinTolerance, "让出应该是立刻的")
+	assert.Less(t, time.Since(start), shortWaitTolerance, "让出应该是立刻的")
 }
