@@ -61,6 +61,7 @@ func main() {
 	trigger("demo/broken-payment", gotick.MetaData{"order_id": "ORD-99001"})
 	trigger("demo/parallel-fetch", gotick.MetaData{"batch": "2026-08-14"})
 	trigger("demo/slow-drip", gotick.MetaData{"note": "这个会跑一分钟，用来看 running 状态"})
+	trigger("demo/scheduled-report", gotick.MetaData{"report": "weekly-2026-W33"})
 
 	fmt.Fprintln(os.Stderr, "\n触发完毕。现在另开一个终端运行：")
 	fmt.Fprintf(os.Stderr, "  go run ./cmd/gotick ui -redis %s\n\n", *redisURL)
@@ -155,6 +156,26 @@ func registerFlows(tick *gotick.Server) {
 				sum += f.(*gotick.FutureT[int]).Value()
 			}
 			log.Printf("merged total: %d", sum)
+			return nil
+		})
+	})
+
+	// 睡两分钟，用来观察 sleep 的倒计时和进度条。
+	// 这是 gotick 最能体现价值的形态：等待期间不占用任何进程，
+	// 服务重启也不影响它按时醒来。
+	tick.Flow("demo/scheduled-report", func(ctx *gotick.Context) {
+		name, _ := ctx.MetaData("report")
+
+		gotick.Task(ctx, "collect-data", func(ctx *gotick.TaskContext) error {
+			time.Sleep(200 * time.Millisecond)
+			log.Printf("[%s] data collected", name)
+			return nil
+		})
+
+		gotick.Sleep(ctx, "wait-for-quiet-hours", 2*time.Minute)
+
+		gotick.Task(ctx, "render-and-send", func(ctx *gotick.TaskContext) error {
+			log.Printf("[%s] report sent", name)
 			return nil
 		})
 	})

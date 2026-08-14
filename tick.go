@@ -940,8 +940,17 @@ func (t TaskStatus) MakeClaimed(now time.Time) TaskStatus {
 }
 
 func (t TaskStatus) MakeSleep(runAt time.Time) TaskStatus {
+	// 记录进入 sleep 的时刻，这样界面上才能显示「睡了多久 / 还剩多久」，
+	// 而不是只有一个孤零零的唤醒时间戳。
+	//
+	// 重放会再次走到这里（Sleep 未到期时会用剩余时长重新 BreakSleep），
+	// 所以已经在 sleep 中就不能重置起点，否则进度会一直往回跳。
+	if t.Status != TaskStatusSleep || t.StartedAt.IsZero() {
+		t.StartedAt = time.Now()
+	}
 	t.Status = TaskStatusSleep
 	t.RunAt = runAt
+	t.EndedAt = time.Time{}
 	return t
 }
 

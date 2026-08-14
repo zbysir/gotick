@@ -131,6 +131,59 @@
     border: 1px solid var(--crit); background: var(--crit-soft); color: var(--crit);
     border-radius: 3px; padding: 12px 16px; margin-bottom: 18px; font-size: 13px;
   }
+
+  /* ---- 当前活动 ---- */
+  .activity {
+    border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    background: var(--surface); border-radius: 3px;
+    padding: 16px 20px; margin-bottom: 18px;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .activity.idle { border-left-color: var(--line-strong); }
+  .activity-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .activity-state {
+    font-size: 15px; font-weight: 650; letter-spacing: -.005em;
+    display: inline-flex; align-items: center; gap: 8px;
+  }
+  .activity-task { font-family: var(--mono); font-size: 13px; color: var(--muted); }
+  .activity-time {
+    font-family: var(--mono); font-size: 13px; color: var(--ink);
+    font-variant-numeric: tabular-nums;
+  }
+  .activity-note { font-size: 12.5px; color: var(--faint); }
+
+  /* 活着的状态给一个呼吸点，静态截图里也看得出「它还在动」 */
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--accent); flex: none;
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  .dot.warn { background: var(--warn); }
+  .dot.still { background: var(--line-strong); animation: none; }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50%      { opacity: .35; transform: scale(.78); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .dot { animation: none; }
+  }
+
+  /* 倒计时进度条 */
+  .prog {
+    height: 6px; background: var(--surface-2);
+    border-radius: 3px; overflow: hidden;
+  }
+  .prog > i {
+    display: block; height: 100%; background: var(--accent);
+    border-radius: 3px; transition: width 1s linear;
+  }
+  .prog.warn > i { background: var(--warn); }
+  @media (prefers-reduced-motion: reduce) {
+    .prog > i { transition: none; }
+  }
+
+  td .prog { margin-top: 5px; }
+  .countdown { font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body>
@@ -188,6 +241,59 @@ function ago(iso) {
 
 function pill(status) {
   return `<span class="pill ${esc(status || "unknown")}">${esc(status || "unknown")}</span>`;
+}
+
+function isZeroTime(iso) {
+  return !iso || iso.startsWith("0001-");
+}
+
+// humanDuration 把毫秒渲染成人读的时长。秒级以下不显示，避免读数一直在抖。
+function humanDuration(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return s + "s";
+  const m = Math.floor(s / 60), rs = s % 60;
+  if (m < 60) return rs ? `${m}m${rs}s` : `${m}m`;
+  const h = Math.floor(m / 60), rm = m % 60;
+  if (h < 24) return rm ? `${h}h${rm}m` : `${h}h`;
+  const d = Math.floor(h / 24);
+  return `${d}d${h % 24}h`;
+}
+
+// tickDynamic 每秒刷新一次页面上跟时间有关的部分。
+//
+// 这一步不发请求：轮询是 3 秒一次，光靠它倒计时会一跳三秒，
+// 看起来像卡住了而不是在走。本地走时让「还在动」这件事一眼可见。
+function tickDynamic() {
+  const now = Date.now();
+
+  document.querySelectorAll("[data-countdown]").forEach(el => {
+    const left = Date.parse(el.dataset.countdown) - now;
+    el.textContent = left > 0 ? humanDuration(left) : "即将继续";
+  });
+
+  document.querySelectorAll("[data-elapsed]").forEach(el => {
+    el.textContent = humanDuration(now - Date.parse(el.dataset.elapsed));
+  });
+
+  document.querySelectorAll("[data-from]").forEach(el => {
+    const from = Date.parse(el.dataset.from), to = Date.parse(el.dataset.to);
+    const pct = to > from ? Math.min(100, Math.max(0, ((now - from) / (to - from)) * 100)) : 100;
+    el.style.width = pct.toFixed(2) + "%";
+  });
+}
+
+setInterval(tickDynamic, 1000);
+
+// countdownTo 渲染一个会自己走的倒计时；起止时间都有就顺带给一条进度条。
+function countdownTo(until, since, warn) {
+  if (isZeroTime(until)) return "—";
+
+  let html = `<span class="countdown" data-countdown="${esc(until)}">…</span>`;
+  if (!isZeroTime(since)) {
+    html += `<div class="prog${warn ? " warn" : ""}">` +
+            `<i data-from="${esc(since)}" data-to="${esc(until)}"></i></div>`;
+  }
+  return html;
 }
 
 function banner(msg) {
@@ -279,6 +385,53 @@ async function renderList() {
 
 // ---------- 详情页 ----------
 
+// activityBanner 回答「此刻在干什么」。
+//
+// 一张任务表回答不了这个问题：一个正在睡的流程，表里只是某一行写着 sleep
+// 加一个时间戳，得自己拿当前时间去减才知道还要等多久。
+const ACTIVITY = {
+  running:    { label: "执行中",   dot: "",     note: "任务正在某个节点上运行，心跳还在续期" },
+  sleeping:   { label: "睡眠中",   dot: "",     note: "到点后会被自动唤醒；等待期间不占用任何进程，重启也不受影响" },
+  retrying:   { label: "等待重试", dot: "warn", note: "上一次执行失败了，退避结束后会再试一次" },
+  scheduling: { label: "调度中",   dot: "",     note: "正处在两步之间，马上会被某个 worker 接走" },
+  done:       { label: "已完成",   dot: "still" },
+  failed:     { label: "已失败",   dot: "still" },
+  aborted:    { label: "已终止",   dot: "still" },
+};
+
+function activityBanner(a) {
+  if (!a || !a.state) return "";
+
+  const m = ACTIVITY[a.state] || { label: a.state, dot: "still" };
+  const idle = ["done", "failed", "aborted"].includes(a.state);
+
+  let timing = "";
+  let progress = "";
+
+  if ((a.state === "sleeping" || a.state === "retrying") && !isZeroTime(a.until)) {
+    timing = `<span class="activity-time">还有 ` +
+             `<span class="countdown" data-countdown="${esc(a.until)}">…</span></span>`;
+    if (!isZeroTime(a.since)) {
+      progress = `<div class="prog${a.state === "retrying" ? " warn" : ""}">` +
+                 `<i data-from="${esc(a.since)}" data-to="${esc(a.until)}"></i></div>`;
+    }
+  } else if (a.state === "running" && !isZeroTime(a.since)) {
+    timing = `<span class="activity-time">已运行 ` +
+             `<span class="countdown" data-elapsed="${esc(a.since)}">…</span></span>`;
+  }
+
+  return `
+    <div class="activity${idle ? " idle" : ""}">
+      <div class="activity-head">
+        <span class="activity-state"><i class="dot ${m.dot}"></i>${esc(m.label)}</span>
+        ${a.task ? `<span class="activity-task">${esc(a.task)}</span>` : ""}
+        ${timing}
+      </div>
+      ${progress}
+      ${m.note ? `<div class="activity-note">${esc(m.note)}</div>` : ""}
+    </div>`;
+}
+
 async function renderDetail(callId) {
   let d;
   try {
@@ -295,18 +448,32 @@ async function renderDetail(callId) {
 
   const maxMs = Math.max(1, ...tasks.map(t => t.duration_ms || 0));
   const taskRows = tasks.map(t => {
-    const width = Math.round(((t.duration_ms || 0) / maxMs) * 100);
     const cls = t.status === "fail" ? "fail" : (t.status === "retry" ? "retry" : "");
+
+    // 时间那一列要按状态给不同的东西：还没结束的任务给会走的读数，
+    // 已经结束的给固定耗时。
+    let timing;
+    if ((t.status === "sleep" || t.status === "retry") && !isZeroTime(t.run_at)) {
+      timing = countdownTo(t.run_at, t.started_at, t.status === "retry");
+    } else if (t.status === "running" && !isZeroTime(t.started_at)) {
+      timing = `<span class="countdown" data-elapsed="${esc(t.started_at)}">…</span>`;
+    } else {
+      timing = esc(t.duration_text);
+    }
+
+    const width = Math.round(((t.duration_ms || 0) / maxMs) * 100);
+    const bar = (t.duration_ms || 0) > 0
+      ? `<div class="bartrack"><div class="bar ${cls}" style="width:${width}%"></div></div>`
+      : "";
+
     return `
       <tr>
         <td class="mono">${esc(t.key)}</td>
         <td>${pill(t.status)}</td>
         <td class="num">${t.retry_count || 0}</td>
-        <td class="num" title="${esc(fmtTime(t.started_at))}">${esc(t.started_at && !t.started_at.startsWith("0001-") ? fmtTime(t.started_at).slice(11) : "—")}</td>
-        <td class="num">${esc(t.duration_text)}</td>
-        <td style="min-width:120px">
-          <div class="bartrack"><div class="bar ${cls}" style="width:${width}%"></div></div>
-        </td>
+        <td class="num" title="${esc(fmtTime(t.started_at))}">${esc(isZeroTime(t.started_at) ? "—" : fmtTime(t.started_at).slice(11))}</td>
+        <td class="num" style="min-width:96px">${timing}</td>
+        <td style="min-width:120px">${bar}</td>
         <td>${(t.errs || []).map(e => `<span class="err">${esc(e)}</span>`).join("") || "—"}</td>
       </tr>`;
   }).join("");
@@ -318,6 +485,8 @@ async function renderDetail(callId) {
     <a class="back" href="#/">← 返回列表</a>
     <h2 style="margin-top:14px">${esc(run.flow_id || "unknown flow")}</h2>
     <div class="sub mono">${esc(callId)}</div>
+
+    ${activityBanner(d.activity)}
 
     <div class="panel">
       <div class="panel-head"><span>概览</span><span>${esc(run.status || "unknown")}</span></div>
@@ -354,16 +523,27 @@ async function renderDetail(callId) {
       <dl class="kv">${kvRows(meta.cached)}</dl>
     </div>` : ""}`;
 
-  scheduleRefresh(!!run.running);
+  tickDynamic();
+
+  // 睡得还久就没必要一直问后端——倒计时在本地自己走，看起来一样是活的。
+  let poll = 3000;
+  const a = d.activity;
+  if (a && a.state === "sleeping" && !isZeroTime(a.until)) {
+    const left = Date.parse(a.until) - Date.now();
+    if (left > 30000) poll = Math.min(15000, left - 2000);
+  }
+
+  scheduleRefresh(!!run.running, poll);
 }
 
 // ---------- 路由 ----------
 
-function scheduleRefresh(active) {
+function scheduleRefresh(active, delayMs) {
   if (timer) { clearTimeout(timer); timer = null; }
   if (!active) { setRefresh("已结束，停止自动刷新"); return; }
-  setRefresh("每 3 秒自动刷新");
-  timer = setTimeout(route, 3000);
+  const ms = delayMs || 3000;
+  setRefresh(`每 ${Math.round(ms / 1000)} 秒同步一次`);
+  timer = setTimeout(route, ms);
 }
 
 function route() {

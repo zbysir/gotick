@@ -525,3 +525,29 @@ func TestWaitDelay(t *testing.T) {
 	assert.Equal(t, time.Duration(0), waitDelay(now.Add(-time.Second), now),
 		"an overdue retry should be picked up immediately")
 }
+
+// TestMakeSleepKeepsItsStartingPoint 覆盖「重放不能重置睡眠起点」。
+//
+// Sleep 没到期时每次重放都会用剩余时长重新 BreakSleep，调度器于是会再调一次
+// MakeSleep。如果那里无条件写 StartedAt，界面上的睡眠进度会一直往回跳，
+// 而且「已经睡了多久」这个信息会永远拿不到。
+func TestMakeSleepKeepsItsStartingPoint(t *testing.T) {
+	wake := time.Now().Add(time.Minute)
+
+	first := TaskStatus{}.MakeSleep(wake)
+	require.Equal(t, TaskStatusSleep, first.Status)
+	require.False(t, first.StartedAt.IsZero(), "第一次进入 sleep 要记下起点")
+	require.True(t, first.RunAt.Equal(wake))
+
+	time.Sleep(5 * time.Millisecond)
+
+	// 模拟一次重放：还在睡，用剩余时长重新 BreakSleep
+	second := first.MakeSleep(wake)
+	assert.True(t, second.StartedAt.Equal(first.StartedAt),
+		"重放不能把睡眠起点往后推，否则进度会一直重置")
+
+	// 但从别的状态进入 sleep 时应该重新计时
+	afterRetry := TaskStatus{Status: TaskStatusRetry, StartedAt: time.Now().Add(-time.Hour)}.MakeSleep(wake)
+	assert.True(t, afterRetry.StartedAt.After(first.StartedAt),
+		"从其他状态进入 sleep 应该重新开始计时")
+}

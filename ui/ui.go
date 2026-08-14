@@ -244,11 +244,69 @@ func (h *handler) handleRunDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	tasks := decorateTasks(statuses)
+
 	writeJSON(w, map[string]any{
 		"run":      decorateRun(run),
-		"tasks":    decorateTasks(statuses),
+		"tasks":    tasks,
+		"activity": deriveActivity(run, tasks),
 		"metadata": splitMeta(meta),
 	})
+}
+
+// activity 回答「这次调用此刻在干什么」。
+//
+// 光有一张任务表看不出这个：一个正在 sleep 的流程，表里只是某一行的状态是 sleep
+// 加一个孤零零的时间戳，得自己去比对当前时间才知道它还要睡多久。
+type activity struct {
+	// State: running / sleeping / retrying / scheduling / 或者 run 的终态
+	State string `json:"state"`
+	Task  string `json:"task,omitempty"`
+	// Since 这个状态是什么时候开始的，Until 是预计什么时候结束。
+	Since time.Time `json:"since,omitempty"`
+	Until time.Time `json:"until,omitempty"`
+}
+
+func deriveActivity(run gotick.RunInfo, tasks []taskView) activity {
+	if run.Finished() {
+		return activity{State: run.Status}
+	}
+
+	now := time.Now()
+
+	// 正在跑的任务优先——那是此刻真正在消耗时间的东西
+	for _, t := range tasks {
+		if t.Status == gotick.TaskStatusRunning {
+			return activity{State: "running", Task: t.Key, Since: t.StartedAt}
+		}
+	}
+
+	// 其次是等待中的：取最早醒来的那个，它决定了整个流程什么时候能往下走
+	var next *taskView
+	for i := range tasks {
+		t := &tasks[i]
+		switch t.Status {
+		case gotick.TaskStatusSleep, gotick.TaskStatusRetry:
+		default:
+			continue
+		}
+		if t.RunAt.IsZero() || !t.RunAt.After(now) {
+			continue
+		}
+		if next == nil || t.RunAt.Before(next.RunAt) {
+			next = t
+		}
+	}
+	if next != nil {
+		state := "sleeping"
+		if next.Status == gotick.TaskStatusRetry {
+			state = "retrying"
+		}
+		return activity{State: state, Task: next.Key, Since: next.StartedAt, Until: next.RunAt}
+	}
+
+	// 没有任何任务在跑也没有在等，说明正处在两步之间的调度间隙
+	return activity{State: "scheduling"}
 }
 
 // runView 是 RunInfo 加上给前端算好的派生字段。

@@ -228,3 +228,61 @@ func TestUnknownPathIs404(t *testing.T) {
 	rec, _ := get(t, h, "/nope")
 	assert.Equal(t, http.StatusNotFound, rec.Code)
 }
+
+func TestDeriveActivity(t *testing.T) {
+	now := time.Now()
+
+	running := gotick.RunInfo{Status: gotick.RunStatusRunning}
+
+	t.Run("已结束的实例直接报终态", func(t *testing.T) {
+		got := deriveActivity(gotick.RunInfo{Status: gotick.RunStatusFailed}, []taskView{
+			{Key: "a", Status: gotick.TaskStatusSleep, RunAt: now.Add(time.Hour)},
+		})
+		assert.Equal(t, gotick.RunStatusFailed, got.State,
+			"结束了就不该再报告它在睡觉")
+	})
+
+	t.Run("正在执行的任务优先", func(t *testing.T) {
+		got := deriveActivity(running, []taskView{
+			{Key: "sleeper", Status: gotick.TaskStatusSleep, RunAt: now.Add(time.Minute)},
+			{Key: "worker", Status: gotick.TaskStatusRunning, StartedAt: now.Add(-time.Second)},
+		})
+		assert.Equal(t, "running", got.State)
+		assert.Equal(t, "worker", got.Task,
+			"此刻真正在消耗时间的是正在跑的那个，不是在等的那个")
+	})
+
+	t.Run("睡眠中报告最早醒来的那个", func(t *testing.T) {
+		got := deriveActivity(running, []taskView{
+			{Key: "late", Status: gotick.TaskStatusSleep, StartedAt: now, RunAt: now.Add(time.Hour)},
+			{Key: "soon", Status: gotick.TaskStatusSleep, StartedAt: now, RunAt: now.Add(time.Minute)},
+		})
+		assert.Equal(t, "sleeping", got.State)
+		assert.Equal(t, "soon", got.Task, "最早醒来的那个决定了流程什么时候能往下走")
+		assert.True(t, got.Until.Equal(now.Add(time.Minute)))
+		assert.False(t, got.Since.IsZero(), "没有起点就画不出进度条")
+	})
+
+	t.Run("重试等待和睡眠区分开", func(t *testing.T) {
+		got := deriveActivity(running, []taskView{
+			{Key: "flaky", Status: gotick.TaskStatusRetry, StartedAt: now, RunAt: now.Add(3 * time.Second)},
+		})
+		assert.Equal(t, "retrying", got.State)
+		assert.Equal(t, "flaky", got.Task)
+	})
+
+	t.Run("已经到期的等待不算在等", func(t *testing.T) {
+		got := deriveActivity(running, []taskView{
+			{Key: "overdue", Status: gotick.TaskStatusSleep, RunAt: now.Add(-time.Second)},
+		})
+		assert.Equal(t, "scheduling", got.State,
+			"到点了还没被唤醒，说明它在等调度而不是在睡")
+	})
+
+	t.Run("两步之间是调度中", func(t *testing.T) {
+		got := deriveActivity(running, []taskView{
+			{Key: "a", Status: gotick.TaskStatusDone},
+		})
+		assert.Equal(t, "scheduling", got.State)
+	})
+}
