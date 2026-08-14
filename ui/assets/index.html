@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gotick</title>
+<style>
+  :root {
+    --ground: #f4f6f7;
+    --surface: #ffffff;
+    --surface-2: #eaeef0;
+    --ink: #0f1a1e;
+    --muted: #576b74;
+    --faint: #7f959d;
+    --line: #dae2e5;
+    --line-strong: #b5c4c9;
+    --accent: #0b7285;
+    --accent-soft: #dceef1;
+    --ok: #0f6b4f;
+    --ok-soft: #dcf0e7;
+    --warn: #855800;
+    --warn-soft: #faefd6;
+    --crit: #a32118;
+    --crit-soft: #fbe7e4;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+            "Hiragino Sans GB", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #0b1316; --surface: #121f24; --surface-2: #172a31;
+      --ink: #dfeaed; --muted: #93abb3; --faint: #6e8791;
+      --line: #1e2f36; --line-strong: #2e454e;
+      --accent: #3fcbe0; --accent-soft: #10333b;
+      --ok: #4dc79a; --ok-soft: #102c24;
+      --warn: #e0b341; --warn-soft: #2c2413;
+      --crit: #f2837a; --crit-soft: #2e1917;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--ground); color: var(--ink);
+    font-family: var(--sans); font-size: 14px; line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 0 20px 80px; }
+
+  header {
+    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+    padding: 26px 0 18px; border-bottom: 1px solid var(--line); margin-bottom: 22px;
+  }
+  .brand {
+    font-family: var(--mono); font-size: 19px; font-weight: 600;
+    letter-spacing: -.03em; color: var(--accent); text-decoration: none;
+  }
+  .tagline { color: var(--faint); font-size: 12.5px; }
+  header .spacer { flex: 1; }
+  .refresh { font-family: var(--mono); font-size: 11.5px; color: var(--faint); }
+
+  .toolbar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 16px; }
+  select, button, input {
+    font-family: var(--sans); font-size: 13px; color: var(--ink);
+    background: var(--surface); border: 1px solid var(--line-strong);
+    border-radius: 3px; padding: 6px 10px;
+  }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button:focus-visible, select:focus-visible, a:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px;
+  }
+
+  .panel {
+    border: 1px solid var(--line); border-radius: 3px;
+    background: var(--surface); overflow: hidden; margin-bottom: 18px;
+  }
+  .panel-head {
+    padding: 11px 16px; border-bottom: 1px solid var(--line);
+    background: var(--surface-2); font-family: var(--mono);
+    font-size: 11px; letter-spacing: .13em; text-transform: uppercase; color: var(--faint);
+    display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  }
+  .scroller { overflow-x: auto; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th {
+    text-align: left; font-family: var(--mono); font-size: 10.5px;
+    letter-spacing: .1em; text-transform: uppercase; color: var(--faint);
+    font-weight: 500; padding: 10px 14px; border-bottom: 1px solid var(--line); white-space: nowrap;
+  }
+  td { padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr.clickable { cursor: pointer; }
+  tbody tr.clickable:hover { background: var(--surface-2); }
+  .num { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .mono { font-family: var(--mono); font-size: 12.5px; }
+
+  .pill {
+    display: inline-block; font-family: var(--mono); font-size: 10.5px;
+    letter-spacing: .07em; text-transform: uppercase; padding: 2px 7px;
+    border-radius: 2px; white-space: nowrap; font-weight: 500;
+  }
+  .pill.done { background: var(--ok-soft); color: var(--ok); }
+  .pill.running { background: var(--accent-soft); color: var(--accent); }
+  .pill.failed, .pill.fail { background: var(--crit-soft); color: var(--crit); }
+  .pill.aborted, .pill.abort { background: var(--crit-soft); color: var(--crit); }
+  .pill.retry { background: var(--warn-soft); color: var(--warn); }
+  .pill.sleep { background: var(--surface-2); color: var(--muted); }
+  .pill.unknown, .pill.expired { background: var(--surface-2); color: var(--faint); }
+
+  .err {
+    color: var(--crit); font-family: var(--mono); font-size: 12px;
+    display: block; margin-top: 4px; word-break: break-word;
+  }
+  .empty { padding: 40px 16px; text-align: center; color: var(--faint); }
+  .kv { display: grid; grid-template-columns: minmax(120px, max-content) 1fr; gap: 6px 18px; padding: 14px 16px; }
+  .kv dt { font-family: var(--mono); font-size: 11.5px; color: var(--faint); }
+  .kv dd { margin: 0; word-break: break-word; }
+  .kv dd.mono { font-size: 12.5px; }
+
+  .back { color: var(--accent); text-decoration: none; font-size: 13px; }
+  .back:hover { text-decoration: underline; }
+  h2 { font-size: 17px; margin: 0 0 2px; letter-spacing: -.01em; }
+  .sub { color: var(--muted); font-size: 12.5px; margin-bottom: 16px; }
+
+  .bar { height: 4px; background: var(--accent); border-radius: 2px; min-width: 2px; }
+  .bar.fail { background: var(--crit); }
+  .bar.retry { background: var(--warn); }
+  .bartrack { background: var(--surface-2); border-radius: 2px; min-width: 60px; }
+
+  .banner {
+    border: 1px solid var(--crit); background: var(--crit-soft); color: var(--crit);
+    border-radius: 3px; padding: 12px 16px; margin-bottom: 18px; font-size: 13px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <a class="brand" href="#/">gotick</a>
+    <span class="tagline">workflow inspector</span>
+    <span class="spacer"></span>
+    <span class="refresh" id="refresh"></span>
+  </header>
+  <div id="app"><div class="empty">加载中…</div></div>
+</div>
+
+<script>
+"use strict";
+
+// 页面可能被挂在任意前缀下（/_gotick/ 之类），所以所有请求都相对当前目录。
+const BASE = location.pathname.endsWith("/") ? location.pathname : location.pathname + "/";
+const app = document.getElementById("app");
+const refreshEl = document.getElementById("refresh");
+
+let timer = null;
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, c => (
+    {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]
+  ));
+}
+
+async function api(path) {
+  const res = await fetch(BASE + path, { headers: { "Accept": "application/json" } });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || ("HTTP " + res.status));
+  return body;
+}
+
+function fmtTime(iso) {
+  if (!iso || iso.startsWith("0001-")) return "—";
+  const d = new Date(iso);
+  if (isNaN(d)) return "—";
+  const pad = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ` +
+         `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+function ago(iso) {
+  if (!iso || iso.startsWith("0001-")) return "—";
+  const diff = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (isNaN(diff)) return "—";
+  if (diff < 60) return Math.max(0, Math.round(diff)) + " 秒前";
+  if (diff < 3600) return Math.round(diff / 60) + " 分钟前";
+  if (diff < 86400) return Math.round(diff / 3600) + " 小时前";
+  return Math.round(diff / 86400) + " 天前";
+}
+
+function pill(status) {
+  return `<span class="pill ${esc(status || "unknown")}">${esc(status || "unknown")}</span>`;
+}
+
+function banner(msg) {
+  return `<div class="banner">${esc(msg)}</div>`;
+}
+
+function setRefresh(text) { refreshEl.textContent = text; }
+
+// ---------- 列表页 ----------
+
+async function renderList() {
+  const params = new URLSearchParams(location.hash.split("?")[1] || "");
+  const flow = params.get("flow") || "";
+  const status = params.get("status") || "";
+
+  let flows = { flows: [], total_runs: 0 };
+  let data = { runs: [], total: 0 };
+  try {
+    [flows, data] = await Promise.all([
+      api("api/flows"),
+      api("api/runs?" + new URLSearchParams({ flow, status, limit: "100" })),
+    ]);
+  } catch (e) {
+    app.innerHTML = banner("读取失败：" + e.message);
+    return;
+  }
+
+  const options = ['<option value="">全部 flow</option>'].concat(
+    (flows.flows || []).map(f =>
+      `<option value="${esc(f.id)}" ${f.id === flow ? "selected" : ""}>${esc(f.id)} (${f.runs})</option>`)
+  ).join("");
+
+  const statuses = ["", "running", "done", "failed", "aborted"];
+  const statusOptions = statuses.map(s =>
+    `<option value="${s}" ${s === status ? "selected" : ""}>${s === "" ? "全部状态" : s}</option>`
+  ).join("");
+
+  const rows = (data.runs || []).map(r => `
+    <tr class="clickable" data-call="${esc(r.call_id)}">
+      <td>${pill(r.status)}</td>
+      <td class="mono">${esc(r.flow_id || "—")}</td>
+      <td class="mono">${esc(r.call_id.slice(0, 12))}</td>
+      <td class="num" title="${esc(fmtTime(r.started_at))}">${esc(ago(r.started_at))}</td>
+      <td class="num">${esc(r.duration_text)}</td>
+      <td class="num">${r.replays}</td>
+      <td>
+        ${r.failed_task ? `<span class="mono">${esc(r.failed_task)}</span>` : "—"}
+        ${r.error ? `<span class="err">${esc(r.error)}</span>` : ""}
+      </td>
+    </tr>`).join("");
+
+  app.innerHTML = `
+    <div class="toolbar">
+      <select id="flowFilter">${options}</select>
+      <select id="statusFilter">${statusOptions}</select>
+      <button id="reload">刷新</button>
+    </div>
+    <div class="panel">
+      <div class="panel-head">
+        <span>运行实例</span>
+        <span>${data.runs.length} / ${data.total} 条</span>
+      </div>
+      <div class="scroller">
+        ${rows ? `<table>
+          <thead><tr>
+            <th>状态</th><th>Flow</th><th>Call ID</th>
+            <th>开始</th><th>耗时</th><th>重放</th><th>失败于</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>` : `<div class="empty">还没有运行记录。触发一个 flow 之后回来看看。</div>`}
+      </div>
+    </div>`;
+
+  document.getElementById("flowFilter").onchange = e => {
+    location.hash = "#/?" + new URLSearchParams({ flow: e.target.value, status });
+  };
+  document.getElementById("statusFilter").onchange = e => {
+    location.hash = "#/?" + new URLSearchParams({ flow, status: e.target.value });
+  };
+  document.getElementById("reload").onclick = () => route();
+  app.querySelectorAll("tr.clickable").forEach(tr => {
+    tr.onclick = () => { location.hash = "#/run/" + tr.dataset.call; };
+  });
+
+  // 有实例还在跑就自动刷新，跑完了就停下来，别无谓地打 Redis。
+  const anyRunning = (data.runs || []).some(r => r.running);
+  scheduleRefresh(anyRunning);
+}
+
+// ---------- 详情页 ----------
+
+async function renderDetail(callId) {
+  let d;
+  try {
+    d = await api("api/runs/" + encodeURIComponent(callId));
+  } catch (e) {
+    app.innerHTML = `<a class="back" href="#/">← 返回列表</a>` + banner("读取失败：" + e.message);
+    setRefresh("");
+    return;
+  }
+
+  const run = d.run || {};
+  const tasks = d.tasks || [];
+  const meta = d.metadata || { user: {}, cached: {} };
+
+  const maxMs = Math.max(1, ...tasks.map(t => t.duration_ms || 0));
+  const taskRows = tasks.map(t => {
+    const width = Math.round(((t.duration_ms || 0) / maxMs) * 100);
+    const cls = t.status === "fail" ? "fail" : (t.status === "retry" ? "retry" : "");
+    return `
+      <tr>
+        <td class="mono">${esc(t.key)}</td>
+        <td>${pill(t.status)}</td>
+        <td class="num">${t.retry_count || 0}</td>
+        <td class="num" title="${esc(fmtTime(t.started_at))}">${esc(t.started_at && !t.started_at.startsWith("0001-") ? fmtTime(t.started_at).slice(11) : "—")}</td>
+        <td class="num">${esc(t.duration_text)}</td>
+        <td style="min-width:120px">
+          <div class="bartrack"><div class="bar ${cls}" style="width:${width}%"></div></div>
+        </td>
+        <td>${(t.errs || []).map(e => `<span class="err">${esc(e)}</span>`).join("") || "—"}</td>
+      </tr>`;
+  }).join("");
+
+  const kvRows = obj => Object.keys(obj).sort().map(k =>
+    `<dt>${esc(k)}</dt><dd class="mono">${esc(obj[k])}</dd>`).join("");
+
+  app.innerHTML = `
+    <a class="back" href="#/">← 返回列表</a>
+    <h2 style="margin-top:14px">${esc(run.flow_id || "unknown flow")}</h2>
+    <div class="sub mono">${esc(callId)}</div>
+
+    <div class="panel">
+      <div class="panel-head"><span>概览</span><span>${esc(run.status || "unknown")}</span></div>
+      <dl class="kv">
+        <dt>状态</dt><dd>${pill(run.status)}</dd>
+        <dt>开始</dt><dd class="mono">${esc(fmtTime(run.started_at))}</dd>
+        <dt>结束</dt><dd class="mono">${esc(fmtTime(run.ended_at))}</dd>
+        <dt>耗时</dt><dd class="mono">${esc(run.duration_text || "—")}</dd>
+        <dt>重放次数</dt><dd class="mono">${run.replays == null ? "—" : run.replays}</dd>
+        ${run.failed_task ? `<dt>失败于</dt><dd class="mono">${esc(run.failed_task)}</dd>` : ""}
+        ${run.error ? `<dt>错误</dt><dd><span class="err">${esc(run.error)}</span></dd>` : ""}
+      </dl>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><span>任务</span><span>${tasks.length} 个</span></div>
+      <div class="scroller">
+        ${tasks.length ? `<table>
+          <thead><tr>
+            <th>Task</th><th>状态</th><th>重试</th><th>开始</th><th>耗时</th><th></th><th>错误</th>
+          </tr></thead>
+          <tbody>${taskRows}</tbody>
+        </table>` : `<div class="empty">这次调用还没有任何任务状态。</div>`}
+      </div>
+    </div>
+
+    ${Object.keys(meta.user || {}).length ? `<div class="panel">
+      <div class="panel-head"><span>Metadata</span></div>
+      <dl class="kv">${kvRows(meta.user)}</dl>
+    </div>` : ""}
+
+    ${Object.keys(meta.cached || {}).length ? `<div class="panel">
+      <div class="panel-head"><span>缓存结果</span><span>Memo / Array / Async</span></div>
+      <dl class="kv">${kvRows(meta.cached)}</dl>
+    </div>` : ""}`;
+
+  scheduleRefresh(!!run.running);
+}
+
+// ---------- 路由 ----------
+
+function scheduleRefresh(active) {
+  if (timer) { clearTimeout(timer); timer = null; }
+  if (!active) { setRefresh("已结束，停止自动刷新"); return; }
+  setRefresh("每 3 秒自动刷新");
+  timer = setTimeout(route, 3000);
+}
+
+function route() {
+  const hash = location.hash || "#/";
+  const m = hash.match(/^#\/run\/([^?]+)/);
+  if (m) renderDetail(decodeURIComponent(m[1]));
+  else renderList();
+}
+
+window.addEventListener("hashchange", route);
+route();
+</script>
+</body>
+</html>

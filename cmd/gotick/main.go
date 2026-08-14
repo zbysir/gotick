@@ -8,9 +8,11 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"sort"
 	"strings"
@@ -20,6 +22,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/zbysir/gotick"
 	"github.com/zbysir/gotick/store"
+	"github.com/zbysir/gotick/ui"
 )
 
 const defaultRedisURL = "redis://localhost:6379/0"
@@ -40,6 +43,8 @@ func run(args []string) error {
 	switch args[0] {
 	case "inspect":
 		return inspect(args[1:])
+	case "ui":
+		return serveUI(args[1:])
 	case "-h", "--help", "help":
 		usage()
 		return nil
@@ -53,12 +58,47 @@ func usage() {
 	fmt.Fprint(os.Stderr, `gotick — inspect gotick workflow state in Redis
 
 Usage:
-  gotick inspect [-redis URL] <callId>
+  gotick inspect [-redis URL] <callId>   Print one run's task state
+  gotick ui [-redis URL] [-addr ADDR]    Serve the web inspector
 
 Flags:
   -redis URL   Redis connection URL (default `+defaultRedisURL+`)
                Also read from the REDIS_URL environment variable.
+  -addr ADDR   Address for the web inspector (default `+defaultUIAddr+`)
+
+The inspector reads Redis directly. It does not need to reach your
+workers, and nothing has to be deployed to use it.
 `)
+}
+
+const defaultUIAddr = "127.0.0.1:8088"
+
+func serveUI(args []string) error {
+	fs := flag.NewFlagSet("ui", flag.ContinueOnError)
+	redisURL := fs.String("redis", envOr("REDIS_URL", defaultRedisURL), "Redis connection URL")
+	addr := fs.String("addr", envOr("GOTICK_UI_ADDR", defaultUIAddr), "listen address")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	opt, err := redis.ParseURL(*redisURL)
+	if err != nil {
+		return fmt.Errorf("parse -redis %q: %w", *redisURL, err)
+	}
+	rdb := redis.NewClient(opt)
+	defer rdb.Close()
+
+	if err := rdb.Ping(context.Background()).Err(); err != nil {
+		return fmt.Errorf("connect to %s: %w", *redisURL, err)
+	}
+
+	h, err := ui.NewHandler(ui.Options{Store: store.NewRedisStore(rdb)})
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(os.Stderr, "gotick inspector on http://%s (redis: %s)\n", *addr, *redisURL)
+	return http.ListenAndServe(*addr, h)
 }
 
 func inspect(args []string) error {

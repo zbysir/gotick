@@ -106,8 +106,48 @@ flow 函数本身只负责编排。
 
 ## 排查问题
 
-流程卡住了想知道它停在哪一步，用 `gotick inspect`。它直接读 Redis，
-不需要连上正在运行的 worker，也不需要部署任何东西：
+### Web 界面
+
+`gotick/ui` 提供一个内嵌的界面：实例列表、每个 task 的状态 / 耗时 / 重试 / 错误、metadata
+和框架缓存的结果。它是一个普通的 `http.Handler`，**不需要部署任何服务**，
+因为数据源是 Redis 而不是进程——UI 不必和正在跑的 worker 待在一起。
+
+三种用法：
+
+```go
+// 一、挂到你已有的 mux 上（最常见，零新增端口）
+h, _ := ui.NewHandler(ui.Options{
+    RootPath: "/_gotick",
+    Store:    store.NewRedisStore(rdb),
+    Auth:     myAuthMiddleware, // 界面能看到所有 metadata，务必自己加鉴权
+})
+mux.Handle("/_gotick/", h)
+
+// 二、进程里没有 HTTP 服务时，让它自己起一个端口（类比 net/http/pprof）
+go ui.ListenAndServe("127.0.0.1:6060", ui.Options{Store: store.NewRedisStore(rdb)})
+```
+
+```
+# 三、完全独立运行，什么都不用改，用完关掉
+$ go run github.com/zbysir/gotick/cmd/gotick@latest ui -redis redis://localhost:6379/0
+gotick inspector on http://127.0.0.1:8088
+```
+
+UI 放在独立子包里，所以**不 import 它的人二进制不会变大**——实测 0 字节增长，
+import 之后增加约 616 KB。
+
+想快速看看效果：
+
+```
+docker run -d -p 6379:6379 redis:7-alpine
+go run ./example/uidemo                 # 触发几个成功/失败/重试/并行的流程
+go run ./cmd/gotick ui                  # 另开一个终端
+```
+
+### 命令行
+
+只想看一个实例停在哪一步，用 `gotick inspect`。它同样直接读 Redis，
+不需要连上正在运行的 worker：
 
 ```
 $ go install github.com/zbysir/gotick/cmd/gotick@latest
