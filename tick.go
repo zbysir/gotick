@@ -333,6 +333,10 @@ const defaultAsyncMaxRetry = 5
 // waitRecheckDelay 是没有明确重试时间时，下一次回来查看的间隔。
 const waitRecheckDelay = time.Second
 
+// sleepSpinTolerance 是 Sleep 允许就地等待的最大剩余时长。
+// 超过它才值得重新入队，让出这个 worker。
+const sleepSpinTolerance = time.Second
+
 // Wait 执行并等待所有 future 完成。
 // parallel 限制同时执行的任务数，<=0 表示不限制。
 func Wait(ctx *Context, parallel int, fs ...Future) {
@@ -739,7 +743,21 @@ func Sleep(c *Context, key string, duration time.Duration) {
 	}
 
 	if s.Status == TaskStatusSleep {
-		if d := time.Until(s.RunAt); d > 0 {
+		d := time.Until(s.RunAt)
+
+		// 唤醒事件可能比预定时刻早到一点点（实测毫秒级）。
+		// 为这点差距再走一轮消息队列非常不划算：重新入队之后要等队列把它
+		// 从「已排期」搬回「待执行」，那是秒级的开销。于是一个 30 分钟的 Sleep
+		// 会变成 30 分零几秒，并且白白多出一次重放。
+		//
+		// 差得不多就地等一下，比绕一圈便宜得多。这段等待期间持有着重放租约，
+		// 所以上限必须很小；进程在这期间挂掉也没有任何损失——重放会重做。
+		if d > 0 && d <= sleepSpinTolerance {
+			time.Sleep(d)
+			d = 0
+		}
+
+		if d > 0 {
 			panic(BreakSleep(key, d))
 		}
 

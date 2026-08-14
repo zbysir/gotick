@@ -551,3 +551,46 @@ func TestMakeSleepKeepsItsStartingPoint(t *testing.T) {
 	assert.True(t, afterRetry.StartedAt.After(first.StartedAt),
 		"从其他状态进入 sleep 应该重新开始计时")
 }
+
+// TestSleepSpinsThroughTinyRemainders 覆盖「快到点了就地等，不要再绕一圈队列」。
+//
+// 唤醒事件常常比预定时刻早到几十到几百毫秒。早期实现遇到这种情况会用剩余时长
+// 重新 BreakSleep，而重新入队要等消息队列把任务从「已排期」搬回「待执行」，
+// 实测是 5 秒级的开销——于是每个 Sleep 都白白多花 5 秒、多一次重放。
+func TestSleepSpinsThroughTinyRemainders(t *testing.T) {
+	ctx := newTestContext()
+
+	// 只差一点点就到点：应该就地等完，把 task 标记为 done，不再中断
+	almost := time.Now().Add(60 * time.Millisecond)
+	require.NoError(t, ctx.store.SetNodeStatus("nap", TaskStatus{
+		Status: TaskStatusSleep,
+		RunAt:  almost,
+	}))
+
+	start := time.Now()
+	bp := catchBreak(t, func() { Sleep(ctx, "nap", time.Hour) })
+	elapsed := time.Since(start)
+
+	assert.Nil(t, bp, "只差几十毫秒时不该再中断一次，绕队列比就地等贵得多")
+	assert.GreaterOrEqual(t, elapsed, 50*time.Millisecond, "但也必须真的等满")
+
+	got, _, err := ctx.store.GetNodeStatus("nap")
+	require.NoError(t, err)
+	assert.Equal(t, TaskStatusDone, got.Status)
+}
+
+func TestSleepYieldsForLongRemainders(t *testing.T) {
+	ctx := newTestContext()
+
+	require.NoError(t, ctx.store.SetNodeStatus("nap", TaskStatus{
+		Status: TaskStatusSleep,
+		RunAt:  time.Now().Add(time.Hour),
+	}))
+
+	start := time.Now()
+	bp := catchBreak(t, func() { Sleep(ctx, "nap", time.Hour) })
+
+	require.NotNil(t, bp, "还早得很就必须让出 worker，不能占着它干等")
+	assert.IsType(t, &breakSleep{}, bp)
+	assert.Less(t, time.Since(start), sleepSpinTolerance, "让出应该是立刻的")
+}
