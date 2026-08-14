@@ -1119,7 +1119,24 @@ type Event struct {
 	CallId       string
 	Critical     bool
 	InitMetaData MetaData // 只有当第一次调度时有效
+
+	// Bounces 这个事件被转投了多少次。
+	//
+	// 所有 flow 共用队列，所以事件可能落到没有注册这个 flow 的 worker 上。
+	// 那时它会被原样重新投递，直到落对地方。计数用来兜底：
+	// 如果整个集群里根本没人注册这个 flow，不能无限转投下去。
+	Bounces int `json:"bounces,omitempty"`
 }
+
+// maxEventBounces 一个事件最多被转投多少次。
+//
+// 正常部署（所有 worker 注册同一组 flow）一次都不会用到。
+// 需要用到时通常是滚动发布，命中率至少一半，几次之内就收敛。
+// 用满这个数说明整个集群里没人认识这个 flow。
+const maxEventBounces = 50
+
+// bounceDelay 转投的间隔。够短所以收敛快，又不至于在没人认领时把 Redis 打满。
+const bounceDelay = 200 * time.Millisecond
 
 type AsyncQueue interface {
 	// Publish 当 uniqueKey 不为空时，后面 Publish 的数据会覆盖前面的数据
@@ -1956,7 +1973,45 @@ func (a *DelayedAsyncQueueProduct) Start(ctx context.Context) (err error) {
 }
 
 func NewAsyncQueueFactory(redis store.DelayedQueue) *DelayedAsyncQueueProduct {
-	return &DelayedAsyncQueueProduct{queue: redis, closeChan: make(chan bool)}
+	p := &DelayedAsyncQueueProduct{queue: redis, closeChan: make(chan bool)}
+
+	// 共用队列的实现会把「收到没注册的 flow」交给这里处理。
+	if h, ok := redis.(interface {
+		SetUnknownTopicHandler(func(ctx context.Context, topic string, data []byte) error)
+	}); ok {
+		h.SetUnknownTopicHandler(p.rerouteEvent)
+	}
+
+	return p
+}
+
+// rerouteEvent 把落错 worker 的事件原样重新投递出去。
+//
+// 不能直接 ack —— 那等于把别人的流程吞掉，它再也不会往下走。
+// 也不能靠消息队列的重试去「弹」——那会消耗重试预算，命中率低时
+// 事件会重试耗尽被归档，流程同样永久卡住。
+// 重新投递则是换一个新信封，预算重新开始，只用 Bounces 兜底。
+func (p *DelayedAsyncQueueProduct) rerouteEvent(ctx context.Context, topic string, data []byte) error {
+	var ev Event
+	if err := json.Unmarshal(data, &ev); err != nil {
+		return fmt.Errorf("gotick: cannot decode a misrouted event for flow %q: %w", topic, err)
+	}
+
+	if ev.Bounces >= maxEventBounces {
+		// 转投这么多次还没人认领，说明整个集群里都没有这个 flow。
+		// 返回错误让消息队列按自己的策略重试并最终归档，这样事件不会凭空消失。
+		return fmt.Errorf("gotick: flow %q is not registered anywhere in this queue namespace "+
+			"(gave up after %d attempts); check that unrelated services are not sharing one namespace",
+			topic, ev.Bounces)
+	}
+
+	ev.Bounces++
+	bs, err := json.Marshal(ev)
+	if err != nil {
+		return err
+	}
+
+	return p.queue.Publish(ctx, topic, bs, bounceDelay, store.Option{Critical: ev.Critical})
 }
 
 func (a *DelayedAsyncQueueProduct) New(key string) AsyncQueue {

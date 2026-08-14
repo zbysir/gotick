@@ -69,6 +69,21 @@ type Asynq struct {
 	started  bool
 	// warned 记录已经报过警的 flow，避免刷屏。
 	warned map[string]bool
+
+	// onUnknownTopic 收到没有注册的 topic 时调用。
+	// 返回 nil 表示调用方已经接管（本条会被 ack），返回错误则走正常重试。
+	onUnknownTopic func(ctx context.Context, topic string, data []byte) error
+}
+
+// SetUnknownTopicHandler 设置「收到没注册的 flow」时的处理方式。
+//
+// 默认行为是返回错误让消息队列重投，但那会消耗重试预算：
+// 命中率低的时候（比如两个不相干的服务共用了命名空间）事件会重试耗尽后被归档，
+// 流程就永久卡住了。上层用这个钩子改成「换个信封重新投递」，不吃重试预算。
+func (a *Asynq) SetUnknownTopicHandler(h func(ctx context.Context, topic string, data []byte) error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.onUnknownTopic = h
 }
 
 func (a *Asynq) queue() string {
@@ -137,19 +152,26 @@ func (a *Asynq) Start(ctx context.Context) error {
 	err := srv.Start(asynq.HandlerFunc(func(ctx context.Context, task *asynq.Task) error {
 		a.mu.RLock()
 		handlers := a.callback[task.Type()]
+		onUnknown := a.onUnknownTopic
 		a.mu.RUnlock()
 
 		if len(handlers) == 0 {
+			a.warnUnknownFlow(task.Type())
+
+			// 交给上层重新投递。这样不消耗重试预算——
+			// 靠 asynq 的重试来「弹」到正确的 worker，在命中率低时
+			// 会重试耗尽然后归档，把事件彻底丢掉。
+			if onUnknown != nil {
+				return onUnknown(ctx, task.Type(), task.Payload())
+			}
+
 			// 共用队列意味着这个 worker 会收到它没有注册的 flow 的事件。
 			//
 			// 必须返回错误而不是默默 ack：ack 等于把别人的事件吞掉，
 			// 那个流程就再也不会往下走了。返回错误会让它被快速重投，
 			// 落到真正注册了这个 flow 的 worker 上。
 			//
-			// 滚动发布期间新旧 worker 混跑会短暂走到这里。如果一直重试到归档，
-			// 说明整个集群里没人注册这个 flow——通常是两个不相干的服务
-			// 共用了同一个队列命名空间。
-			a.warnUnknownFlow(task.Type())
+			// 没有钩子时退回到「报错重投」。
 			return fmt.Errorf("%w: %q", ErrUnknownFlow, task.Type())
 		}
 
@@ -222,9 +244,9 @@ func (a *Asynq) warnUnknownFlow(topic string) {
 		return
 	}
 	a.warned[topic] = true
-	log.Printf("[gotick] received an event for flow %q which is not registered on this worker; "+
-		"it will be retried elsewhere. If no worker in the cluster registers it, the event will be "+
-		"archived — check that unrelated services are not sharing one queue namespace.", topic)
+	log.Printf("[gotick] flow %q is not registered on this worker; its events are being handed to "+
+		"another worker. If this keeps happening, check that unrelated services are not sharing "+
+		"the same queue namespace.", topic)
 }
 
 var _ DelayedQueue = (*Asynq)(nil)
