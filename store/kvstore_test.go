@@ -309,3 +309,64 @@ func TestHSetCASIsAtomic(t *testing.T) {
 		})
 	}
 }
+
+// TestZSetOperations 覆盖有序集合，run 列表靠它按时间倒序分页。
+func TestZSetOperations(t *testing.T) {
+	ctx := context.Background()
+
+	impls := map[string]KVStore{
+		"redis": newTestRedisStore(t),
+		"mock":  NewMockKvStore(),
+	}
+
+	for name, s := range impls {
+		t.Run(name, func(t *testing.T) {
+			require.NoError(t, s.ZAdd(ctx, "runs", "a", 100))
+			require.NoError(t, s.ZAdd(ctx, "runs", "b", 300))
+			require.NoError(t, s.ZAdd(ctx, "runs", "c", 200))
+
+			n, err := s.ZCard(ctx, "runs")
+			require.NoError(t, err)
+			assert.Equal(t, int64(3), n)
+
+			// score 从大到小
+			got, err := s.ZRevRange(ctx, "runs", 0, 10)
+			require.NoError(t, err)
+			require.Len(t, got, 3)
+			assert.Equal(t, []string{"b", "c", "a"},
+				[]string{got[0].Member, got[1].Member, got[2].Member})
+			assert.Equal(t, float64(300), got[0].Score)
+
+			// 分页
+			page, err := s.ZRevRange(ctx, "runs", 1, 1)
+			require.NoError(t, err)
+			require.Len(t, page, 1)
+			assert.Equal(t, "c", page[0].Member)
+
+			// 重复 ZAdd 是更新 score，不是新增成员
+			require.NoError(t, s.ZAdd(ctx, "runs", "a", 400))
+			n, err = s.ZCard(ctx, "runs")
+			require.NoError(t, err)
+			assert.Equal(t, int64(3), n)
+
+			got, err = s.ZRevRange(ctx, "runs", 0, 1)
+			require.NoError(t, err)
+			require.Len(t, got, 1)
+			assert.Equal(t, "a", got[0].Member, "re-adding must update the score in place")
+
+			// 裁剪
+			removed, err := s.ZRemBelow(ctx, "runs", 250)
+			require.NoError(t, err)
+			assert.Equal(t, int64(1), removed, "only the member scored 200 is below 250")
+
+			n, err = s.ZCard(ctx, "runs")
+			require.NoError(t, err)
+			assert.Equal(t, int64(2), n)
+
+			// 空集合不该报错
+			empty, err := s.ZRevRange(ctx, "nothing-here", 0, 10)
+			require.NoError(t, err)
+			assert.Empty(t, empty)
+		})
+	}
+}

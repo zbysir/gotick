@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -35,6 +36,23 @@ type KVStore interface {
 
 	// Expire 给一个已存在的 key 设置过期时间，用于回收已经结束的 flow 数据。
 	Expire(ctx context.Context, key string, ttl time.Duration) error
+
+	// 有序集合，用于按时间倒序索引 flow 的运行实例。
+
+	// ZAdd 写入或更新一个成员的 score。
+	ZAdd(ctx context.Context, key string, member string, score float64) error
+	// ZRevRange 按 score 从大到小返回一段成员。
+	ZRevRange(ctx context.Context, key string, offset, count int64) ([]ZMember, error)
+	// ZCard 返回成员数量。
+	ZCard(ctx context.Context, key string) (int64, error)
+	// ZRemBelow 删除 score 小于 max 的成员，返回删除数量，用于裁剪过期索引。
+	ZRemBelow(ctx context.Context, key string, max float64) (int64, error)
+}
+
+// ZMember 是有序集合里的一个成员。
+type ZMember struct {
+	Member string
+	Score  float64
 }
 
 var _ KVStore = (*WithPrefix)(nil)
@@ -86,6 +104,22 @@ func (w *WithPrefix) DeleteIf(ctx context.Context, key string, expect string) (b
 
 func (w *WithPrefix) Expire(ctx context.Context, key string, ttl time.Duration) error {
 	return w.store.Expire(ctx, w.prefix+key, ttl)
+}
+
+func (w *WithPrefix) ZAdd(ctx context.Context, key string, member string, score float64) error {
+	return w.store.ZAdd(ctx, w.prefix+key, member, score)
+}
+
+func (w *WithPrefix) ZRevRange(ctx context.Context, key string, offset, count int64) ([]ZMember, error) {
+	return w.store.ZRevRange(ctx, w.prefix+key, offset, count)
+}
+
+func (w *WithPrefix) ZCard(ctx context.Context, key string) (int64, error) {
+	return w.store.ZCard(ctx, w.prefix+key)
+}
+
+func (w *WithPrefix) ZRemBelow(ctx context.Context, key string, max float64) (int64, error) {
+	return w.store.ZRemBelow(ctx, w.prefix+key, max)
 }
 
 func NewWithPrefix(prefix string, store KVStore) *WithPrefix {
@@ -238,6 +272,39 @@ func (r *RedisStore) ExpireIf(ctx context.Context, key string, expect string, tt
 
 func (r *RedisStore) Expire(ctx context.Context, key string, ttl time.Duration) error {
 	return r.redis.Expire(ctx, key, ttl).Err()
+}
+
+func (r *RedisStore) ZAdd(ctx context.Context, key string, member string, score float64) error {
+	return r.redis.ZAdd(ctx, key, redis.Z{Score: score, Member: member}).Err()
+}
+
+func (r *RedisStore) ZRevRange(ctx context.Context, key string, offset, count int64) ([]ZMember, error) {
+	if count <= 0 {
+		return nil, nil
+	}
+
+	res, err := r.redis.ZRevRangeWithScores(ctx, key, offset, offset+count-1).Result()
+	if err != nil {
+		if redis.Nil == err {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	out := make([]ZMember, 0, len(res))
+	for _, z := range res {
+		m, _ := z.Member.(string)
+		out = append(out, ZMember{Member: m, Score: z.Score})
+	}
+	return out, nil
+}
+
+func (r *RedisStore) ZCard(ctx context.Context, key string) (int64, error) {
+	return r.redis.ZCard(ctx, key).Result()
+}
+
+func (r *RedisStore) ZRemBelow(ctx context.Context, key string, max float64) (int64, error) {
+	return r.redis.ZRemRangeByScore(ctx, key, "-inf", fmt.Sprintf("(%f", max)).Result()
 }
 
 func (r *RedisStore) DeleteIf(ctx context.Context, key string, expect string) (bool, error) {

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"sort"
 	"sync"
 	"time"
 )
@@ -18,6 +19,7 @@ type MockKvStore struct {
 	m     map[string]lifeValue
 	hm    map[string]map[string][]byte
 	hLive map[string]time.Time // hash 表的过期时间，零值表示不过期
+	zs    map[string]map[string]float64
 }
 
 type lifeValue struct {
@@ -34,6 +36,7 @@ func NewMockKvStore() *MockKvStore {
 		m:     map[string]lifeValue{},
 		hm:    map[string]map[string][]byte{},
 		hLive: map[string]time.Time{},
+		zs:    map[string]map[string]float64{},
 	}
 }
 
@@ -217,7 +220,71 @@ func (m *MockKvStore) Delete(ctx context.Context, key string) error {
 	delete(m.m, key)
 	delete(m.hm, key)
 	delete(m.hLive, key)
+	delete(m.zs, key)
 	return nil
+}
+
+func (m *MockKvStore) ZAdd(ctx context.Context, key string, member string, score float64) error {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	if m.zs[key] == nil {
+		m.zs[key] = map[string]float64{}
+	}
+	m.zs[key][member] = score
+	return nil
+}
+
+func (m *MockKvStore) ZRevRange(ctx context.Context, key string, offset, count int64) ([]ZMember, error) {
+	if count <= 0 {
+		return nil, nil
+	}
+
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	all := make([]ZMember, 0, len(m.zs[key]))
+	for member, score := range m.zs[key] {
+		all = append(all, ZMember{Member: member, Score: score})
+	}
+
+	// score 从大到小；score 相同时按成员名排序，保证结果稳定
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].Score != all[j].Score {
+			return all[i].Score > all[j].Score
+		}
+		return all[i].Member < all[j].Member
+	})
+
+	if offset >= int64(len(all)) {
+		return nil, nil
+	}
+	end := offset + count
+	if end > int64(len(all)) {
+		end = int64(len(all))
+	}
+	return all[offset:end], nil
+}
+
+func (m *MockKvStore) ZCard(ctx context.Context, key string) (int64, error) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	return int64(len(m.zs[key])), nil
+}
+
+func (m *MockKvStore) ZRemBelow(ctx context.Context, key string, max float64) (int64, error) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	var removed int64
+	for member, score := range m.zs[key] {
+		if score < max {
+			delete(m.zs[key], member)
+			removed++
+		}
+	}
+	return removed, nil
 }
 
 // hashExpired 调用方必须已经持有锁。
