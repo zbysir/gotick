@@ -153,15 +153,15 @@ func Sequence(ctx *Context, key string, maxLen int) SequenceWrap {
 type FutureT[T interface{}] struct {
 	Val T
 	k   string
-	fun func() (T, error)
+	fun func(retry int) (T, error)
 }
 
 func (f *FutureT[T]) Value() T {
 	return f.Val
 }
 
-func (f *FutureT[T]) exec() (interface{}, error) {
-	t, err := f.fun()
+func (f *FutureT[T]) exec(retry int) (interface{}, error) {
+	t, err := f.fun(retry)
 	if err != nil {
 		return t, err
 	}
@@ -176,26 +176,17 @@ func (f *FutureT[T]) key() string {
 }
 
 type Future interface {
-	exec() (interface{}, error)
+	exec(retry int) (interface{}, error)
 	key() string
 }
 
-type AsyncTask struct {
-}
-
-func (a *AsyncTask) Done() bool {
-	return true
-}
-
-func (a *AsyncTask) Exec() bool {
-	return true
-}
 func AsyncArray[T interface{}, A interface{}](ctx *Context, key string, arr []ArrayWrap[A], f func(ctx *TaskContext, a A, index int) (T, error)) []Future {
 	var fs []Future
 
 	for index, t := range arr {
 		// 注意闭包问题
 		t := t
+		index := index
 		fs = append(fs, Async(ctx, t.Key(key), func(ctx *TaskContext) (T, error) {
 			return f(ctx, t.Val, index)
 		}))
@@ -204,282 +195,261 @@ func AsyncArray[T interface{}, A interface{}](ctx *Context, key string, arr []Ar
 	return fs
 }
 
+// Async 声明一个异步任务，需要配合 Wait 才会真正执行。
+//
+// 这里只读取已经缓存的结果，不查任务状态：任务是否已完成、能不能执行，
+// 由 Wait 一次性读全量状态来判断，避免每个 future 各查一次 Redis。
 func Async[T interface{}](ctx *Context, key string, f func(ctx *TaskContext) (T, error)) *FutureT[T] {
-	s, exist, _ := ctx.store.GetNodeStatus(key)
-	if exist {
-		// 有任务正在运行中，跳过执行
-		t, _, _ := GetFromStore[T](ctx.store, key)
-		return &FutureT[T]{
-			Val: t,
-			k:   key,
-			fun: func() (T, error) {
-				return f(newTaskContext(ctx, s))
-			},
-		}
+	val, _, err := GetFromStore[T](ctx.store, key)
+	if err != nil {
+		// 读失败绝不能当作「没有缓存」，否则已完成的任务会被重新执行一遍。
+		panic(BreakWait(time.Second))
 	}
 
-	future := FutureT[T]{
-		k: key,
-		fun: func() (T, error) {
-			return f(newTaskContext(ctx, s))
+	return &FutureT[T]{
+		Val: val,
+		k:   key,
+		fun: func(retry int) (T, error) {
+			return f(&TaskContext{Context: ctx, Retry: retry})
 		},
 	}
-
-	return &future
 }
 
 type ParallelOption struct {
-	Parallel           int // 如果不设置，则不并发。
-	BatchSizePerRunner int // 如果不设置，则会在这个 runner 上运行完所有 Future
+	// Parallel 本次调度里最多同时执行多少个任务，<=0 表示不限制。
+	Parallel int
+	// BatchSizePerRunner 本次调度最多认领多少个任务，达到后把剩下的留给其他节点。
+	// <=0 表示把当前所有可执行的任务都认领下来。
+	BatchSizePerRunner int
 }
 
-// WaitFast 等待所有任务完成。
-// 如果是不是快速模式，每个 task 都会被重新调度到任何一台 runner 上，并且会有一些延迟（任务队列的最低延迟）。
-// 如果是快速模式，那么在一个 runner 上会执行多次，直到达到 BatchSizePerRunner 才会让出任务。
-// 例如 BatchSizePerRunner = 10，那么每完成 10 个任务就会重新调度一次（可能会调度到其他 runner 上）。
-func WaitFast(ctx *Context, opt ParallelOption, fs ...Future) {
-	// log.Printf("[gotick] WaitFast start, opt: %v", opt)
-	runCount := int64(0)
-	wg := sync.WaitGroup{}
+// defaultAsyncMaxRetry 是 Async 任务的重试上限。
+//
+// TODO: 让 Async / AsyncArray 也接受 TaskOption，和 Task / Array 用同一套配置。
+// 现在用户对 Async 任务设置 WithMaxRetry 是完全无效的。
+const defaultAsyncMaxRetry = 5
 
-	var maxParallelChan chan struct{}
-	if opt.Parallel > 0 {
-		maxParallelChan = make(chan struct{}, opt.Parallel)
+// waitRecheckDelay 是没有明确重试时间时，下一次回来查看的间隔。
+const waitRecheckDelay = time.Second
+
+// Wait 执行并等待所有 future 完成。
+// parallel 限制同时执行的任务数，<=0 表示不限制。
+func Wait(ctx *Context, parallel int, fs ...Future) {
+	waitAll(ctx, ParallelOption{Parallel: parallel}, fs)
+}
+
+// WaitFast 和 Wait 的区别只在于可以用 BatchSizePerRunner 限制单个节点一次认领多少任务。
+//
+// Deprecated: 直接用 Wait，或者用 WaitWithOption 表达同样的意图。
+func WaitFast(ctx *Context, opt ParallelOption, fs ...Future) {
+	waitAll(ctx, opt, fs)
+}
+
+// WaitWithOption 是 Wait 的完整版本。
+func WaitWithOption(ctx *Context, opt ParallelOption, fs ...Future) {
+	waitAll(ctx, opt, fs)
+}
+
+// waitAll 是 Wait / WaitFast 的共同实现。
+//
+// 每次重放都会：一次性读回所有任务状态 → 判断谁完成了、谁失败了、谁现在可以跑 →
+// 原子地认领可跑的任务并执行 → 如果还有没完成的，就中断等待下一次调度。
+func waitAll(ctx *Context, opt ParallelOption, fs []Future) {
+	if len(fs) == 0 {
+		return
 	}
 
-	doneCount := int64(0)
+	// 一次 HGETALL 拿回全部状态。
+	// 旧实现是每个 future 各查一次，N 个任务的 flow 调度 N 次就是 N² 次 Redis 读。
+	all, err := ctx.store.GetAllNodeStatus()
+	if err != nil {
+		// 读不到状态时不能假设任务不存在，否则会重复执行已完成的任务。
+		panic(BreakWait(waitRecheckDelay))
+	}
+
+	now := time.Now()
+
+	var (
+		pending  []Future  // 还没有结论的
+		runnable []Future  // 现在就可以执行的
+		nextRun  time.Time // 最早一个可以重试的时间
+	)
 
 	for _, f := range fs {
-		s, exist, _ := ctx.store.GetNodeStatus(f.key())
-		// 这里的 for 循环会导致过多的判断，也就是每次调度，都会再次判断之前所有的任务状态，也许可以优化？
+		s, exist := all[f.key()]
 
 		if exist {
-			// 有任务正在运行中，跳过执行
 			switch s.Status {
-			case "done":
-				// 任务正在其他节点上（包括自己）执行，跳过而执行后面的任务
-				atomic.AddInt64(&doneCount, 1)
+			case TaskStatusDone:
 				continue
-			case "fail":
-				// 如果有一个任务失败了，则算整个失败。
-				panic(BreakFail(f.key(), fmt.Errorf("task %v, error %v: ", s.Key, strings.Join(s.Errs, ";"))))
-			}
-
-			if s.Status == "retry" {
-				// 如果一个任务是 retry 状态，则需要重新执行
-			} else {
-				continue
+			case TaskStatusFail:
+				panic(BreakFail(f.key(), fmt.Errorf("task %v failed after %d attempts: %v",
+					f.key(), s.RetryCount, strings.Join(s.Errs, "; "))))
+			case TaskStatusAbort:
+				panic(BreakAbort(f.key(), fmt.Errorf("task %v aborted", f.key())))
 			}
 		}
 
-		// 如果任务没有状态，或则到了应该执行的时间，就需要执行
-		if !(s.RunAt.IsZero() || s.RunAt.Before(time.Now())) {
+		pending = append(pending, f)
+
+		if s.Runnable(now, exist) {
+			runnable = append(runnable, f)
+			continue
+		}
+		// 还没到重试时间的，记下来好算等待多久
+		if exist && !s.RunAt.IsZero() && s.RunAt.After(now) {
+			if nextRun.IsZero() || s.RunAt.Before(nextRun) {
+				nextRun = s.RunAt
+			}
+		}
+	}
+
+	if len(pending) == 0 {
+		return
+	}
+
+	if opt.BatchSizePerRunner > 0 && len(runnable) > opt.BatchSizePerRunner {
+		runnable = runnable[:opt.BatchSizePerRunner]
+	}
+
+	succeeded := runFutures(ctx, opt.Parallel, runnable)
+
+	// 本次就把剩下的都做完了，不用再调度一轮，直接往下走。
+	if succeeded == len(pending) {
+		return
+	}
+
+	panic(BreakWait(waitDelay(nextRun, time.Now())))
+}
+
+// waitDelay 计算下次回来查看的间隔。
+//
+// 旧实现在重试退避期间用 BreakWait(0) 空转，以任务队列的最小间隔疯狂重放并狂刷 Redis。
+func waitDelay(nextRun time.Time, now time.Time) time.Duration {
+	if nextRun.IsZero() {
+		return waitRecheckDelay
+	}
+	if d := nextRun.Sub(now); d > 0 {
+		return d
+	}
+	return 0
+}
+
+// runFutures 认领并执行给定的任务，返回真正成功完成的数量。
+func runFutures(ctx *Context, parallel int, fs []Future) int {
+	if len(fs) == 0 {
+		return 0
+	}
+
+	var (
+		wg        sync.WaitGroup
+		succeeded int64
+		sem       chan struct{}
+	)
+	if parallel > 0 {
+		sem = make(chan struct{}, parallel)
+	}
+
+	for _, f := range fs {
+		f := f
+
+		// 原子地抢执行权。抢不到说明别的节点正在跑它，或者它刚刚有了结论。
+		//
+		// 旧实现是「读状态 → 写 running（忽略错误）→ 起 goroutine」，
+		// 写失败或两个节点同时读到可执行状态时，同一个任务会在两处同时执行。
+		status, claimed, err := claimTask(ctx.store, f.key(), time.Now())
+		if err != nil || !claimed {
 			continue
 		}
 
-		if maxParallelChan != nil {
-			// 并发满了，则阻塞直到其他任务做完
-			maxParallelChan <- struct{}{}
+		if sem != nil {
+			sem <- struct{}{}
 		}
-
 		wg.Add(1)
-		go func(future Future, s TaskStatus) {
-			defer func() {
-				wg.Done()
-				atomic.AddInt64(&doneCount, 1)
-
-				if maxParallelChan != nil {
-					<-maxParallelChan
-				}
-			}()
-			errorc := make(chan error)
-			datac := make(chan interface{})
-
-			responseChan := make(chan struct{})
-
-			// 启动心跳
-			go func() {
-				defer close(responseChan)
-				for {
-					select {
-					case e := <-errorc:
-						// 不重新调度，而是等待 BreakWait 自循环。
-						// 重新调度将面临并发问题：
-						// 多次任务同时执行成功，将并发调用，可能会导致 task 并发调用出错（状态检查），最好不要并发调度，否则需要加锁导致逻辑复杂。
-						if s.RetryCount > 5 {
-							_ = ctx.store.SetNodeStatus(future.key(), s.MakeFail(e))
-						} else {
-							_ = ctx.store.SetNodeStatus(future.key(), s.MakeRetry(e))
-
-							//log.Printf("step MakeRetry")
-						}
-						return
-					case data := <-datac:
-						_ = SetToStore(ctx.store, future.key(), data)
-						_ = ctx.store.SetNodeStatus(future.key(), s.MakeDone())
-
-						// log.Printf("[gotick] task done: %v", future.key())
-						return
-					case <-time.After(3 * time.Second):
-						// 心跳续期
-						_ = ctx.store.SetNodeStatus(future.key(), s.MakeRunning(), 6*time.Second)
-					}
-				}
-
-			}()
-
-			// log.Printf("[gotick] task running: %v, runCount: %v", future.key(), runCount)
-
-			t, err := future.exec()
-			if err != nil {
-				errorc <- err
-			} else {
-				datac <- t
+		go func(epoch int64, retry int) {
+			defer wg.Done()
+			if sem != nil {
+				defer func() { <-sem }()
 			}
-
-			<-responseChan // 等待后台的心跳任务完成
-
-		}(f, s)
-
-		// 如果达到了最大运行数，则跳出循环
-		if opt.BatchSizePerRunner > 0 {
-			if atomic.AddInt64(&runCount, 1) >= int64(opt.BatchSizePerRunner) {
-				break
+			if runFuture(ctx, f, epoch, retry) {
+				atomic.AddInt64(&succeeded, 1)
 			}
-		}
+		}(status.Epoch, status.RetryCount)
 	}
 
 	wg.Wait()
 
-	// log.Printf("[gotick] WaitFast done, doneCount: %v", doneCount)
-
-	if atomic.LoadInt64(&doneCount) != int64(len(fs)) {
-		//log.Printf("step BreakWait 10")
-		// 如果还有任务没完成，则等待一会进行下一个调度
-		// 在下一个调度中，会再次检查任务状态，同时检查任务心跳，如果任务没有心跳则也会重启任务。
-		// log.Printf("[gotick] task next")
-
-		panic(BreakWait(0))
-	}
-
+	return int(atomic.LoadInt64(&succeeded))
 }
 
-// Wait will wait all future done, if Parallel is not 0, then no limit for parallel.
-// Wait 在大量任务时，会出现明显的延迟，因为每执行完一次
-func Wait(ctx *Context, parallel int, fs ...Future) {
-	allDone := true
-	runCount := 0
+// runFuture 执行单个任务并写回结果，期间持续心跳。返回是否成功完成。
+func runFuture(ctx *Context, f Future, epoch int64, retry int) bool {
+	stopHeartbeat := startHeartbeat(ctx, f.key(), epoch)
 
-	// wg := sync.WaitGroup{}
-	// 获取并并行 parallel 个任务，等这些任务都完成了，才会开始下一个循环
-	// 可能出现短板，运行时间取决于 n 个任务中最长耗时的任务
+	val, execErr := f.exec(retry)
 
-	for _, f := range fs {
-		s, exist, _ := ctx.store.GetNodeStatus(f.key())
-		// 这里的 for 循环会导致过多的判断，也就是每次调度，都会再次判断之前所有的任务状态，也许可以优化？
+	// 先停心跳再写结果，避免续期把刚写好的终态又改回 running。
+	stopHeartbeat()
 
-		if exist {
-			// 有任务正在运行中，跳过执行
-			done := false
-			switch s.Status {
-			case "done":
-				done = true
-			case "fail":
-				// 如果有一个任务失败了，则算整个失败。
-				panic(BreakFail(f.key(), fmt.Errorf("task %v, error %v: ", s.Key, strings.Join(s.Errs, ";"))))
+	if execErr != nil {
+		_, _ = settleTask(ctx.store, f.key(), epoch, func(s TaskStatus) TaskStatus {
+			if s.RetryCount >= defaultAsyncMaxRetry {
+				return s.MakeFail(execErr)
 			}
-
-			if done {
-				continue
-			} else {
-				allDone = false
-			}
-
-			if s.Status == "retry" {
-				// 如果一个任务是 retry 状态，则需要重新执行
-			} else {
-				// 任务正在其他节点上（包括自己）执行，跳过而执行后面的任务
-				runCount++
-				continue
-			}
-		} else {
-			allDone = false
-		}
-
-		// 如果任务是重试状态，或没有状态，就需要执行
-		if (s.RunAt.IsZero() || s.RunAt.Before(time.Now())) && (parallel <= 0 || runCount < parallel) {
-			// 如果是 retry，也改为执行状态，让下次调度跳过这次任务
-			_ = ctx.store.SetNodeStatus(f.key(), s.MakeRunning(), 6*time.Second)
-
-			// 如果没到执行时间，则不执行
-
-			// wg.Add(1)
-
-			// 如果 fastMode 为 true
-			//
-
-			//log.Printf("step Run")
-			go func(future Future, s TaskStatus) {
-				// defer wg.Done()
-
-				errorc := make(chan error)
-				datac := make(chan interface{})
-				go func() {
-					// 启动心跳
-					for {
-						select {
-						case e := <-errorc:
-							// 不重新调度，而是等待 BreakWait 自循环。
-							// 重新调度将面临并发问题：
-							// 多次任务同时执行成功，将并发调用，可能会导致 task 并发调用出错（状态检查），最好不要并发调度，否则需要加锁导致逻辑复杂。
-							if s.RetryCount > 5 {
-								_ = ctx.store.SetNodeStatus(future.key(), s.MakeFail(e))
-							} else {
-								_ = ctx.store.SetNodeStatus(future.key(), s.MakeRetry(e))
-
-								//log.Printf("step MakeRetry")
-							}
-							return
-						case data := <-datac:
-							_ = SetToStore(ctx.store, future.key(), data)
-							_ = ctx.store.SetNodeStatus(future.key(), s.MakeDone())
-
-							// log.Printf("[gotick] task done: %v", future.key())
-							return
-						case <-time.After(3 * time.Second):
-							// 心跳续期
-							_ = ctx.store.SetNodeStatus(future.key(), s.MakeRunning(), 6*time.Second)
-						}
-					}
-				}()
-
-				log.Printf("[gotick] task running: %v, runCount: %v", future.key(), runCount)
-
-				t, err := future.exec()
-				if err != nil {
-					errorc <- err
-				} else {
-					datac <- t
-				}
-			}(f, s)
-
-			// 并行
-			log.Printf("step BreakWait nextCall: %s ", f.key())
-			panic(BreakWait(0))
-		}
+			return s.MakeRetry(execErr)
+		})
+		return false
 	}
 
-	// wg.Wait()
+	// 结果存不下来就不能标记成功，否则下游会读到零值还以为任务成功了。
+	if err := SetToStore(ctx.store, f.key(), val); err != nil {
+		_, _ = settleTask(ctx.store, f.key(), epoch, func(s TaskStatus) TaskStatus {
+			return s.MakeRetry(err)
+		})
+		return false
+	}
 
-	if !allDone {
-		//log.Printf("step BreakWait 10")
-		// 如果还有任务没完成，则等待任务完成
-		// 循环 1 s 调度一次，检查任务状态，同时检查任务心跳，如果任务没有心跳则也会重启任务。
-		log.Printf("[gotick] task next")
+	applied, err := settleTask(ctx.store, f.key(), epoch, func(s TaskStatus) TaskStatus {
+		return s.MakeDone()
+	})
+	if err != nil {
+		return false
+	}
 
-		// 为什么要等待 1s?
-		// 如果所有任务都在后台执行，那么 Wait 方法会快速的执行完成，导致很平凡的调度。
-		panic(BreakWait(time.Second / 1))
+	// applied 为 false 说明执行权已经被别人抢走了，这次的结果不算数。
+	return applied
+}
+
+// startHeartbeat 起一个后台 goroutine 为任务续期，返回停止它的函数。
+// 停止函数会等待 goroutine 真正退出，所以调用后不会再有心跳写入。
+func startHeartbeat(ctx *Context, key string, epoch int64) (stop func()) {
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+
+	go func() {
+		defer close(stopped)
+
+		t := time.NewTicker(heartbeatInterval)
+		defer t.Stop()
+
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				held, err := renewHeartbeat(ctx.store, key, epoch, time.Now())
+				if err == nil && !held {
+					// 执行权已经不在自己手上，再续期只会破坏别人的状态
+					return
+				}
+			}
+		}
+	}()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() { close(done) })
+		<-stopped
 	}
 }
 
@@ -728,27 +698,89 @@ type Set interface {
 	Push(i interface{})
 }
 
+// Task 的状态取值。
+const (
+	TaskStatusRunning = "running" // 正在某个节点上执行
+	TaskStatusDone    = "done"    // 已完成
+	TaskStatusFail    = "fail"    // 超过重试次数，整个 flow 失败
+	TaskStatusAbort   = "abort"   // 被手动终止
+	TaskStatusSleep   = "sleep"   // 等待到 RunAt
+	TaskStatusRetry   = "retry"   // 失败后等待重试
+)
+
+const (
+	// heartbeatInterval 执行中的任务多久向存储续期一次。
+	heartbeatInterval = 3 * time.Second
+
+	// runningTimeout 超过这么久没有心跳，就认为执行它的节点已经死了，任务可以被别人接管。
+	//
+	// 容忍连续丢失 4 次心跳。旧实现是 6s 超时配 3s 心跳，只要有一次超过 3s 的
+	// GC 停顿或 Redis 抖动就会误判死亡，让同一个任务在两个节点上同时执行。
+	runningTimeout = heartbeatInterval * 5
+)
+
 type TaskStatus struct {
-	Key string
-	// fail, 超过重试次数就算失败
-	// abort, 手动终止流程
-	// sleep, 等待中
-	// retry, 重试中
-	// done, 完成
-	// running, 异步任务正在运行
+	// Key 由存储层的 field 名提供，不重复序列化。
+	Key string `json:"-"`
+
 	Status     string    `json:"status"`
-	RunAt      time.Time `json:"run_at"` // sleep 到的时间
-	Errs       []string  `json:"errs"`   // 每次重试都有错误
+	RunAt      time.Time `json:"run_at"` // sleep 到的时间，或下次可以重试的时间
+	Errs       []string  `json:"errs"`   // 每次失败都会追加一条
 	RetryCount int       `json:"retry_count"`
+
+	// Heartbeat 是 running 状态下最近一次续期的时间。
+	//
+	// 判断执行节点是否还活着靠的是它，而不是存储层的 TTL：Redis 的 hash field
+	// 在 7.4 之前根本没有 TTL，旧实现依赖的那个过期从未生效过，
+	// 于是节点崩溃后任务会永远停在 running，flow 永久卡死。
+	Heartbeat time.Time `json:"heartbeat,omitempty"`
+
+	// Epoch 是执行权的代号，每被抢占一次 +1。
+	//
+	// 心跳和写结果时都要带上自己抢到的 epoch，不匹配就说明任务已经被别人接管，
+	// 这次写入必须放弃——否则残留的心跳会把别人写好的 done 覆盖回 running。
+	Epoch int64 `json:"epoch,omitempty"`
+}
+
+// Alive 报告一个 running 状态的任务是否还有活着的执行者。
+func (t TaskStatus) Alive(now time.Time) bool {
+	return t.Status == TaskStatusRunning && !now.After(t.Heartbeat.Add(runningTimeout))
+}
+
+// Settled 报告这个任务是否已经有了最终结论，不该再被执行。
+func (t TaskStatus) Settled() bool {
+	switch t.Status {
+	case TaskStatusDone, TaskStatusFail, TaskStatusAbort:
+		return true
+	}
+	return false
+}
+
+// Runnable 报告现在是否可以（重新）执行这个任务。exist 为 false 表示这个任务还没有任何状态。
+func (t TaskStatus) Runnable(now time.Time, exist bool) bool {
+	if !exist {
+		return true
+	}
+	if t.Settled() {
+		return false
+	}
+	if t.Status == TaskStatusRunning {
+		// 只有执行者失联了才能接管
+		return !t.Alive(now)
+	}
+	// retry / sleep 要等到 RunAt
+	return t.RunAt.IsZero() || !t.RunAt.After(now)
 }
 
 func (t TaskStatus) MakeDone() TaskStatus {
-	t.Status = "done"
+	t.Status = TaskStatusDone
+	t.Heartbeat = time.Time{}
 	return t
 }
 
 func (t TaskStatus) MakeFail(err error) TaskStatus {
-	t.Status = "fail"
+	t.Status = TaskStatusFail
+	t.Heartbeat = time.Time{}
 	t.RetryCount += 1
 	if err != nil {
 		t.Errs = append(t.Errs, err.Error())
@@ -757,38 +789,107 @@ func (t TaskStatus) MakeFail(err error) TaskStatus {
 }
 
 func (t TaskStatus) MakeAbort() TaskStatus {
-	t.Status = "abort"
+	t.Status = TaskStatusAbort
+	t.Heartbeat = time.Time{}
 	return t
 }
 
-func (t TaskStatus) MakeRunning() TaskStatus {
-	t.Status = "running"
+// MakeRunning 续期一个已经属于自己的执行中任务。抢占执行权请用 MakeClaimed。
+func (t TaskStatus) MakeRunning(now time.Time) TaskStatus {
+	t.Status = TaskStatusRunning
+	t.Heartbeat = now
+	return t
+}
+
+// MakeClaimed 抢占执行权：进入 running 并推进 epoch，让之前那次执行的心跳失效。
+func (t TaskStatus) MakeClaimed(now time.Time) TaskStatus {
+	t.Status = TaskStatusRunning
+	t.Heartbeat = now
+	t.Epoch += 1
 	return t
 }
 
 func (t TaskStatus) MakeSleep(runAt time.Time) TaskStatus {
-	t.Status = "sleep"
+	t.Status = TaskStatusSleep
 	t.RunAt = runAt
 	return t
 }
 
 func (t TaskStatus) MakeRetry(err error) TaskStatus {
-	t.Status = "retry"
+	t.Status = TaskStatusRetry
+	t.Heartbeat = time.Time{}
 	t.RetryCount += 1
-	t.Errs = append(t.Errs, err.Error())
+	if err != nil {
+		t.Errs = append(t.Errs, err.Error())
+	}
 	t.RunAt = time.Now().Add(time.Second * time.Duration(t.RetryCount))
 	return t
 }
 
 type NodeStatusStore interface {
-	GetNodeStatus(key string) (TaskStatus, bool, error) // 获取每个 task 的运行状态
-	GetAllNodeStatus() (map[string]TaskStatus, error)   // 获取这次调用中所有 task 的状态，用于 inspect / UI
-	SetNodeStatus(key string, value TaskStatus, ttl ...time.Duration) error
-	UpdateNodeStatus(key string, fu func(status TaskStatus, isNew bool) TaskStatus) (TaskStatus, error)
+	GetNodeStatus(key string) (TaskStatus, bool, error) // 获取单个 task 的运行状态
+	GetAllNodeStatus() (map[string]TaskStatus, error)   // 获取这次调用中所有 task 的状态，用于调度、inspect 和 UI
+	SetNodeStatus(key string, value TaskStatus) error
+
+	// UpdateNodeStatus 原子地更新一个 task 的状态。
+	//
+	// fu 返回 commit=false 表示放弃本次更新。如果期间有别的节点改动了这个 task，
+	// fu 会带着最新状态被重新调用，所以它必须是纯函数、可以被安全地重复执行。
+	UpdateNodeStatus(key string, fu func(status TaskStatus, isNew bool) (next TaskStatus, commit bool)) (TaskStatus, error)
+
 	GetKVAll() (map[string]string, error)
 	SetKV(k string, v string) error
 	GetKV(k string) (string, bool, error)
-	Clear() error // 删除所有数据
+	Clear() error // 删除这次调用的所有数据
+}
+
+// claimTask 原子地抢占一个 task 的执行权。
+//
+// 抢到时返回带着新 epoch 的状态。抢不到说明它已经有结论了，
+// 或者正在别的节点上执行且心跳还活着。
+func claimTask(store NodeStatusStore, key string, now time.Time) (TaskStatus, bool, error) {
+	claimed := false
+	s, err := store.UpdateNodeStatus(key, func(status TaskStatus, isNew bool) (TaskStatus, bool) {
+		if !status.Runnable(now, !isNew) {
+			claimed = false
+			return status, false
+		}
+		claimed = true
+		return status.MakeClaimed(now), true
+	})
+	if err != nil {
+		return s, false, err
+	}
+	return s, claimed, nil
+}
+
+// renewHeartbeat 为执行中的 task 续期。
+//
+// 只有当这个 task 仍然由 epoch 这次执行持有时才会写入，
+// 否则一个已经被判死、任务已被别人完成的节点，其残留心跳会把 done 打回 running。
+func renewHeartbeat(store NodeStatusStore, key string, epoch int64, now time.Time) (held bool, err error) {
+	_, err = store.UpdateNodeStatus(key, func(status TaskStatus, isNew bool) (TaskStatus, bool) {
+		if isNew || status.Epoch != epoch || status.Status != TaskStatusRunning {
+			held = false
+			return status, false
+		}
+		held = true
+		return status.MakeRunning(now), true
+	})
+	return held, err
+}
+
+// settleTask 写入 task 的最终结果，同样要求执行权还在自己手上。
+func settleTask(store NodeStatusStore, key string, epoch int64, apply func(TaskStatus) TaskStatus) (applied bool, err error) {
+	_, err = store.UpdateNodeStatus(key, func(status TaskStatus, isNew bool) (TaskStatus, bool) {
+		if isNew || status.Epoch != epoch {
+			applied = false
+			return status, false
+		}
+		applied = true
+		return apply(status), true
+	})
+	return applied, err
 }
 
 var _ NodeStatusStore = (*KvNodeStatusStore)(nil)
@@ -1029,77 +1130,88 @@ func (s *Scheduler) register(f *Flow) {
 						return
 					}
 				case *breakRetry:
-					// 存储重试次数
 					var newStatus TaskStatus
-					newStatus, err = statusStore.UpdateNodeStatus(breakpoint.Task, func(status TaskStatus, isNew bool) TaskStatus {
-						return status.MakeRetry(breakpoint.Err)
+					newStatus, err = statusStore.UpdateNodeStatus(breakpoint.Task, func(status TaskStatus, isNew bool) (TaskStatus, bool) {
+						return status.MakeRetry(breakpoint.Err), true
 					})
+					if err != nil {
+						// 重试次数落不了盘就不能继续调度：RetryCount 永远涨不上去，
+						// 就永远到不了 MaxRetry，会无限重试下去。
+						// 直接把错误交给消息队列，让它重投这个事件。
+						return
+					}
 
 					if f.onError != nil {
-						err = f.onError(ctx, newStatus)
-						if err != nil {
-							// TODO retry when onError error
-							log.Printf("[gotick error] onFail error: %v", err)
+						if cbErr := f.onError(ctx, newStatus); cbErr != nil {
+							// TODO 支持 onError 回调失败后的重试
+							log.Printf("[gotick] onError callback failed: %v", cbErr)
 						}
 					}
-					// 进入下次调度
+
+					// 进入下次调度。退避时间由 MakeRetry 写在 RunAt 里。
+					// TODO 支持自定义退避算法
 					err = aw.Publish(ctx, Event{
 						CallId:   callId,
 						Critical: true,
-					}, time.Duration(newStatus.RetryCount)*time.Second) // TODO 支持指定算法计算回退时间
+					}, time.Until(newStatus.RunAt))
 					if err != nil {
-						log.Printf("[gotick error] Publish error: %v", err)
+						log.Printf("[gotick] publish retry event failed: %v", err)
+						return
 					}
 				case *breakAbort:
 					var newStatus TaskStatus
-					newStatus, err = statusStore.UpdateNodeStatus(breakpoint.Task, func(status TaskStatus, isNew bool) TaskStatus {
-						return status.MakeAbort()
+					newStatus, err = statusStore.UpdateNodeStatus(breakpoint.Task, func(status TaskStatus, isNew bool) (TaskStatus, bool) {
+						if status.Status == TaskStatusAbort {
+							return status, false
+						}
+						return status.MakeAbort(), true
 					})
 					if err != nil {
 						return
 					}
 					if f.onFail != nil {
-						err = f.onFail(ctx, newStatus)
-						if err != nil {
-							log.Printf("[gotick error] onFail error: %v", err)
+						if cbErr := f.onFail(ctx, newStatus); cbErr != nil {
+							log.Printf("[gotick] onFail callback failed: %v", cbErr)
 						}
 					}
 				case *breakFail:
 					var newStatus TaskStatus
-					newStatus, err = statusStore.UpdateNodeStatus(breakpoint.Task, func(status TaskStatus, isNew bool) TaskStatus {
-						return status.MakeFail(breakpoint.Err)
+					newStatus, err = statusStore.UpdateNodeStatus(breakpoint.Task, func(status TaskStatus, isNew bool) (TaskStatus, bool) {
+						// Wait 里的任务可能已经把自己标成 fail 了。
+						// 再标一次会重复累加 RetryCount 和 Errs。
+						if status.Status == TaskStatusFail {
+							return status, false
+						}
+						return status.MakeFail(breakpoint.Err), true
 					})
 					if err != nil {
 						return
 					}
 					if f.onFail != nil {
-						err = f.onFail(ctx, newStatus)
-						if err != nil {
-							log.Printf("[gotick error] onFail error: %v", err)
+						if cbErr := f.onFail(ctx, newStatus); cbErr != nil {
+							log.Printf("[gotick] onFail callback failed: %v", cbErr)
 						}
 					}
 				case *breakSleep:
-					// 进入下次调度
 					// TODO 考虑先入队，然后更改状态
-					_, err = statusStore.UpdateNodeStatus(breakpoint.Task, func(status TaskStatus, isNew bool) TaskStatus {
-						return status.MakeSleep(breakpoint.RunAt)
+					_, err = statusStore.UpdateNodeStatus(breakpoint.Task, func(status TaskStatus, isNew bool) (TaskStatus, bool) {
+						return status.MakeSleep(breakpoint.RunAt), true
 					})
 					if err != nil {
 						return
 					}
 
-					now := time.Now()
 					err = aw.Publish(ctx, Event{
 						CallId:   callId,
 						Critical: true,
-					}, breakpoint.RunAt.Sub(now))
+					}, time.Until(breakpoint.RunAt))
 					if err != nil {
-						log.Printf("[gotick error] Publish error: %v", err)
+						log.Printf("[gotick] publish sleep event failed: %v", err)
 						return
 					}
 				case *breakDone:
-					_, err = statusStore.UpdateNodeStatus(breakpoint.Task, func(status TaskStatus, isNew bool) TaskStatus {
-						return status.MakeDone()
+					_, err = statusStore.UpdateNodeStatus(breakpoint.Task, func(status TaskStatus, isNew bool) (TaskStatus, bool) {
+						return status.MakeDone(), true
 					})
 					if err != nil {
 						return
@@ -1110,7 +1222,7 @@ func (s *Scheduler) register(f *Flow) {
 						Critical: true,
 					}, 0)
 					if err != nil {
-						log.Printf("[gotick error] Publish error: %v", err)
+						log.Printf("[gotick] publish done event failed: %v", err)
 						return
 					}
 				}
@@ -1260,18 +1372,64 @@ func NewKvNodeStatusStore(store store.KVStore, key string) *KvNodeStatusStore {
 	return &KvNodeStatusStore{store: store, key: key}
 }
 
-func (n *KvNodeStatusStore) UpdateNodeStatus(key string, fu func(status TaskStatus, isNew bool) TaskStatus) (TaskStatus, error) {
-	old, ok, err := n.GetNodeStatus(key)
-	if err != nil {
-		return old, err
+// casMaxAttempts 单次 UpdateNodeStatus 最多重试多少轮 CAS。
+// 同一个 task 的并发写入方最多是「若干个重放 + 一个心跳」，正常情况下一两轮就成功。
+const casMaxAttempts = 20
+
+func (n *KvNodeStatusStore) UpdateNodeStatus(key string, fu func(status TaskStatus, isNew bool) (TaskStatus, bool)) (TaskStatus, error) {
+	ctx := context.Background()
+
+	for attempt := 0; attempt < casMaxAttempts; attempt++ {
+		raw, exist, err := n.getRawNodeStatus(key)
+		if err != nil {
+			return TaskStatus{Key: key}, err
+		}
+
+		old := TaskStatus{Key: key}
+		if exist {
+			if err := json.Unmarshal([]byte(raw), &old); err != nil {
+				return old, fmt.Errorf("decode status of task %q: %w", key, err)
+			}
+			old.Key = key
+		}
+
+		next, commit := fu(old, !exist)
+		if !commit {
+			return old, nil
+		}
+
+		// expect 为 nil 表示「要求这个 field 当前不存在」，
+		// 这样两个节点同时首次写入同一个 task 时只有一个能赢。
+		var expect *string
+		if exist {
+			expect = &raw
+		}
+
+		ok, err := n.store.HSetCAS(ctx, n.statusKey(), key, expect, next)
+		if err != nil {
+			return old, err
+		}
+		if ok {
+			next.Key = key
+			return next, nil
+		}
+		// 有人抢先改了，带着最新状态重来一轮
 	}
 
-	nw := fu(old, !ok)
-	err = n.SetNodeStatus(key, nw)
+	return TaskStatus{Key: key}, fmt.Errorf("update status of task %q: gave up after %d contended attempts", key, casMaxAttempts)
+}
+
+// getRawNodeStatus 取出存储里原始的 JSON 字节，CAS 需要拿它做比较。
+func (n *KvNodeStatusStore) getRawNodeStatus(key string) (string, bool, error) {
+	var raw json.RawMessage
+	exist, err := n.store.HGet(context.Background(), n.statusKey(), key, &raw)
 	if err != nil {
-		return old, err
+		return "", false, err
 	}
-	return nw, nil
+	if !exist {
+		return "", false, nil
+	}
+	return string(raw), true, nil
 }
 
 func (n *KvNodeStatusStore) GetNodeStatus(key string) (TaskStatus, bool, error) {
@@ -1310,12 +1468,8 @@ func (n *KvNodeStatusStore) GetAllNodeStatus() (map[string]TaskStatus, error) {
 	return all, nil
 }
 
-func (n *KvNodeStatusStore) SetNodeStatus(key string, value TaskStatus, ttl ...time.Duration) error {
-	var t time.Duration
-	if len(ttl) >= 1 {
-		t = ttl[0]
-	}
-	return n.store.HSet(context.Background(), n.statusKey(), key, value, t)
+func (n *KvNodeStatusStore) SetNodeStatus(key string, value TaskStatus) error {
+	return n.store.HSet(context.Background(), n.statusKey(), key, value)
 }
 
 func (n *KvNodeStatusStore) GetKVAll() (map[string]string, error) {
@@ -1360,7 +1514,7 @@ func (n *KvNodeStatusStore) GetKV(k string) (string, bool, error) {
 }
 
 func (n *KvNodeStatusStore) SetKV(k, v string) error {
-	return n.store.HSet(context.Background(), n.metaKey(), k, v, 0)
+	return n.store.HSet(context.Background(), n.metaKey(), k, v)
 }
 
 type Config struct {
