@@ -207,9 +207,12 @@ tick.Flow("demo/close-order", func(ctx *gotick.Context) {
 
 ### Task
 
-运行一个不会返回数据的任务，如果任务失败会重试，直到成功或者超时；
+运行一个不会返回数据的任务，失败会按 `WithMaxRetry` 重试，超过上限则整个 flow 失败。
 
-如果任务需要返回数据，则应该使用 Memo
+如果任务需要返回数据，则应该使用 Memo。
+
+> `WithMaxRetry(n)` 的 n 是**重试次数**，不含第一次执行，所以总共最多执行 n+1 次。
+> 默认值是 3。`WithMaxRetry(0)` 表示失败即失败。
 
 ```go
 gotick.Task(ctx, "start", func(ctx *gotick.TaskContext) error {

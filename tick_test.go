@@ -429,6 +429,20 @@ func TestNewClientRejectsBadURL(t *testing.T) {
 	require.Error(t, err, "an invalid URL must be reported, not panicked")
 }
 
+// TestNewClientFromInjectedQueue 覆盖「没有 Redis 也能构造 Client」。
+//
+// 之前只能从 RedisURL / RedisClient 构造，于是在没有 Redis 的环境里
+// （测试、本地开发、降级启动）根本拿不到 Client，只能把它置为 nil。
+func TestNewClientFromInjectedQueue(t *testing.T) {
+	q := store.NewMockRedisDelayedQueue()
+	c := NewClientFrom(NewClientParams{DelayedQueue: q})
+	require.NotNil(t, c)
+
+	callId, err := c.Trigger(context.Background(), "demo/flow", MetaData{"k": "v"}, 0)
+	require.NoError(t, err)
+	assert.NotEmpty(t, callId, "Trigger must work without any Redis")
+}
+
 // TestReplayLeaseIsExclusive 覆盖「同一个 callId 同时只能有一个节点重放」。
 //
 // 消息队列是 at-least-once 的，任何一次重复投递都会让两个节点同时重放同一个 callId，

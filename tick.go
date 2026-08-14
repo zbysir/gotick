@@ -22,10 +22,17 @@ type MetaData map[string]string
 
 type Context struct {
 	context.Context
-	CallId  string
-	store   NodeStatusStore
-	collect func(typ string, key string) bool // 预运行来生成 flow 图
-	s       AsyncQueue
+	CallId string
+	store  NodeStatusStore
+	s      AsyncQueue
+
+	// collect 不为 nil 时表示这是一次「预运行」：不真正执行任何任务，
+	// 只把遇到的 key 和类型报告出去，用来生成 flow 的静态结构图。
+	//
+	// 目前没有任何地方给它赋值——生成 DAG 的那部分代码还没有接回来。
+	// 接的时候注意两个缺口：Async 和 waitAll 还没有 collect 分支，
+	// 预运行会走到真实的存储读取上。
+	collect func(typ string, key string) bool
 
 	keyMu    sync.Mutex
 	usedKeys map[string]string // key -> 使用它的 API，用于检测重名
@@ -1689,7 +1696,22 @@ func NewServer(p NewServerParams) *Server {
 
 type NewClientConfig struct {
 	RedisURL    string                // "redis://<user>:<pass>@localhost:6379/<db>"
-	RedisClient redis.UniversalClient // if RedisURL is not set, use this client
+	RedisClient redis.UniversalClient // RedisURL 未设置时使用这个 client
+}
+
+// NewClientParams 用于直接注入队列实现，和 NewServerParams 对称。
+//
+// 测试、或者在没有 Redis 的环境里构造 client 时用它，
+// 不必为了拿到一个 Client 而先有一个能连上的 Redis。
+type NewClientParams struct {
+	DelayedQueue store.DelayedQueue
+}
+
+// NewClientFrom 用给定的队列实现创建 Client。
+func NewClientFrom(p NewClientParams) *Client {
+	return &Client{
+		trigger: NewTrigger(NewAsyncQueueFactory(p.DelayedQueue)),
+	}
 }
 
 // NewClient 创建一个只能触发 flow、不启动调度器的客户端。
