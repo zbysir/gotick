@@ -164,6 +164,26 @@ gotick inspector on http://127.0.0.1:8088
 UI 放在独立子包里，所以**不 import 它的人二进制不会变大**——实测 0 字节增长，
 import 之后增加约 616 KB。
 
+### 访问控制
+
+界面会展示所有 flow 的 metadata，里面很可能有业务敏感数据，所以：
+
+- 挂到已有 mux 上时，直接复用应用自己的鉴权中间件（`Options.Auth`）
+- 只想要一个口令，用 `ui.BasicAuth(user, pass)`
+- 没有配置鉴权时，`ui.ListenAndServe` 和 `gotick ui` **只允许绑定回环地址**
+
+最后一条是一道拦截而不是提示：「把地址改成 0.0.0.0 好让我从别的机器上看一眼」
+是个太容易做出的动作。要对外提供访问，就得先明确给出凭据。
+
+```
+$ gotick ui -addr 0.0.0.0:8088
+gotick: refusing to listen on 0.0.0.0:8088 without -auth: ...
+
+$ gotick ui -addr 0.0.0.0:8088 -auth admin:s3cret   # 也可用 GOTICK_UI_AUTH
+```
+
+Basic 认证的凭据是明文编码的，适合内网或反向代理背后的 TLS，不适合直接裸奔公网。
+
 想快速看看效果：
 
 ```

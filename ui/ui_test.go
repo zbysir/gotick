@@ -286,3 +286,67 @@ func TestDeriveActivity(t *testing.T) {
 		assert.Equal(t, "scheduling", got.State)
 	})
 }
+
+func TestIsLoopbackAddr(t *testing.T) {
+	cases := map[string]bool{
+		"127.0.0.1:8088": true,
+		"localhost:8088": true,
+		"LocalHost:80":   true,
+		"[::1]:8088":     true,
+		"127.0.0.5:1":    true,
+
+		"0.0.0.0:8088":     false,
+		":8088":            false, // 所有网卡
+		"192.168.1.10:80":  false,
+		"[::]:8088":        false,
+		"example.com:8088": false, // 判断不了的一律当作对外暴露
+		"":                 false,
+	}
+
+	for addr, want := range cases {
+		assert.Equal(t, want, IsLoopbackAddr(addr), "addr = %q", addr)
+	}
+}
+
+// TestListenAndServeRefusesPublicWithoutAuth 是这道拦截的意义所在：
+// 「把地址改成 0.0.0.0 好让我从别的机器上看一眼」是个太容易做出的动作，
+// 而界面会暴露所有 flow 的 metadata。
+func TestListenAndServeRefusesPublicWithoutAuth(t *testing.T) {
+	kv, _ := newFixture(t)
+
+	err := ListenAndServe("0.0.0.0:0", Options{Store: kv})
+	require.Error(t, err, "没有凭据就不该允许绑定对外地址")
+	assert.Contains(t, err.Error(), "refusing to listen")
+	assert.Contains(t, err.Error(), "metadata", "错误信息要说清楚为什么危险")
+}
+
+func TestBasicAuth(t *testing.T) {
+	kv, idx := newFixture(t)
+
+	h, err := NewHandler(Options{
+		Store: kv,
+		Index: idx,
+		Auth:  BasicAuth("admin", "s3cret"),
+	})
+	require.NoError(t, err)
+
+	call := func(user, pass string, withCreds bool) int {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/flows", nil)
+		if withCreds {
+			req.SetBasicAuth(user, pass)
+		}
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	assert.Equal(t, http.StatusOK, call("admin", "s3cret", true))
+	assert.Equal(t, http.StatusUnauthorized, call("admin", "wrong", true), "密码错")
+	assert.Equal(t, http.StatusUnauthorized, call("nobody", "s3cret", true), "用户名错")
+	assert.Equal(t, http.StatusUnauthorized, call("", "", false), "没带凭据")
+
+	// 浏览器要靠这个头弹出输入框
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	assert.Contains(t, rec.Header().Get("WWW-Authenticate"), "Basic")
+}

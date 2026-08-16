@@ -12,7 +12,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"sort"
 	"strings"
@@ -65,6 +64,9 @@ Flags:
   -redis URL   Redis connection URL (default `+defaultRedisURL+`)
                Also read from the REDIS_URL environment variable.
   -addr ADDR   Address for the web inspector (default `+defaultUIAddr+`)
+  -auth U:P    HTTP basic auth for the inspector. Also read from GOTICK_UI_AUTH.
+               Required to bind anywhere other than loopback — the inspector
+               shows every flow's metadata.
 
 The inspector reads Redis directly. It does not need to reach your
 workers, and nothing has to be deployed to use it.
@@ -77,8 +79,18 @@ func serveUI(args []string) error {
 	fs := flag.NewFlagSet("ui", flag.ContinueOnError)
 	redisURL := fs.String("redis", envOr("REDIS_URL", defaultRedisURL), "Redis connection URL")
 	addr := fs.String("addr", envOr("GOTICK_UI_ADDR", defaultUIAddr), "listen address")
+	auth := fs.String("auth", envOr("GOTICK_UI_AUTH", ""), "user:password for HTTP basic auth")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+
+	uiOpt := ui.Options{}
+	if *auth != "" {
+		user, pass, ok := strings.Cut(*auth, ":")
+		if !ok || user == "" || pass == "" {
+			return fmt.Errorf(`-auth must look like "user:password"`)
+		}
+		uiOpt.Auth = ui.BasicAuth(user, pass)
 	}
 
 	opt, err := redis.ParseURL(*redisURL)
@@ -92,13 +104,20 @@ func serveUI(args []string) error {
 		return fmt.Errorf("connect to %s: %w", *redisURL, err)
 	}
 
-	h, err := ui.NewHandler(ui.Options{Store: store.NewRedisStore(rdb)})
-	if err != nil {
-		return err
-	}
+	uiOpt.Store = store.NewRedisStore(rdb)
 
-	fmt.Fprintf(os.Stderr, "gotick inspector on http://%s (redis: %s)\n", *addr, *redisURL)
-	return http.ListenAndServe(*addr, h)
+	protection := "loopback only, no auth"
+	if uiOpt.Auth != nil {
+		protection = "basic auth"
+	} else if !ui.IsLoopbackAddr(*addr) {
+		return fmt.Errorf("refusing to listen on %s without -auth: the inspector shows every "+
+			"flow's metadata. Pass -auth user:password, or bind to 127.0.0.1", *addr)
+	}
+	fmt.Fprintf(os.Stderr, "gotick inspector on http://%s (%s, redis: %s)\n", *addr, protection, *redisURL)
+
+	// 走 ui.ListenAndServe 而不是 http.ListenAndServe，这样「没有凭据就不许绑非回环地址」
+	// 这道拦截对命令行同样生效。
+	return ui.ListenAndServe(*addr, uiOpt)
 }
 
 func inspect(args []string) error {

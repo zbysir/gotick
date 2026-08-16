@@ -19,10 +19,12 @@
 package ui
 
 import (
+	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"sort"
 	"strconv"
@@ -52,14 +54,44 @@ type Options struct {
 	// Index 是运行索引。留空时会基于 Store 自动创建一个。
 	Index gotick.RunIndex
 
-	// ReadOnly 为 false 时才允许写操作。默认只读。
+	// Auth 包装整个 handler（包括 API），用于接入鉴权。
 	//
-	// UI 能看到所有 metadata，里面很可能有业务敏感数据，
-	// 所以鉴权应该由调用方通过 Auth 提供，这里不做任何假设。
-	ReadOnly bool
-
-	// Auth 包装整个 handler，用于接入调用方自己的鉴权中间件。
+	// 界面能看到所有 metadata，里面很可能有业务敏感数据。
+	// 挂到已有 mux 上时通常直接复用应用自己的鉴权中间件；
+	// 只想要一个口令的话用 BasicAuth。
+	//
+	// 留空时 ListenAndServe 只允许绑定回环地址——见那里的说明。
 	Auth func(http.Handler) http.Handler
+}
+
+// BasicAuth 返回一个 HTTP Basic 认证中间件，用于 Options.Auth。
+//
+// 故意只做到这一步：没有账号体系、没有会话、没有登录页。
+// 那些属于挂载这个界面的应用，不属于一个工作流库。
+//
+// Basic 认证的凭据是明文编码的，所以它适合回环地址、内网、或者反向代理背后的 TLS，
+// 不适合直接裸奔在公网上。
+func BasicAuth(username, password string) func(http.Handler) http.Handler {
+	wantUser := []byte(username)
+	wantPass := []byte(password)
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			user, pass, ok := r.BasicAuth()
+			// 用常数时间比较，避免从响应耗时里逐字节猜出口令。
+			// 两个都要比，不能因为用户名不对就提前返回。
+			userOK := subtle.ConstantTimeCompare([]byte(user), wantUser) == 1
+			passOK := subtle.ConstantTimeCompare([]byte(pass), wantPass) == 1
+
+			if !ok || !userOK || !passOK {
+				w.Header().Set("WWW-Authenticate", `Basic realm="gotick", charset="UTF-8"`)
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 type handler struct {
@@ -96,13 +128,46 @@ func NewHandler(opt Options) (http.Handler, error) {
 // ListenAndServe 在指定地址上单独起一个 HTTP 服务跑 UI。
 //
 // 适合纯 worker 进程——它们本身没有 HTTP 服务。
-// 默认只绑定回环地址，不要暴露到公网。
+//
+// 没有配置 Auth 时，它只允许绑定回环地址。这不是给谨慎用户的提示，
+// 而是一道拦截：界面会暴露所有 flow 的 metadata，
+// 而「把 -addr 改成 0.0.0.0 好让我从别的机器上看一眼」是个太容易做出的动作。
+// 要对外提供访问，就得先明确给出凭据。
 func ListenAndServe(addr string, opt Options) error {
+	if opt.Auth == nil && !IsLoopbackAddr(addr) {
+		return fmt.Errorf("ui: refusing to listen on %q without Options.Auth — "+
+			"the inspector exposes every flow's metadata; "+
+			"use ui.BasicAuth(user, pass), plug in your own middleware, or bind to 127.0.0.1", addr)
+	}
+
 	h, err := NewHandler(opt)
 	if err != nil {
 		return err
 	}
 	return http.ListenAndServe(addr, h)
+}
+
+// IsLoopbackAddr 判断一个监听地址是否只对本机可见。
+// 导出是为了让调用方在启动前就知道自己会不会被拦下来。
+//
+// 判断不了的一律当作对外暴露：这里宁可错误地拦住，也不能错误地放行。
+func IsLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// 没有端口分隔符时按整体当主机名处理
+		host = addr
+	}
+
+	switch strings.ToLower(strings.Trim(host, "[]")) {
+	case "localhost":
+		return true
+	case "", "*":
+		// ":8088" 表示所有网卡
+		return false
+	}
+
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
 }
 
 func (h *handler) routes() {
