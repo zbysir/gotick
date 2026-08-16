@@ -6,18 +6,18 @@
 <title>gotick</title>
 <style>
   :root {
-    --ground: #f4f6f7;
+    --ground: #f5f7f5;
     --surface: #ffffff;
-    --surface-2: #eaeef0;
-    --ink: #0f1a1e;
-    --muted: #576b74;
-    --faint: #7f959d;
-    --line: #dae2e5;
-    --line-strong: #b5c4c9;
-    --accent: #0b7285;
-    --accent-soft: #dceef1;
-    --ok: #0f6b4f;
-    --ok-soft: #dcf0e7;
+    --surface-2: #ebefec;
+    --ink: #0d1710;
+    --muted: #55665c;
+    --faint: #7b8d82;
+    --line: #dde4df;
+    --line-strong: #b8c6bd;
+    --accent: #07743d;
+    --accent-soft: #dcf1e5;
+    --ok: #14663f;
+    --ok-soft: #ddf0e5;
     --warn: #855800;
     --warn-soft: #faefd6;
     --crit: #a32118;
@@ -28,13 +28,13 @@
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --ground: #0b1316; --surface: #121f24; --surface-2: #172a31;
-      --ink: #dfeaed; --muted: #93abb3; --faint: #6e8791;
-      --line: #1e2f36; --line-strong: #2e454e;
-      --accent: #3fcbe0; --accent-soft: #10333b;
-      --ok: #4dc79a; --ok-soft: #102c24;
-      --warn: #e0b341; --warn-soft: #2c2413;
-      --crit: #f2837a; --crit-soft: #2e1917;
+      --ground: #050807; --surface: #0c110e; --surface-2: #131b16;
+      --ink: #e8f2ea; --muted: #96a89c; --faint: #6f8175;
+      --line: #1a231d; --line-strong: #2b3830;
+      --accent: #3ef08a; --accent-soft: #0a2617;
+      --ok: #2fc476; --ok-soft: #082114;
+      --warn: #f5b73d; --warn-soft: #2a2011;
+      --crit: #ff6f66; --crit-soft: #2c1614;
     }
   }
   * { box-sizing: border-box; }
@@ -360,7 +360,7 @@ async function renderList() {
         ${rows ? `<table>
           <thead><tr>
             <th>状态</th><th>Flow</th><th>Call ID</th>
-            <th>开始</th><th>耗时</th><th>重放</th><th>失败于</th>
+            <th>开始</th><th>耗时</th><th>跑了几遍</th><th>失败于</th>
           </tr></thead>
           <tbody>${rows}</tbody>
         </table>` : `<div class="empty">还没有运行记录。触发一个 flow 之后回来看看。</div>`}
@@ -432,10 +432,10 @@ function activityBanner(a) {
     </div>`;
 }
 
-// replayPanel 把每次重放画出来。
+// replayPanel 把函数每一遍的执行画出来。
 //
-// 光有一个「重放了 5 次」的数字看不出问题：一次本该立刻继续、却等了 5 秒
-// 才被调度的重放，在计数里和正常重放长得一模一样，证据全在间隔里。
+// 光有一个「跑了 5 遍」的数字看不出问题：一遍本该立刻继续、却等了 5 秒
+// 才被调度的执行，在计数里和正常的长得一模一样，证据全在间隔里。
 const REPLAY_KIND = {
   done:        "任务完成",
   sleep:       "进入睡眠",
@@ -461,8 +461,8 @@ function replayPanel(run) {
   const marks = run.marks || [];
   if (!marks.length) {
     return `<div class="panel">
-      <div class="panel-head"><span>重放</span><span>${run.replays || 0} 次</span></div>
-      <div class="empty">这次调用是在重放记录上线之前跑的。</div>
+      <div class="panel-head"><span>执行记录</span><span>${run.replays || 0} 遍</span></div>
+      <div class="empty">这次调用是在执行记录上线之前跑的。</div>
     </div>`;
   }
 
@@ -492,22 +492,22 @@ function replayPanel(run) {
   let note = "";
   if (rearms > 0) {
     note = `<div class="activity-note" style="padding:10px 16px;border-top:1px solid var(--line)">` +
-      `有 ${rearms} 次重放是被提前唤醒后又重新计时的——这一轮什么都没推进，` +
+      `有 ${rearms} 遍是被提前唤醒后又重新计时的——这一遍什么都没推进，` +
       `而且重新入队本身要花掉一次队列调度的时间。</div>`;
   } else if (worst.gap >= GAP_WARN) {
     note = `<div class="activity-note" style="padding:10px 16px;border-top:1px solid var(--line)">` +
-      `第 ${worst.i} 次重放做完之后本该立刻继续，实际隔了 ${humanGap(worst.gap)}——` +
+      `第 ${worst.i} 遍跑完之后本该立刻继续，实际隔了 ${humanGap(worst.gap)}——` +
       `这段时间花在了消息队列的调度上。</div>`;
   }
 
   return `<div class="panel">
     <div class="panel-head">
-      <span>重放</span>
-      <span>${marks.length} 次${run.replays > marks.length ? `（另有 ${run.replays - marks.length} 次未记录完）` : ""}</span>
+      <span>执行记录</span>
+      <span>${marks.length} 遍${run.replays > marks.length ? `（另有 ${run.replays - marks.length} 遍未记录完）` : ""}</span>
     </div>
     <div class="scroller">
       <table>
-        <thead><tr><th>#</th><th>时刻</th><th>这一轮做了什么</th><th>Task</th><th>距上次</th></tr></thead>
+        <thead><tr><th>#</th><th>时刻</th><th>这一遍做了什么</th><th>Task</th><th>距上一遍</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
     </div>
@@ -588,7 +588,7 @@ async function renderDetail(callId) {
         <dt>开始</dt><dd class="mono">${esc(fmtTime(run.started_at))}</dd>
         <dt>结束</dt><dd class="mono">${esc(fmtTime(run.ended_at))}</dd>
         <dt>耗时</dt><dd class="mono">${esc(run.duration_text || "—")}</dd>
-        <dt>重放次数</dt><dd class="mono">${run.replays == null ? "—" : run.replays}</dd>
+        <dt>执行次数</dt><dd class="mono">${run.replays == null ? "—" : run.replays}</dd>
         ${run.failed_task ? `<dt>失败于</dt><dd class="mono">${esc(run.failed_task)}</dd>` : ""}
         ${run.error ? `<dt>错误</dt><dd><span class="err">${esc(run.error)}</span></dd>` : ""}
       </dl>
