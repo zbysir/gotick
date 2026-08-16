@@ -9,7 +9,7 @@ on:
 
 env:
   # 改镜像名只需要改这一行
-  IMAGE_NAME: zbysir/gotick-ui
+  IMAGE_NAME: bysir/gotick-ui
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

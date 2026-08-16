@@ -11,7 +11,7 @@
 docker run -p 8088:8088 \
   -e REDIS_URL="redis://your-redis:6379/0" \
   -e GOTICK_UI_AUTH="admin:换成你自己的密码" \
-  zbysir/gotick-ui
+  bysir/gotick-ui
 ```
 
 打开 <http://127.0.0.1:8088>，用上面那组用户名密码登录。
@@ -40,7 +40,7 @@ docker run -p 8088:8088 \
 
 ```bash
 docker run --rm -e REDIS_URL="redis://your-redis:6379/0" \
-  zbysir/gotick-ui inspect <callId>
+  bysir/gotick-ui inspect <callId>
 ```
 
 ## 标签

@@ -4,7 +4,7 @@
 # 它只读 Redis，不连 worker，所以这个容器和你的业务进程之间没有任何耦合：
 # 业务在哪跑、有没有在跑，都不影响它能不能看。
 
-FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
 
 WORKDIR /src
 

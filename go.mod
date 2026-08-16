@@ -1,8 +1,6 @@
 module github.com/zbysir/gotick
 
-go 1.22
-
-toolchain go1.23.1
+go 1.25.0
 
 require (
 	github.com/alicebob/miniredis/v2 v2.38.0
@@ -20,7 +18,7 @@ require (
 	github.com/robfig/cron/v3 v3.0.1 // indirect
 	github.com/spf13/cast v1.7.0 // indirect
 	github.com/yuin/gopher-lua v1.1.1 // indirect
-	golang.org/x/sys v0.27.0 // indirect
+	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/time v0.8.0 // indirect
 	google.golang.org/protobuf v1.35.2 // indirect
 	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
