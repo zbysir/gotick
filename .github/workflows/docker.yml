@@ -1,0 +1,126 @@
+name: Docker
+
+on:
+  push:
+    branches: [master, main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # 改镜像名只需要改这一行
+  IMAGE_NAME: zbysir/gotick-ui
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 先在单架构上把镜像跑起来验一遍，再谈发布。
+  # 发一个连启动都不会的镜像出去，比不发布糟糕得多。
+  smoke:
+    name: build & smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: build (load into local docker)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: gotick-ui:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 顺序很重要：先把 Redis 起起来。
+      # 连不上 Redis 时，进程会一直重试而走不到「要不要密码」这一步，
+      # 于是这一步不会失败、会挂住——本地踩过一次。
+      - name: 起一个 Redis
+        run: |
+          docker network create gotick-smoke
+          docker run -d --name redis --network gotick-smoke redis:7-alpine
+          for i in $(seq 1 30); do
+            docker exec redis redis-cli ping >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+      - name: 没有密码时必须拒绝对外监听
+        run: |
+          set -o pipefail
+          out=$(timeout 60 docker run --rm --network gotick-smoke \
+            -e REDIS_URL=redis://redis:6379/0 gotick-ui:smoke 2>&1 | grep -v '^redis:' || true)
+          echo "$out"
+          echo "$out" | grep -q 'refusing to listen' \
+            || { echo "::error::绑到 0.0.0.0 且没有 -auth 时，本该拒绝启动"; exit 1; }
+
+      - name: 给了密码就该正常服务
+        run: |
+          docker run -d --name ui --network gotick-smoke -p 8088:8088 \
+            -e REDIS_URL=redis://redis:6379/0 \
+            -e GOTICK_UI_AUTH=admin:s3cret \
+            gotick-ui:smoke
+          for i in $(seq 1 30); do
+            curl -fsS -u admin:s3cret http://127.0.0.1:8088/api/runs >/dev/null 2>&1 && break
+            sleep 1
+          done
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8088/)
+          [ "$code" = "401" ] || { echo "::error::没带凭据却返回 $code，本该是 401"; docker logs ui; exit 1; }
+          code=$(curl -s -o /dev/null -w '%{http_code}' -u admin:s3cret http://127.0.0.1:8088/)
+          [ "$code" = "200" ] || { echo "::error::带了凭据却返回 $code，本该是 200"; docker logs ui; exit 1; }
+          curl -fsS -u admin:s3cret http://127.0.0.1:8088/api/runs
+
+  publish:
+    name: push to Docker Hub
+    needs: smoke
+    runs-on: ubuntu-latest
+    # PR 和 fork 不发布：secrets 在 fork 上本来也拿不到
+    if: github.event_name != 'pull_request' && github.repository == 'zbysir/gotick'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          # master 推 edge；打 v1.2.3 推 1.2.3 / 1.2 / latest
+          tags: |
+            type=ref,event=branch,enable={{is_default_branch}},value=edge
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: build & push (amd64 + arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # CGO 关着，Dockerfile 里用 $BUILDPLATFORM 交叉编译，
+          # 所以这两个架构都是原生速度，不需要 QEMU 模拟
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 让 Docker Hub 上的说明和仓库里的文件同源，不用手动去网页上维护
+      - name: sync Docker Hub 说明
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.IMAGE_NAME }}
+          short-description: "Web inspector for gotick durable workflows — reads Redis directly"
+          readme-filepath: ./docker/README.md

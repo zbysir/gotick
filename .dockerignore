@@ -1,0 +1,8 @@
+# 构建只需要 Go 源码和依赖清单，其它一律不进构建上下文
+.git
+.github
+.idea
+*.md
+example/
+Dockerfile
+.dockerignore
