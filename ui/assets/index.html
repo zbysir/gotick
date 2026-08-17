@@ -132,6 +132,11 @@
     border-radius: 3px; padding: 12px 16px; margin-bottom: 18px; font-size: 13px;
   }
 
+  .lang { font-size: 12px; margin-right: 14px; }
+  .lang a { color: var(--faint); text-decoration: none; padding: 0 4px; }
+  .lang a.on { color: var(--accent); }
+  .lang .sep { color: var(--line-strong); }
+
   /* ---- 当前活动 ---- */
   .activity {
     border: 1px solid var(--line); border-left: 3px solid var(--accent);
@@ -192,13 +197,116 @@
     <a class="brand" href="#/">gotick</a>
     <span class="tagline">workflow inspector</span>
     <span class="spacer"></span>
+    <span class="lang" id="lang"></span>
     <span class="refresh" id="refresh"></span>
   </header>
-  <div id="app"><div class="empty">加载中…</div></div>
+  <div id="app"><div class="empty" id="boot"></div></div>
 </div>
 
 <script>
 "use strict";
+
+// ---------- 多语言 ----------
+//
+// 没有引入任何框架：这个界面本来就是模板字符串拼出来的，多语言需要的
+// 只是一个字典加一个 t()。为了它把 React/Preact 和一条 npm 构建链塞进
+// 一个纯 Go 仓库，会把「内嵌界面零依赖」这个卖点直接折掉。
+const MESSAGES = {
+  zh: {
+    loading: "加载中…", back: "← 返回列表", readFail: "读取失败：",
+    secAgo: "{n} 秒前", minAgo: "{n} 分钟前", hourAgo: "{n} 小时前", dayAgo: "{n} 天前",
+    soon: "即将继续",
+    allFlows: "全部 flow", allStatus: "全部状态", reload: "刷新",
+    runs: "运行实例", runsCount: "{n} / {total} 条",
+    thStatus: "状态", thFlow: "Flow", thCallId: "Call ID", thStarted: "开始",
+    thDuration: "耗时", thRuns: "跑了几遍", thFailedAt: "失败于", thRetry: "重试",
+    listEmpty: "还没有运行记录。触发一个 flow 之后回来看看。",
+    actRunning: "执行中", actRunningNote: "任务正在某个节点上运行，心跳还在续期",
+    actSleeping: "睡眠中", actSleepingNote: "到点后会被自动唤醒；等待期间不占用任何进程，重启也不受影响",
+    actRetrying: "等待重试", actRetryingNote: "上一次执行失败了，退避结束后会再试一次",
+    actScheduling: "调度中", actSchedulingNote: "正处在两步之间，马上会被某个 worker 接走",
+    actDone: "已完成", actFailed: "已失败", actAborted: "已终止",
+    actLeft: "还有 ", actRan: "已运行 ",
+    kindDone: "任务完成", kindSleep: "进入睡眠", kindSleepRearm: "重新计时",
+    kindRetry: "安排重试", kindWait: "等待下一步", kindFail: "任务失败",
+    kindAbort: "流程终止", kindFinish: "流程跑完",
+    execLog: "执行记录", laps: "{n} 遍", lapsMore: "（另有 {n} 遍未记录完）",
+    legacyRun: "这次调用是在执行记录上线之前跑的。",
+    thTime: "时刻", thWhat: "这一遍做了什么", thGap: "距上一遍", earlyWake: "早醒",
+    noteRearm: "有 {n} 遍是被提前唤醒后又重新计时的——这一遍什么都没推进，而且重新入队本身要花掉一次队列调度的时间。",
+    noteGap: "第 {i} 遍跑完之后本该立刻继续，实际隔了 {gap}——这段时间花在了消息队列的调度上。",
+    overview: "概览", dStarted: "开始", dEnded: "结束", dDuration: "耗时",
+    dExecCount: "执行次数", dFailedAt: "失败于", dError: "错误",
+    tasks: "任务", tasksCount: "{n} 个", tasksEmpty: "这次调用还没有任何任务状态。",
+    cached: "缓存结果",
+    stopped: "已结束，停止自动刷新", syncEvery: "每 {n} 秒同步一次",
+  },
+  en: {
+    loading: "Loading…", back: "← Back to list", readFail: "Failed to load: ",
+    secAgo: "{n}s ago", minAgo: "{n}m ago", hourAgo: "{n}h ago", dayAgo: "{n}d ago",
+    soon: "resuming",
+    allFlows: "All flows", allStatus: "All statuses", reload: "Reload",
+    runs: "Runs", runsCount: "{n} / {total}",
+    thStatus: "Status", thFlow: "Flow", thCallId: "Call ID", thStarted: "Started",
+    thDuration: "Duration", thRuns: "Runs", thFailedAt: "Failed at", thRetry: "Retries",
+    listEmpty: "No runs yet. Trigger a flow and come back.",
+    actRunning: "Running", actRunningNote: "A task is executing on some node; its heartbeat is still being renewed",
+    actSleeping: "Sleeping", actSleepingNote: "It wakes automatically when due. While waiting it holds no process, and a restart doesn't affect it",
+    actRetrying: "Retry pending", actRetryingNote: "The last attempt failed; it will try again once the backoff ends",
+    actScheduling: "Scheduling", actSchedulingNote: "Between two steps — a worker will pick it up shortly",
+    actDone: "Done", actFailed: "Failed", actAborted: "Aborted",
+    actLeft: "wakes in ", actRan: "running for ",
+    kindDone: "task finished", kindSleep: "went to sleep", kindSleepRearm: "re-armed timer",
+    kindRetry: "retry scheduled", kindWait: "waiting for next step", kindFail: "task failed",
+    kindAbort: "flow aborted", kindFinish: "flow completed",
+    execLog: "Execution log", laps: "{n} runs", lapsMore: " ({n} more not fully recorded)",
+    legacyRun: "This call ran before the execution log existed.",
+    thTime: "Time", thWhat: "What this run did", thGap: "Since previous", earlyWake: "early",
+    noteRearm: "{n} runs were woken early and re-armed — those runs advanced nothing, and re-queueing itself costs one scheduling round.",
+    noteGap: "Run {i} should have continued immediately after finishing, but {gap} passed — that time went into queue scheduling.",
+    overview: "Overview", dStarted: "Started", dEnded: "Ended", dDuration: "Duration",
+    dExecCount: "Times executed", dFailedAt: "Failed at", dError: "Error",
+    tasks: "Tasks", tasksCount: "{n}", tasksEmpty: "No task state recorded for this call yet.",
+    cached: "Cached results",
+    stopped: "Finished — auto-refresh stopped", syncEvery: "syncing every {n}s",
+  },
+};
+
+const LANG_KEY = "gotick.lang";
+// 默认英文：这是个开源项目的运维界面，读者不一定是中文使用者。
+// 不跟随 navigator.language——同一个人在不同机器上看到不同语言更让人困惑。
+let LANG = localStorage.getItem(LANG_KEY) || "en";
+if (!MESSAGES[LANG]) LANG = "en";
+
+function t(key, vars) {
+  let str = (MESSAGES[LANG] && MESSAGES[LANG][key]) ?? MESSAGES.zh[key] ?? key;
+  if (vars) for (const k in vars) str = str.split("{" + k + "}").join(vars[k]);
+  return str;
+}
+
+function setLang(l) {
+  if (!MESSAGES[l] || l === LANG) return;
+  LANG = l;
+  localStorage.setItem(LANG_KEY, l);
+  document.documentElement.lang = l === "zh" ? "zh" : "en";
+  renderLangSwitch();
+  route();
+}
+
+function renderLangSwitch() {
+  const el = document.getElementById("lang");
+  if (!el) return;
+  el.innerHTML = ["zh", "en"].map(l =>
+    `<a href="#" data-lang="${l}" class="${l === LANG ? "on" : ""}">${l === "zh" ? "中文" : "EN"}</a>`
+  ).join('<span class="sep">/</span>');
+}
+
+document.addEventListener("click", e => {
+  const a = e.target.closest("#lang a[data-lang]");
+  if (!a) return;
+  e.preventDefault();
+  setLang(a.dataset.lang);
+});
 
 // 页面可能被挂在任意前缀下（/_gotick/ 之类），所以所有请求都相对当前目录。
 const BASE = location.pathname.endsWith("/") ? location.pathname : location.pathname + "/";
@@ -233,10 +341,10 @@ function ago(iso) {
   if (!iso || iso.startsWith("0001-")) return "—";
   const diff = (Date.now() - new Date(iso).getTime()) / 1000;
   if (isNaN(diff)) return "—";
-  if (diff < 60) return Math.max(0, Math.round(diff)) + " 秒前";
-  if (diff < 3600) return Math.round(diff / 60) + " 分钟前";
-  if (diff < 86400) return Math.round(diff / 3600) + " 小时前";
-  return Math.round(diff / 86400) + " 天前";
+  if (diff < 60) return t("secAgo", {n: Math.max(0, Math.round(diff))});
+  if (diff < 3600) return t("minAgo", {n: Math.round(diff / 60)});
+  if (diff < 86400) return t("hourAgo", {n: Math.round(diff / 3600)});
+  return t("dayAgo", {n: Math.round(diff / 86400)});
 }
 
 function pill(status) {
@@ -268,7 +376,7 @@ function tickDynamic() {
 
   document.querySelectorAll("[data-countdown]").forEach(el => {
     const left = Date.parse(el.dataset.countdown) - now;
-    el.textContent = left > 0 ? humanDuration(left) : "即将继续";
+    el.textContent = left > 0 ? humanDuration(left) : t("soon");
   });
 
   document.querySelectorAll("[data-elapsed]").forEach(el => {
@@ -317,18 +425,18 @@ async function renderList() {
       api("api/runs?" + new URLSearchParams({ flow, status, limit: "100" })),
     ]);
   } catch (e) {
-    app.innerHTML = banner("读取失败：" + e.message);
+    app.innerHTML = banner(t("readFail") + e.message);
     return;
   }
 
-  const options = ['<option value="">全部 flow</option>'].concat(
+  const options = [`<option value="">${t("allFlows")}</option>`].concat(
     (flows.flows || []).map(f =>
       `<option value="${esc(f.id)}" ${f.id === flow ? "selected" : ""}>${esc(f.id)} (${f.runs})</option>`)
   ).join("");
 
   const statuses = ["", "running", "done", "failed", "aborted"];
   const statusOptions = statuses.map(s =>
-    `<option value="${s}" ${s === status ? "selected" : ""}>${s === "" ? "全部状态" : s}</option>`
+    `<option value="${s}" ${s === status ? "selected" : ""}>${s === "" ? t("allStatus") : s}</option>`
   ).join("");
 
   const rows = (data.runs || []).map(r => `
@@ -349,21 +457,21 @@ async function renderList() {
     <div class="toolbar">
       <select id="flowFilter">${options}</select>
       <select id="statusFilter">${statusOptions}</select>
-      <button id="reload">刷新</button>
+      <button id="reload">${t("reload")}</button>
     </div>
     <div class="panel">
       <div class="panel-head">
-        <span>运行实例</span>
-        <span>${data.runs.length} / ${data.total} 条</span>
+        <span>${t("runs")}</span>
+        <span>${t("runsCount", {n: data.runs.length, total: data.total})}</span>
       </div>
       <div class="scroller">
         ${rows ? `<table>
           <thead><tr>
-            <th>状态</th><th>Flow</th><th>Call ID</th>
-            <th>开始</th><th>耗时</th><th>跑了几遍</th><th>失败于</th>
+            <th>${t("thStatus")}</th><th>${t("thFlow")}</th><th>${t("thCallId")}</th>
+            <th>${t("thStarted")}</th><th>${t("thDuration")}</th><th>${t("thRuns")}</th><th>${t("thFailedAt")}</th>
           </tr></thead>
           <tbody>${rows}</tbody>
-        </table>` : `<div class="empty">还没有运行记录。触发一个 flow 之后回来看看。</div>`}
+        </table>` : `<div class="empty">${t("listEmpty")}</div>`}
       </div>
     </div>`;
 
@@ -390,45 +498,47 @@ async function renderList() {
 // 一张任务表回答不了这个问题：一个正在睡的流程，表里只是某一行写着 sleep
 // 加一个时间戳，得自己拿当前时间去减才知道还要等多久。
 const ACTIVITY = {
-  running:    { label: "执行中",   dot: "",     note: "任务正在某个节点上运行，心跳还在续期" },
-  sleeping:   { label: "睡眠中",   dot: "",     note: "到点后会被自动唤醒；等待期间不占用任何进程，重启也不受影响" },
-  retrying:   { label: "等待重试", dot: "warn", note: "上一次执行失败了，退避结束后会再试一次" },
-  scheduling: { label: "调度中",   dot: "",     note: "正处在两步之间，马上会被某个 worker 接走" },
-  done:       { label: "已完成",   dot: "still" },
-  failed:     { label: "已失败",   dot: "still" },
-  aborted:    { label: "已终止",   dot: "still" },
+  running:    { key: "actRunning",    dot: "",      note: "actRunningNote" },
+  sleeping:   { key: "actSleeping",   dot: "",      note: "actSleepingNote" },
+  retrying:   { key: "actRetrying",   dot: "warn",  note: "actRetryingNote" },
+  scheduling: { key: "actScheduling", dot: "",      note: "actSchedulingNote" },
+  done:       { key: "actDone",       dot: "still" },
+  failed:     { key: "actFailed",     dot: "still" },
+  aborted:    { key: "actAborted",    dot: "still" },
 };
 
 function activityBanner(a) {
   if (!a || !a.state) return "";
 
-  const m = ACTIVITY[a.state] || { label: a.state, dot: "still" };
+  const m = ACTIVITY[a.state] || { dot: "still" };
+  const label = m.key ? t(m.key) : a.state;
+  const note = m.note ? t(m.note) : "";
   const idle = ["done", "failed", "aborted"].includes(a.state);
 
   let timing = "";
   let progress = "";
 
   if ((a.state === "sleeping" || a.state === "retrying") && !isZeroTime(a.until)) {
-    timing = `<span class="activity-time">还有 ` +
+    timing = `<span class="activity-time">${t("actLeft")}` +
              `<span class="countdown" data-countdown="${esc(a.until)}">…</span></span>`;
     if (!isZeroTime(a.since)) {
       progress = `<div class="prog${a.state === "retrying" ? " warn" : ""}">` +
                  `<i data-from="${esc(a.since)}" data-to="${esc(a.until)}"></i></div>`;
     }
   } else if (a.state === "running" && !isZeroTime(a.since)) {
-    timing = `<span class="activity-time">已运行 ` +
+    timing = `<span class="activity-time">${t("actRan")}` +
              `<span class="countdown" data-elapsed="${esc(a.since)}">…</span></span>`;
   }
 
   return `
     <div class="activity${idle ? " idle" : ""}">
       <div class="activity-head">
-        <span class="activity-state"><i class="dot ${m.dot}"></i>${esc(m.label)}</span>
+        <span class="activity-state"><i class="dot ${m.dot}"></i>${esc(label)}</span>
         ${a.task ? `<span class="activity-task">${esc(a.task)}</span>` : ""}
         ${timing}
       </div>
       ${progress}
-      ${m.note ? `<div class="activity-note">${esc(m.note)}</div>` : ""}
+      ${note ? `<div class="activity-note">${esc(note)}</div>` : ""}
     </div>`;
 }
 
@@ -437,14 +547,14 @@ function activityBanner(a) {
 // 光有一个「跑了 5 遍」的数字看不出问题：一遍本该立刻继续、却等了 5 秒
 // 才被调度的执行，在计数里和正常的长得一模一样，证据全在间隔里。
 const REPLAY_KIND = {
-  done:        "任务完成",
-  sleep:       "进入睡眠",
-  sleep_rearm: "重新计时",
-  retry:       "安排重试",
-  wait:        "等待下一步",
-  fail:        "任务失败",
-  abort:       "流程终止",
-  finish:      "流程跑完",
+  done:        "kindDone",
+  sleep:       "kindSleep",
+  sleep_rearm: "kindSleepRearm",
+  retry:       "kindRetry",
+  wait:        "kindWait",
+  fail:        "kindFail",
+  abort:       "kindAbort",
+  finish:      "kindFinish",
 };
 
 // GAP_WARN 超过这个间隔才值得看一眼。
@@ -461,8 +571,8 @@ function replayPanel(run) {
   const marks = run.marks || [];
   if (!marks.length) {
     return `<div class="panel">
-      <div class="panel-head"><span>执行记录</span><span>${run.replays || 0} 遍</span></div>
-      <div class="empty">这次调用是在执行记录上线之前跑的。</div>
+      <div class="panel-head"><span>${t("execLog")}</span><span>${t("laps", {n: run.replays || 0})}</span></div>
+      <div class="empty">${t("legacyRun")}</div>
     </div>`;
   }
 
@@ -475,7 +585,7 @@ function replayPanel(run) {
     return `<tr>
       <td class="num">#${i + 1}</td>
       <td class="num">${esc(fmtTime(m.at).slice(11))}<span style="opacity:.5">${esc(fracSeconds(m.at))}</span></td>
-      <td>${esc(REPLAY_KIND[m.kind] || m.kind || "—")}${odd ? ` <span class="pill retry">早醒</span>` : ""}</td>
+      <td>${esc(REPLAY_KIND[m.kind] ? t(REPLAY_KIND[m.kind]) : (m.kind || "—"))}${odd ? ` <span class="pill retry">${t("earlyWake")}</span>` : ""}</td>
       <td class="mono">${esc(m.task || "—")}</td>
       <td class="num" ${slow ? 'style="color:var(--warn)"' : ""}>${i === 0 ? "—" : "+" + humanGap(gap)}</td>
     </tr>`;
@@ -492,22 +602,20 @@ function replayPanel(run) {
   let note = "";
   if (rearms > 0) {
     note = `<div class="activity-note" style="padding:10px 16px;border-top:1px solid var(--line)">` +
-      `有 ${rearms} 遍是被提前唤醒后又重新计时的——这一遍什么都没推进，` +
-      `而且重新入队本身要花掉一次队列调度的时间。</div>`;
+      `${t("noteRearm", {n: rearms})}</div>`;
   } else if (worst.gap >= GAP_WARN) {
     note = `<div class="activity-note" style="padding:10px 16px;border-top:1px solid var(--line)">` +
-      `第 ${worst.i} 遍跑完之后本该立刻继续，实际隔了 ${humanGap(worst.gap)}——` +
-      `这段时间花在了消息队列的调度上。</div>`;
+      `${t("noteGap", {i: worst.i, gap: humanGap(worst.gap)})}</div>`;
   }
 
   return `<div class="panel">
     <div class="panel-head">
-      <span>执行记录</span>
-      <span>${marks.length} 遍${run.replays > marks.length ? `（另有 ${run.replays - marks.length} 遍未记录完）` : ""}</span>
+      <span>${t("execLog")}</span>
+      <span>${t("laps", {n: marks.length})}${run.replays > marks.length ? t("lapsMore", {n: run.replays - marks.length}) : ""}</span>
     </div>
     <div class="scroller">
       <table>
-        <thead><tr><th>#</th><th>时刻</th><th>这一遍做了什么</th><th>Task</th><th>距上一遍</th></tr></thead>
+        <thead><tr><th>#</th><th>${t("thTime")}</th><th>${t("thWhat")}</th><th>Task</th><th>${t("thGap")}</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
     </div>
@@ -530,7 +638,7 @@ async function renderDetail(callId) {
   try {
     d = await api("api/runs/" + encodeURIComponent(callId));
   } catch (e) {
-    app.innerHTML = `<a class="back" href="#/">← 返回列表</a>` + banner("读取失败：" + e.message);
+    app.innerHTML = `<a class="back" href="#/">${t("back")}</a>` + banner(t("readFail") + e.message);
     setRefresh("");
     return;
   }
@@ -575,36 +683,36 @@ async function renderDetail(callId) {
     `<dt>${esc(k)}</dt><dd class="mono">${esc(obj[k])}</dd>`).join("");
 
   app.innerHTML = `
-    <a class="back" href="#/">← 返回列表</a>
+    <a class="back" href="#/">${t("back")}</a>
     <h2 style="margin-top:14px">${esc(run.flow_id || "unknown flow")}</h2>
     <div class="sub mono">${esc(callId)}</div>
 
     ${activityBanner(d.activity)}
 
     <div class="panel">
-      <div class="panel-head"><span>概览</span><span>${esc(run.status || "unknown")}</span></div>
+      <div class="panel-head"><span>${t("overview")}</span><span>${esc(run.status || "unknown")}</span></div>
       <dl class="kv">
-        <dt>状态</dt><dd>${pill(run.status)}</dd>
-        <dt>开始</dt><dd class="mono">${esc(fmtTime(run.started_at))}</dd>
-        <dt>结束</dt><dd class="mono">${esc(fmtTime(run.ended_at))}</dd>
-        <dt>耗时</dt><dd class="mono">${esc(run.duration_text || "—")}</dd>
-        <dt>执行次数</dt><dd class="mono">${run.replays == null ? "—" : run.replays}</dd>
-        ${run.failed_task ? `<dt>失败于</dt><dd class="mono">${esc(run.failed_task)}</dd>` : ""}
-        ${run.error ? `<dt>错误</dt><dd><span class="err">${esc(run.error)}</span></dd>` : ""}
+        <dt>${t("thStatus")}</dt><dd>${pill(run.status)}</dd>
+        <dt>${t("dStarted")}</dt><dd class="mono">${esc(fmtTime(run.started_at))}</dd>
+        <dt>${t("dEnded")}</dt><dd class="mono">${esc(fmtTime(run.ended_at))}</dd>
+        <dt>${t("dDuration")}</dt><dd class="mono">${esc(run.duration_text || "—")}</dd>
+        <dt>${t("dExecCount")}</dt><dd class="mono">${run.replays == null ? "—" : run.replays}</dd>
+        ${run.failed_task ? `<dt>${t("dFailedAt")}</dt><dd class="mono">${esc(run.failed_task)}</dd>` : ""}
+        ${run.error ? `<dt>${t("dError")}</dt><dd><span class="err">${esc(run.error)}</span></dd>` : ""}
       </dl>
     </div>
 
     ${replayPanel(run)}
 
     <div class="panel">
-      <div class="panel-head"><span>任务</span><span>${tasks.length} 个</span></div>
+      <div class="panel-head"><span>${t("tasks")}</span><span>${t("tasksCount", {n: tasks.length})}</span></div>
       <div class="scroller">
         ${tasks.length ? `<table>
           <thead><tr>
-            <th>Task</th><th>状态</th><th>重试</th><th>开始</th><th>耗时</th><th></th><th>错误</th>
+            <th>Task</th><th>${t("thStatus")}</th><th>${t("thRetry")}</th><th>${t("dStarted")}</th><th>${t("dDuration")}</th><th></th><th>${t("dError")}</th>
           </tr></thead>
           <tbody>${taskRows}</tbody>
-        </table>` : `<div class="empty">这次调用还没有任何任务状态。</div>`}
+        </table>` : `<div class="empty">${t("tasksEmpty")}</div>`}
       </div>
     </div>
 
@@ -614,7 +722,7 @@ async function renderDetail(callId) {
     </div>` : ""}
 
     ${Object.keys(meta.cached || {}).length ? `<div class="panel">
-      <div class="panel-head"><span>缓存结果</span><span>Memo / Array / Async</span></div>
+      <div class="panel-head"><span>${t("cached")}</span><span>Memo / Array / Async</span></div>
       <dl class="kv">${kvRows(meta.cached)}</dl>
     </div>` : ""}`;
 
@@ -635,9 +743,9 @@ async function renderDetail(callId) {
 
 function scheduleRefresh(active, delayMs) {
   if (timer) { clearTimeout(timer); timer = null; }
-  if (!active) { setRefresh("已结束，停止自动刷新"); return; }
+  if (!active) { setRefresh(t("stopped")); return; }
   const ms = delayMs || 3000;
-  setRefresh(`每 ${Math.round(ms / 1000)} 秒同步一次`);
+  setRefresh(t("syncEvery", {n: Math.round(ms / 1000)}));
   timer = setTimeout(route, ms);
 }
 
@@ -647,6 +755,10 @@ function route() {
   if (m) renderDetail(decodeURIComponent(m[1]));
   else renderList();
 }
+
+document.documentElement.lang = LANG === "zh" ? "zh" : "en";
+document.getElementById("boot").textContent = t("loading");
+renderLangSwitch();
 
 window.addEventListener("hashchange", route);
 route();
