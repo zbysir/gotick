@@ -735,6 +735,151 @@ func Task(c *Context, key string, fun TaskFun, opts ...TaskOption) {
 		"这个 key 很可能同时被 Sleep 或 Async 用了", key, s.Status))
 }
 
+// signalEnvelope 包一层是为了把「有值」和「当初超时了」区分开。
+//
+// 不包的话，超时之后如果信号才姗姗来迟，重放读到值就会返回 true，
+// 而之前那遍重放返回的是 false——同一次调用两个答案，分支会走岔。
+type signalEnvelope struct {
+	Value    json.RawMessage `json:"v,omitempty"`
+	TimedOut bool            `json:"timeout,omitempty"`
+}
+
+// signalKey 信号值在存储里的位置。GetFromStore/SetToStore 会再补一个 "__" 前缀，
+// 所以最终键是 __sig:<key>。这个前缀是保留的，别拿它当 Memo 的 key。
+func signalKey(key string) string { return "sig:" + key }
+
+// SignalOption 配置一次等待。
+type SignalOption func(*signalOpt)
+
+type signalOpt struct {
+	timeout time.Duration
+}
+
+// WithSignalTimeout 最多等这么久。不设置就是无限等。
+func WithSignalTimeout(d time.Duration) SignalOption {
+	return func(o *signalOpt) { o.timeout = d }
+}
+
+// WaitForSignal 停在这里，等一个外部信号。
+//
+// 返回 (值, true) 表示收到了信号；(零值, false) 表示等到超时都没来。
+// 不设超时就会一直等——流程停在存储里，不占任何进程，重启也不受影响。
+//
+// 信号可以比等待先到：SendSignal 只是把值写进存储，谁先谁后都不影响结果。
+// 这一点很重要，因为回调（支付、转码、webhook）经常比流程走到这里更快。
+//
+// 同一个 key 只认第一个信号，后来的会被丢弃——重放必须读到同一个值，
+// 否则两遍重放可能走上不同的分支。
+func WaitForSignal[T any](c *Context, key string, opts ...SignalOption) (T, bool) {
+	var zero T
+
+	if c.collect != nil {
+		if c.collect("signal", key) {
+			return zero, false
+		}
+	}
+	c.markKeyUsed("WaitForSignal", key)
+
+	// 读信号位。返回 (值, 收到了吗, 这个位置已经被占了吗)。
+	// 被占且不是超时哨兵 = 真的收到了信号。
+	readSlot := func() (T, bool, bool) {
+		env, exist, err := GetFromStore[signalEnvelope](c.store, signalKey(key))
+		if err != nil {
+			storeUnavailable()
+		}
+		if !exist {
+			return zero, false, false
+		}
+		if env.TimedOut {
+			return zero, false, true
+		}
+		var v T
+		if len(env.Value) > 0 {
+			if err := json.Unmarshal(env.Value, &v); err != nil {
+				storeUnavailable()
+			}
+		}
+		return v, true, true
+	}
+
+	settle := func() {
+		_, err := c.store.UpdateNodeStatus(key, func(st TaskStatus, isNew bool) (TaskStatus, bool) {
+			if st.Status == TaskStatusDone {
+				return st, false
+			}
+			return st.MakeDone(), true
+		})
+		if err != nil {
+			storeUnavailable()
+		}
+	}
+
+	s, exist := mustGetNodeStatus(c.store, key)
+
+	// 已经结束过了：重放走这条路。信封里记着当初是收到了值还是超时，
+	// 所以答案和第一遍完全一致。
+	if s.Status == TaskStatusDone {
+		v, received, _ := readSlot()
+		return v, received
+	}
+
+	var opt signalOpt
+	for _, o := range opts {
+		o(&opt)
+	}
+
+	if !exist {
+		// 第一次走到这儿。信号可能已经先到了，先看一眼再决定要不要停。
+		if v, received, _ := readSlot(); received {
+			settle()
+			return v, true
+		}
+		var until time.Time
+		if opt.timeout > 0 {
+			until = time.Now().Add(opt.timeout)
+		}
+		panic(BreakSignal(key, until))
+	}
+
+	if s.Status == TaskStatusSignal {
+		if v, received, _ := readSlot(); received {
+			settle()
+			return v, true
+		}
+
+		// 超时时刻是第一次停泊时落盘的，不能在这里重新算——
+		// 否则每遍重放都往后推一次，永远等不到超时。
+		if !s.RunAt.IsZero() && !time.Now().Before(s.RunAt) {
+			// 用哨兵去抢这个信号位，把「事件和超时赛跑」的胜负一次性定死：
+			//   抢到了 → 确实超时。之后任何 SendSignal 都会被 first-wins 挡掉，
+			//            重放永远得到同一个 false。
+			//   抢不到 → 有值在我们判定超时的同一瞬间落了地，那就认它，
+			//            返回 true。同样是一次性定死的。
+			raw, mErr := json.Marshal(signalEnvelope{TimedOut: true})
+			if mErr != nil {
+				storeUnavailable()
+			}
+			claimed, sErr := c.store.SetKVNX("__"+signalKey(key), string(raw))
+			if sErr != nil {
+				storeUnavailable()
+			}
+			if !claimed {
+				if v, received, _ := readSlot(); received {
+					settle()
+					return v, true
+				}
+			}
+			settle()
+			return zero, false
+		}
+
+		panic(BreakSignal(key, s.RunAt))
+	}
+
+	panic(fmt.Sprintf("gotick: WaitForSignal %q found in unexpected state %q; "+
+		"这个 key 很可能同时被 Task 或 Sleep 用了", key, s.Status))
+}
+
 func Sleep(c *Context, key string, duration time.Duration) {
 	if c.collect != nil {
 		if c.collect("sleep", key) {
@@ -835,8 +980,9 @@ const (
 	TaskStatusDone    = "done"    // 已完成
 	TaskStatusFail    = "fail"    // 超过重试次数，整个 flow 失败
 	TaskStatusAbort   = "abort"   // 被手动终止
-	TaskStatusSleep   = "sleep"   // 等待到 RunAt
-	TaskStatusRetry   = "retry"   // 失败后等待重试
+	TaskStatusSleep   = "sleep"
+	TaskStatusSignal  = "wait_signal" // 等待到 RunAt
+	TaskStatusRetry   = "retry"       // 失败后等待重试
 )
 
 const (
@@ -968,6 +1114,20 @@ func (t TaskStatus) MakeClaimed(now time.Time) TaskStatus {
 	return t
 }
 
+// MakeWaitSignal 把 task 标记成「停在这里等一个信号」。
+//
+// runAt 是超时时刻，零值表示不超时、无限等。和 MakeSleep 一样，
+// 已经在等待中就不重置起点，否则界面上的等待时长会一直往回跳。
+func (t TaskStatus) MakeWaitSignal(runAt time.Time) TaskStatus {
+	if t.Status != TaskStatusSignal || t.StartedAt.IsZero() {
+		t.StartedAt = time.Now()
+	}
+	t.Status = TaskStatusSignal
+	t.RunAt = runAt
+	t.EndedAt = time.Time{}
+	return t
+}
+
 func (t TaskStatus) MakeSleep(runAt time.Time) TaskStatus {
 	// 记录进入 sleep 的时刻，这样界面上才能显示「睡了多久 / 还剩多久」，
 	// 而不是只有一个孤零零的唤醒时间戳。
@@ -1019,6 +1179,22 @@ type NodeStatusStore interface {
 
 	// ExpireAll 给这次调用的所有数据设置过期时间，用于回收已经结束的 flow。
 	ExpireAll(ttl time.Duration) error
+
+	// SetKVNX 仅当这个键还不存在时写入，返回是否写入成功。
+	//
+	// 信号需要它：同一个 key 收到两次信号时必须「第一个胜出」，
+	// 否则后来的值会覆盖前一个，而重放会读到新值——同一次调用在两遍
+	// 重放里看到不同的输入，分支就可能走岔，确定性直接破掉。
+	SetKVNX(k string, v string) (bool, error)
+
+	// Cancel 标记这次调用被取消。reason 可空，只用于展示。
+	//
+	// 取消是 run 级别的，不是 task 级别：作者不需要在 flow 里写任何等待点，
+	// 引擎在每次重放开头检查它。
+	Cancel(reason string) error
+
+	// Canceled 返回取消原因，以及是否已被取消。
+	Canceled() (reason string, canceled bool, err error)
 }
 
 // claimTask 原子地抢占一个 task 的执行权。
@@ -1221,6 +1397,20 @@ const (
 	// replayLeaseTTL 一次重放持有租约的时长。
 	// 进程被 kill 时租约靠它自动释放，别的节点才能接手。
 	replayLeaseTTL = 30 * time.Second
+	// cancelWatchInterval 重放期间多久查一次取消标志。
+	//
+	// 只影响「打断正在执行的 task」有多快，不影响取消本身生效：
+	// 取消在下一次重放开头一定会被读到，那个检查是无条件的。
+	//
+	// 代价：每个在飞的重放每 cancelWatchInterval 多一次 Redis 读。
+	// 并发 10 个重放就是 3.3 次/秒——相比这个项目空闲时 136 次/秒的基线，
+	// 可以忽略。（那个基线是改成共用队列之后实测的：12 个 flow 全部空闲、
+	// TaskCheckInterval 与 DelayedTaskCheckInterval 取默认值时的轮询地板；
+	// 改之前是 729 次/秒。条件不同数字会变，要权衡时请自己重测。）
+	//
+	// 调大省 Redis 但打断更迟；调小相反。取消本身的生效速度不受影响。
+	cancelWatchInterval = 3 * time.Second
+
 	// replayLeaseRenew 续期间隔，必须显著小于 replayLeaseTTL。
 	replayLeaseRenew = 10 * time.Second
 	// defaultRetainCompleted 已结束的 flow 数据默认保留多久。
@@ -1230,6 +1420,12 @@ const (
 // ErrReplayInFlight 表示同一个 callId 正在别的节点上重放。
 //
 // 它会被返回给消息队列，让这个事件稍后重投，而不是被丢掉。
+// ErrRunNotFound 运行索引里没有这次调用——没开索引，或者它已经过了保留期。
+var ErrRunNotFound = errors.New("gotick: run not found in the index")
+
+// ErrRunNotCancelable 这次调用已经有了终态，取消无意义。
+var ErrRunNotCancelable = errors.New("gotick: run already finished")
+
 var ErrReplayInFlight = errors.New("gotick: another worker is replaying this call")
 
 // nextEvent 描述本次重放结束后要发出的下一个调度事件。
@@ -1238,6 +1434,45 @@ type nextEvent struct {
 }
 
 // startLeaseRenewal 起一个后台 goroutine 持续续期重放租约，返回停止它的函数。
+// startCancelWatch 在一次重放期间轮询取消标志，一旦发现就 cancel 掉这次重放的
+// context——TaskContext 内嵌 *Context 内嵌 context.Context，所以业务代码里的
+// ctx.Done() 会直接就绪，一个跑了十分钟的 HTTP 请求能当场断掉。
+//
+// 没有用 asynq 的 CancelProcessing：那需要记住 asynq 的 task id、构造 Inspector，
+// 而且只对 asynq 有效。这里轮询的是 gotick 自己的状态，mock 队列一样能用，
+// 也和「取消是 gotick 的状态」这个前提一致。
+//
+// 轮询的频率和它的开销见 cancelWatchInterval。
+func startCancelWatch(store NodeStatusStore, onCancel func()) (stop func()) {
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+
+	go func() {
+		defer close(stopped)
+
+		t := time.NewTicker(cancelWatchInterval)
+		defer t.Stop()
+
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				if _, canceled, err := store.Canceled(); err == nil && canceled {
+					onCancel()
+					return // 取消是一次性的，喊完就收工
+				}
+			}
+		}
+	}()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() { close(done) })
+		<-stopped
+	}
+}
+
 func startLeaseRenewal(store NodeStatusStore, token string) (stop func()) {
 	done := make(chan struct{})
 	stopped := make(chan struct{})
@@ -1318,6 +1553,23 @@ func (s *Scheduler) register(f *Flow) {
 			}
 		}
 
+		// 取消检查放在最前面：比起执行一步再发现「其实不用做了」，
+		// 一步都不做更省。作者不需要在 flow 里写任何等待点。
+		if reason, canceled, cErr := statusStore.Canceled(); cErr != nil {
+			return cErr
+		} else if canceled {
+			if iErr := s.runIndex.FinishRun(callId, RunStatusCanceled, "", reason, time.Now()); iErr != nil {
+				log.Printf("[gotick] index canceled run %s failed: %v", callId, iErr)
+			}
+			if s.retainCompleted > 0 {
+				if eErr := statusStore.ExpireAll(s.retainCompleted); eErr != nil {
+					log.Printf("[gotick] set retention on canceled call %s failed: %v", callId, eErr)
+				}
+			}
+			releaseLease()
+			return nil
+		}
+
 		// 索引写失败不该让流程停下来——可观测性坏了比业务停摆好。
 		if err := s.runIndex.BeginRun(f.Id, callId, time.Now()); err != nil {
 			log.Printf("[gotick] index run %s failed: %v", callId, err)
@@ -1334,9 +1586,16 @@ func (s *Scheduler) register(f *Flow) {
 			mark       = ReplayMark{At: replayStart}
 		)
 
+		// 这次重放专属的可取消 ctx。观察者发现取消标志就 cancel 它，
+		// 于是正在执行的 TaskFun 里的 ctx.Done() 立刻就绪。
+		runCtx, cancelRun := context.WithCancel(ctx)
+		defer cancelRun()
+		stopCancelWatch := startCancelWatch(statusStore, cancelRun)
+		defer stopCancelWatch()
+
 		err = func() (err error) {
 			ctx := &Context{
-				Context: ctx,
+				Context: runCtx,
 				CallId:  callId,
 				store:   statusStore,
 				s:       aw,
@@ -1382,6 +1641,20 @@ func (s *Scheduler) register(f *Flow) {
 					// 退避时间由 MakeRetry 写在 RunAt 里。
 					// TODO 支持自定义退避算法
 					next = &nextEvent{delay: time.Until(newStatus.RunAt)}
+
+				case *breakSignal:
+					mark.Kind, mark.Task = "wait_signal", breakpoint.Key
+					if _, uErr := statusStore.UpdateNodeStatus(breakpoint.Key, func(st TaskStatus, isNew bool) (TaskStatus, bool) {
+						return st.WithStartedAt(ctx.attemptStart).MakeWaitSignal(breakpoint.Until), true
+					}); uErr != nil {
+						err = uErr
+						return
+					}
+					// Until 为零 = 无限等：next 保持 nil，一个事件都不发，
+					// 流程就停在存储里，等 SendSignal 来唤醒。
+					if !breakpoint.Until.IsZero() {
+						next = &nextEvent{delay: time.Until(breakpoint.Until)}
+					}
 
 				case *breakAbort:
 					mark.Kind, mark.Task = "abort", breakpoint.Task
@@ -1575,6 +1848,103 @@ func (t *Client) Trigger(ctx context.Context, flowId string, data MetaData, dela
 
 // StartServer 启动服务，在服务端应该调用此方法开始执行异步任务。
 // 当 ctx 被关闭时，服务也会关闭。
+// SendSignal 给一次调用发一个信号，唤醒它继续往下走。
+//
+// 可以在流程走到 WaitForSignal 之前就发——值先写进存储等着被取，
+// 回调比流程跑得快是常态，不该因此丢事件。
+//
+// 同一个 key 只认第一个信号，重复发送会被安静丢弃并返回 false：
+// 重放必须读到同一个值。返回 (true, nil) 表示这次的值被采纳了。
+func (t *Server) SendSignal(ctx context.Context, callId, key string, value any) (bool, error) {
+	return t.scheduler.SendSignal(ctx, callId, key, value)
+}
+
+func (s *Scheduler) SendSignal(ctx context.Context, callId, key string, value any) (bool, error) {
+	if callId == "" || key == "" {
+		return false, fmt.Errorf("gotick: SendSignal needs both callId and key")
+	}
+
+	// 唤醒要知道往哪个 flow 的队列发，这个信息只有运行索引有。
+	info, exist, err := s.runIndex.GetRun(callId)
+	if err != nil {
+		return false, err
+	}
+	if !exist {
+		return false, fmt.Errorf("%w: %s", ErrRunNotFound, callId)
+	}
+	if info.Finished() {
+		return false, fmt.Errorf("%w: %s is already %s", ErrRunNotCancelable, callId, info.Status)
+	}
+
+	inner, err := json.Marshal(value)
+	if err != nil {
+		return false, err
+	}
+	raw, err := json.Marshal(signalEnvelope{Value: inner})
+	if err != nil {
+		return false, err
+	}
+
+	// 「不存在才写」必须原子：两个回调同时到达时，不能各写一半。
+	// 它同时也是超时哨兵的对手——谁先占住这个位置，谁定结局。
+	accepted, err := s.statusFactory.New(callId).SetKVNX("__"+signalKey(key), string(raw))
+	if err != nil {
+		return false, err
+	}
+	if !accepted {
+		// 已经有值了。不唤醒——流程要么已经拿着那个值往下走了，
+		// 要么马上会拿到，再发一次事件只是多一轮无用重放。
+		return false, nil
+	}
+
+	// 唤醒失败不算发送失败：值已经落盘，流程被别的原因唤醒时一样能读到。
+	// 但如果它是无限等，那就真的要等到下一次有人碰它了，所以这里要报出来。
+	if err := s.asyncScheduler.New(info.FlowId).Publish(ctx, Event{CallId: callId}, 0); err != nil {
+		log.Printf("[gotick] signal %s/%s stored but wake up failed: %v", callId, key, err)
+	}
+	return true, nil
+}
+
+// Cancel 取消一次调用。
+//
+// 它做两件事：把取消标志写进这次调用的存储，然后立刻唤醒它。
+// 标志是唯一的真相来源——唤醒只是让「已经被取消」这件事早点被发现，
+// 不唤醒的话一个睡三天的流程会睡满三天才停。
+//
+// 已经结束的调用会返回 ErrRunNotCancelable。正在执行的 task 不会被立刻掐断，
+// 但它的 ctx 会在 cancelWatchInterval 之内被 cancel，业务代码可以据此提前返回。
+func (t *Server) Cancel(ctx context.Context, callId, reason string) error {
+	return t.scheduler.Cancel(ctx, callId, reason)
+}
+
+func (s *Scheduler) Cancel(ctx context.Context, callId, reason string) error {
+	if callId == "" {
+		return fmt.Errorf("gotick: cancel needs a callId")
+	}
+
+	// 唤醒要知道往哪个 flow 的队列发，这个信息只有运行索引有。
+	info, exist, err := s.runIndex.GetRun(callId)
+	if err != nil {
+		return err
+	}
+	if !exist {
+		return fmt.Errorf("%w: %s", ErrRunNotFound, callId)
+	}
+	if info.Finished() {
+		return fmt.Errorf("%w: %s is already %s", ErrRunNotCancelable, callId, info.Status)
+	}
+
+	if err := s.statusFactory.New(callId).Cancel(reason); err != nil {
+		return err
+	}
+
+	// 唤醒失败不算取消失败：标志已经落盘，流程自然醒来时一样会停。
+	if err := s.asyncScheduler.New(info.FlowId).Publish(ctx, Event{CallId: callId}, 0); err != nil {
+		log.Printf("[gotick] cancel %s: wake up failed, it will stop at its next scheduling point: %v", callId, err)
+	}
+	return nil
+}
+
 func (t *Server) StartServer(ctx context.Context) error {
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -1638,11 +2008,52 @@ func (n *KvNodeStatusStore) ExpireAll(ttl time.Duration) error {
 	if err := n.store.Expire(ctx, n.metaKey(), ttl); err != nil {
 		return err
 	}
+	if err := n.store.Expire(ctx, n.cancelKey(), ttl); err != nil {
+		return err
+	}
 	return n.store.Expire(ctx, n.statusKey(), ttl)
 }
 
+// cancelKey 用独立的键，而不是塞进 SetKV：那一份是给用户数据的，
+// 混在一起早晚会和某个 Memo 的 key 撞名。
+func (n *KvNodeStatusStore) cancelKey() string {
+	return n.key + "_cancel"
+}
+
+func (n *KvNodeStatusStore) Cancel(reason string) error {
+	if reason == "" {
+		reason = "canceled"
+	}
+	// SetNX 存的是裸字符串（租约就是这么用的，它从不经过 Get），
+	// 而 Get 走的是 json.Unmarshal——所以这里必须自己先编码，否则读不回来。
+	raw, err := json.Marshal(reason)
+	if err != nil {
+		return err
+	}
+
+	// 不覆盖已有的取消原因：第一个取消它的人才是原因的作者。
+	if _, err := n.store.SetNX(context.Background(), n.cancelKey(), string(raw), 0); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (n *KvNodeStatusStore) Canceled() (string, bool, error) {
+	var reason string
+	exist, err := n.store.Get(context.Background(), n.cancelKey(), &reason)
+	if err != nil {
+		return "", false, err
+	}
+	return reason, exist, nil
+}
+
 func (n *KvNodeStatusStore) Clear() error {
-	err := n.store.Delete(context.Background(), n.metaKey())
+	err := n.store.Delete(context.Background(), n.cancelKey())
+	if err != nil {
+		return err
+	}
+
+	err = n.store.Delete(context.Background(), n.metaKey())
 	if err != nil {
 		return err
 	}
@@ -1802,6 +2213,11 @@ func (n *KvNodeStatusStore) GetKV(k string) (string, bool, error) {
 
 func (n *KvNodeStatusStore) SetKV(k, v string) error {
 	return n.store.HSet(context.Background(), n.metaKey(), k, v)
+}
+
+func (n *KvNodeStatusStore) SetKVNX(k, v string) (bool, error) {
+	// expect 传 nil = 要求该字段当前不存在，整个判断在 Redis 侧原子完成
+	return n.store.HSetCAS(context.Background(), n.metaKey(), k, nil, v)
 }
 
 type Config struct {

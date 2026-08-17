@@ -12,10 +12,11 @@ import (
 
 // 一次 flow 调用的整体状态。
 const (
-	RunStatusRunning = "running"
-	RunStatusDone    = "done"
-	RunStatusFailed  = "failed"
-	RunStatusAborted = "aborted"
+	RunStatusRunning  = "running"
+	RunStatusDone     = "done"
+	RunStatusFailed   = "failed"
+	RunStatusAborted  = "aborted"
+	RunStatusCanceled = "canceled"
 )
 
 // RunInfo 是一次 flow 调用的概览，用于列表展示。
@@ -70,7 +71,8 @@ func (r RunInfo) Duration() time.Duration {
 
 // Finished 报告这次调用是否已经结束。
 func (r RunInfo) Finished() bool {
-	return r.Status == RunStatusDone || r.Status == RunStatusFailed || r.Status == RunStatusAborted
+	return r.Status == RunStatusDone || r.Status == RunStatusFailed ||
+		r.Status == RunStatusAborted || r.Status == RunStatusCanceled
 }
 
 // RunIndex 维护 flow 和运行实例的全局索引。
