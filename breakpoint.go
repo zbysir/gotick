@@ -87,3 +87,22 @@ func (b *breakWait) GetTask() string {
 func BreakWait(t time.Duration) Breakpoint {
 	return &breakWait{Task: "*", RunAt: time.Now().Add(t)} // * 表示不是针对某个 task 的断点，而是系统断点。
 }
+
+// breakSignal 停在这里等一个外部信号。
+//
+// Until 是超时时刻；零值表示无限等——那种情况下调度器不会安排任何后续事件，
+// 流程就停在存储里不动，直到 SendSignal 把它唤醒。这是唯一一种「不占进程、
+// 也没有预定唤醒时刻」的停泊。
+type breakSignal struct {
+	Key   string
+	Until time.Time
+}
+
+func (b *breakSignal) GetTask() string {
+	return b.Key
+}
+
+// BreakSignal 等待信号 key，until 为零值表示不超时。
+func BreakSignal(key string, until time.Time) Breakpoint {
+	return &breakSignal{Key: key, Until: until}
+}
