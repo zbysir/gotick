@@ -161,3 +161,64 @@ func TestTaskStatusElapsed(t *testing.T) {
 	kept := s.WithStartedAt(time.Time{})
 	assert.True(t, kept.StartedAt.Equal(start))
 }
+
+// FinishRun 应当顺带把过期的索引条目裁掉。
+//
+// 这一条是为了防回归：TrimBefore 早就写好了，但很长一段时间里没有任何
+// 生产代码调用它，索引因此只增不减。
+func TestRunIndexTrimsOnFinish(t *testing.T) {
+	retain := time.Hour
+	idx := NewKvRunIndex(store.NewMockKvStore(), retain)
+	now := time.Now().Truncate(time.Millisecond)
+
+	// 一条早就该过期的，和一条还在保留期内的
+	stale := now.Add(-3 * retain)
+	require.NoError(t, idx.BeginRun("a", "stale", stale))
+	require.NoError(t, idx.BeginRun("a", "fresh", now))
+
+	n, err := idx.CountRuns("")
+	require.NoError(t, err)
+	require.Equal(t, int64(2), n)
+
+	require.NoError(t, idx.FinishRun("fresh", RunStatusDone, "", "", now))
+
+	// 全局索引和该 flow 的索引都该只剩下没过期的那条
+	for _, flow := range []string{"", "a"} {
+		n, err := idx.CountRuns(flow)
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), n, "flow=%q", flow)
+	}
+	left, err := idx.ListRuns("", 0, 10)
+	require.NoError(t, err)
+	require.Len(t, left, 1)
+	assert.Equal(t, "fresh", left[0].CallId)
+}
+
+// 两次 FinishRun 挨着发生时，第二次不该再打一遍 Redis。
+func TestRunIndexTrimIsRateLimited(t *testing.T) {
+	idx := NewKvRunIndex(store.NewMockKvStore(), time.Hour)
+	now := time.Now().Truncate(time.Millisecond)
+
+	require.NoError(t, idx.BeginRun("a", "one", now))
+	require.NoError(t, idx.FinishRun("one", RunStatusDone, "", "", now))
+	first := idx.lastTrim
+	require.False(t, first.IsZero(), "第一次结束就该裁一次")
+
+	require.NoError(t, idx.BeginRun("a", "two", now))
+	require.NoError(t, idx.FinishRun("two", RunStatusDone, "", "", now.Add(time.Second)))
+	assert.Equal(t, first, idx.lastTrim, "间隔没到 trimInterval，不该再裁")
+}
+
+// retain <= 0 表示永久保留，这时一条都不该被裁掉。
+func TestRunIndexNoTrimWhenRetainDisabled(t *testing.T) {
+	idx := NewKvRunIndex(store.NewMockKvStore(), 0)
+	now := time.Now().Truncate(time.Millisecond)
+
+	require.NoError(t, idx.BeginRun("a", "ancient", now.Add(-10000*time.Hour)))
+	require.NoError(t, idx.BeginRun("a", "fresh", now))
+	require.NoError(t, idx.FinishRun("fresh", RunStatusDone, "", "", now))
+
+	n, err := idx.CountRuns("")
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), n, "永久保留时不该裁剪")
+}

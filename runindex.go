@@ -3,6 +3,8 @@ package gotick
 import (
 	"context"
 	"fmt"
+	"log"
+	"sync"
 	"time"
 
 	"github.com/zbysir/gotick/store"
@@ -108,7 +110,18 @@ type KvRunIndex struct {
 
 	// retain 索引里的记录保留多久，和 flow 数据的保留期保持一致。
 	retain time.Duration
+
+	// trimMu 保护 lastTrim：索引会被多个 goroutine 并发写。
+	trimMu   sync.Mutex
+	lastTrim time.Time
 }
+
+// trimInterval 两次裁剪之间至少隔这么久。
+//
+// 裁剪挂在 FinishRun 上，没有单独起后台 goroutine：索引本来就是被动写入的，
+// 多一个后台循环就多一份生命周期要管（还要考虑优雅退出）。代价是完全不跑 flow
+// 的进程不会裁剪——但那种进程也不会让索引变长。
+const trimInterval = 10 * time.Minute
 
 var _ RunIndex = (*KvRunIndex)(nil)
 
@@ -195,7 +208,46 @@ func (k *KvRunIndex) FinishRun(callId, status, failedTask, errMsg string, at tim
 	info.FailedTask = failedTask
 	info.Error = errMsg
 
-	return k.saveRun(info)
+	if err := k.saveRun(info); err != nil {
+		return err
+	}
+
+	k.trimIfDue(info.FlowId, at)
+	return nil
+}
+
+// trimIfDue 按保留期裁掉过旧的索引条目。
+//
+// 详情键 gotick:run:<callId> 自带 TTL，到期自己就没了；但 ZSET 成员不会跟着消失，
+// 于是列表里会越堆越多「点进去什么都没有」的空壳，翻很多页才看到有效记录。
+// 补的就是这一刀。
+//
+// 只裁 gotick:runs 和当前 flow 的 gotick:flow:<id>:runs——每个 flow 结束时会裁到
+// 自己那条，不需要枚举全部 flow。gotick:flows 不裁：它的大小由 flow 数量决定
+// （几十条），而且按时间裁会把仍在服役、只是很久没跑过的 flow 从下拉框里抹掉。
+func (k *KvRunIndex) trimIfDue(flowId string, now time.Time) {
+	if k.retain <= 0 {
+		return // <=0 表示永久保留，不裁
+	}
+
+	k.trimMu.Lock()
+	if !k.lastTrim.IsZero() && now.Sub(k.lastTrim) < trimInterval {
+		k.trimMu.Unlock()
+		return
+	}
+	k.lastTrim = now
+	k.trimMu.Unlock()
+
+	// 裁剪失败不该影响流程：索引是观测设施，不是流程状态的一部分。
+	cutoff := now.Add(-k.retain)
+	if _, err := k.TrimBefore("", cutoff); err != nil {
+		log.Printf("[gotick] trim run index failed: %v", err)
+	}
+	if flowId != "" {
+		if _, err := k.TrimBefore(flowId, cutoff); err != nil {
+			log.Printf("[gotick] trim run index of flow %s failed: %v", flowId, err)
+		}
+	}
 }
 
 func (k *KvRunIndex) saveRun(info RunInfo) error {
