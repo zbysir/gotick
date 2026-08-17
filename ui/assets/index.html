@@ -105,6 +105,7 @@
   .pill.aborted, .pill.abort { background: var(--crit-soft); color: var(--crit); }
   .pill.retry { background: var(--warn-soft); color: var(--warn); }
   .pill.sleep { background: var(--surface-2); color: var(--muted); }
+  .pill.wait_signal { background: var(--accent-soft); color: var(--accent); }
   .pill.unknown, .pill.expired { background: var(--surface-2); color: var(--faint); }
 
   .err {
@@ -225,11 +226,15 @@ const MESSAGES = {
     actSleeping: "睡眠中", actSleepingNote: "到点后会被自动唤醒；等待期间不占用任何进程，重启也不受影响",
     actRetrying: "等待重试", actRetryingNote: "上一次执行失败了，退避结束后会再试一次",
     actScheduling: "调度中", actSchedulingNote: "正处在两步之间，马上会被某个 worker 接走",
+    actAwaiting: "等信号",
+    actAwaitingNote: "停在这里等一个外部信号（支付回调、人工审批之类）。等待期间不占用任何进程，重启也不受影响。",
+    actAwaitingForeverNote: "没有设超时，所以它会一直等——除非有人发来这个信号，或者取消这次调用。",
+    actGiveUpIn: "超时还有 ",
     actDone: "已完成", actFailed: "已失败", actAborted: "已终止",
     actLeft: "还有 ", actRan: "已运行 ",
     kindDone: "任务完成", kindSleep: "进入睡眠", kindSleepRearm: "重新计时",
     kindRetry: "安排重试", kindWait: "等待下一步", kindFail: "任务失败",
-    kindAbort: "流程终止", kindFinish: "流程跑完",
+    kindAbort: "流程终止", kindFinish: "流程跑完", kindWaitSignal: "停下等信号",
     execLog: "执行记录", laps: "{n} 遍", lapsMore: "（另有 {n} 遍未记录完）",
     legacyRun: "这次调用是在执行记录上线之前跑的。",
     thTime: "时刻", thWhat: "这一遍做了什么", thGap: "距上一遍", earlyWake: "早醒",
@@ -254,11 +259,15 @@ const MESSAGES = {
     actSleeping: "Sleeping", actSleepingNote: "It wakes automatically when due. While waiting it holds no process, and a restart doesn't affect it",
     actRetrying: "Retry pending", actRetryingNote: "The last attempt failed; it will try again once the backoff ends",
     actScheduling: "Scheduling", actSchedulingNote: "Between two steps — a worker will pick it up shortly",
+    actAwaiting: "Awaiting signal",
+    actAwaitingNote: "Parked here waiting on an outside event — a payment callback, a human approval. It holds no process while waiting, and a restart doesn't affect it.",
+    actAwaitingForeverNote: "No timeout was set, so it waits indefinitely — until someone sends this signal, or the call is canceled.",
+    actGiveUpIn: "gives up in ",
     actDone: "Done", actFailed: "Failed", actAborted: "Aborted",
     actLeft: "wakes in ", actRan: "running for ",
     kindDone: "task finished", kindSleep: "went to sleep", kindSleepRearm: "re-armed timer",
     kindRetry: "retry scheduled", kindWait: "waiting for next step", kindFail: "task failed",
-    kindAbort: "flow aborted", kindFinish: "flow completed",
+    kindAbort: "flow aborted", kindFinish: "flow completed", kindWaitSignal: "parked to await a signal",
     execLog: "Execution log", laps: "{n} runs", lapsMore: " ({n} more not fully recorded)",
     legacyRun: "This call ran before the execution log existed.",
     thTime: "Time", thWhat: "What this run did", thGap: "Since previous", earlyWake: "early",
@@ -502,6 +511,13 @@ const ACTIVITY = {
   sleeping:   { key: "actSleeping",   dot: "",      note: "actSleepingNote" },
   retrying:   { key: "actRetrying",   dot: "warn",  note: "actRetryingNote" },
   scheduling: { key: "actScheduling", dot: "",      note: "actSchedulingNote" },
+  awaiting_signal: {
+    key: "actAwaiting",
+    dot: "",
+    note: "actAwaitingNote",
+    // 无限等时换一句话：说「马上」「还剩」都是假的
+    foreverNote: "actAwaitingForeverNote",
+  },
   done:       { key: "actDone",       dot: "still" },
   failed:     { key: "actFailed",     dot: "still" },
   aborted:    { key: "actAborted",    dot: "still" },
@@ -512,13 +528,30 @@ function activityBanner(a) {
 
   const m = ACTIVITY[a.state] || { dot: "still" };
   const label = m.key ? t(m.key) : a.state;
-  const note = m.note ? t(m.note) : "";
+  let noteKey = m.note;
+  if (a.state === "awaiting_signal" && isZeroTime(a.until) && m.foreverNote) {
+    noteKey = m.foreverNote;
+  }
+  const note = noteKey ? t(noteKey) : "";
   const idle = ["done", "failed", "aborted"].includes(a.state);
 
   let timing = "";
   let progress = "";
 
-  if ((a.state === "sleeping" || a.state === "retrying") && !isZeroTime(a.until)) {
+  if (a.state === "awaiting_signal") {
+    // 有 until = 设了超时，倒计时到的是「放弃等待」的时刻，措辞要和睡眠区分开
+    if (!isZeroTime(a.until)) {
+      timing = `<span class="activity-time">${t("actGiveUpIn")}` +
+               `<span class="countdown" data-countdown="${esc(a.until)}">…</span></span>`;
+      if (!isZeroTime(a.since)) {
+        progress = `<div class="prog"><i data-from="${esc(a.since)}" data-to="${esc(a.until)}"></i></div>`;
+      }
+    } else if (!isZeroTime(a.since)) {
+      // 无限等：只报「已经等了多久」，不编一个不存在的倒计时
+      timing = `<span class="activity-time">${t("actRan")}` +
+               `<span class="countdown" data-elapsed="${esc(a.since)}">…</span></span>`;
+    }
+  } else if ((a.state === "sleeping" || a.state === "retrying") && !isZeroTime(a.until)) {
     timing = `<span class="activity-time">${t("actLeft")}` +
              `<span class="countdown" data-countdown="${esc(a.until)}">…</span></span>`;
     if (!isZeroTime(a.since)) {
@@ -555,6 +588,7 @@ const REPLAY_KIND = {
   fail:        "kindFail",
   abort:       "kindAbort",
   finish:      "kindFinish",
+  wait_signal: "kindWaitSignal",
 };
 
 // GAP_WARN 超过这个间隔才值得看一眼。
@@ -731,7 +765,7 @@ async function renderDetail(callId) {
   // 睡得还久就没必要一直问后端——倒计时在本地自己走，看起来一样是活的。
   let poll = 3000;
   const a = d.activity;
-  if (a && a.state === "sleeping" && !isZeroTime(a.until)) {
+  if (a && (a.state === "sleeping" || a.state === "awaiting_signal") && !isZeroTime(a.until)) {
     const left = Date.parse(a.until) - Date.now();
     if (left > 30000) poll = Math.min(15000, left - 2000);
   }

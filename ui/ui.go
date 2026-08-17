@@ -346,16 +346,26 @@ func deriveActivity(run gotick.RunInfo, tasks []taskView) activity {
 		}
 	}
 
-	// 其次是等待中的：取最早醒来的那个，它决定了整个流程什么时候能往下走
+	// 其次是有明确醒来时刻的：取最早的那个，它决定了整个流程什么时候能往下走
 	var next *taskView
+	// 无限等信号的单独记着：它没有醒来时刻，排不进上面的比较，
+	// 但它恰恰是最需要被报出来的——不报的话界面会说「马上会被 worker 接走」，
+	// 而事实是没有 SendSignal 它永远不会动。
+	var forever *taskView
 	for i := range tasks {
 		t := &tasks[i]
 		switch t.Status {
-		case gotick.TaskStatusSleep, gotick.TaskStatusRetry:
+		case gotick.TaskStatusSleep, gotick.TaskStatusRetry, gotick.TaskStatusSignal:
 		default:
 			continue
 		}
-		if t.RunAt.IsZero() || !t.RunAt.After(now) {
+		if t.RunAt.IsZero() {
+			if t.Status == gotick.TaskStatusSignal && forever == nil {
+				forever = t
+			}
+			continue
+		}
+		if !t.RunAt.After(now) {
 			continue
 		}
 		if next == nil || t.RunAt.Before(next.RunAt) {
@@ -363,11 +373,20 @@ func deriveActivity(run gotick.RunInfo, tasks []taskView) activity {
 		}
 	}
 	if next != nil {
-		state := "sleeping"
-		if next.Status == gotick.TaskStatusRetry {
+		var state string
+		switch next.Status {
+		case gotick.TaskStatusRetry:
 			state = "retrying"
+		case gotick.TaskStatusSignal:
+			state = "awaiting_signal" // 带超时的等待，Until 就是超时时刻
+		default:
+			state = "sleeping"
 		}
 		return activity{State: state, Task: next.Key, Since: next.StartedAt, Until: next.RunAt}
+	}
+	if forever != nil {
+		// 不给 Until：没有截止时间，界面不该显示一个假的倒计时
+		return activity{State: "awaiting_signal", Task: forever.Key, Since: forever.StartedAt}
 	}
 
 	// 没有任何任务在跑也没有在等，说明正处在两步之间的调度间隙
