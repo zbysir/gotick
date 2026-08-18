@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 64" role="img" aria-labelledby="title">
+  <title id="title">gotick dark-mode logo</title>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <g stroke="#00ADD8" stroke-width="6">
+      <path d="M22 13v34q0 7 7 7h3"/>
+      <path d="M14 24h40"/>
+    </g>
+    <circle cx="22" cy="24" r="3" fill="#F04E3E"/>
+    <g stroke="#E6EDF3" stroke-width="5">
+      <path d="M96 25c-3-4-11-4-15 0s-4 13 0 17 12 3 15-1M96 24v20c0 7-5 10-11 10-4 0-7-1-9-3"/>
+      <path d="M106 33c0-7 4-11 10-11s10 4 10 11-4 11-10 11-10-4-10-11Z"/>
+      <path d="M136 16v22c0 4 2 6 6 6M132 24h14"/>
+      <path d="M155 24v20M155 16h.1"/>
+      <path d="M185 26c-2-3-5-4-8-4-7 0-11 5-11 11s4 11 11 11c3 0 6-1 8-4"/>
+      <path d="M196 15v29M214 23l-12 10 13 11"/>
+    </g>
+  </g>
+</svg>

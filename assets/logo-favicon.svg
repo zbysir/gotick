@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+  <title id="title">gotick clock-hands t mark, optically sized for favicons</title>
+  <g fill="none" stroke="#00ADD8" stroke-width="6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M22 13v34q0 7 7 7h3"/>
+    <path d="M14 24h40"/>
+  </g>
+  <circle cx="22" cy="24" r="5" fill="#F04E3E"/>
+</svg>
