@@ -21,6 +21,12 @@ type KVStore interface {
 	// 这是并发安全地更新任务状态的唯一手段：读-改-写不是原子的，
 	// 多个节点同时调度同一个 callId 时会互相覆盖重试计数和状态。
 	HSetCAS(ctx context.Context, table string, key string, expect *string, value interface{}) (bool, error)
+
+	// HDelIf 仅当字段的当前原始值等于 expect 时才删除，返回是否删掉了。
+	//
+	// 「只有仍然属于我时才解绑」需要它：一个已经被别人顶替的绑定，
+	// 不能被上一个持有者在结束时顺手删掉。
+	HDelIf(ctx context.Context, table string, key string, expect string) (bool, error)
 	Delete(ctx context.Context, key string) error
 
 	// 下面三个用于实现带自动过期的租约（同一个 callId 同时只允许一个节点重放）。
@@ -76,6 +82,10 @@ func (w *WithPrefix) HSet(ctx context.Context, table string, key string, value i
 
 func (w *WithPrefix) HSetCAS(ctx context.Context, table string, key string, expect *string, value interface{}) (bool, error) {
 	return w.store.HSetCAS(ctx, w.prefix+table, key, expect, value)
+}
+
+func (w *WithPrefix) HDelIf(ctx context.Context, table string, key string, expect string) (bool, error) {
+	return w.store.HDelIf(ctx, w.prefix+table, key, expect)
 }
 
 func (w *WithPrefix) Delete(ctx context.Context, table string) error {
@@ -186,6 +196,24 @@ func (r *RedisStore) HSet(ctx context.Context, table string, key string, value i
 		return err
 	}
 	return r.redis.HSet(ctx, table, key, bs).Err()
+}
+
+// hdelIfScript 比较字段原始值，相等才 HDEL。和 casScript 一样，
+// 比较和删除必须在同一个原子步骤里，否则两个节点会互相删掉对方的绑定。
+var hdelIfScript = redis.NewScript(`
+local cur = redis.call('HGET', KEYS[1], ARGV[1])
+if cur == false then return 0 end
+if cur ~= ARGV[2] then return 0 end
+redis.call('HDEL', KEYS[1], ARGV[1])
+return 1
+`)
+
+func (r *RedisStore) HDelIf(ctx context.Context, table string, key string, expect string) (bool, error) {
+	res, err := hdelIfScript.Run(ctx, r.redis, []string{table}, key, expect).Int64()
+	if err != nil {
+		return false, err
+	}
+	return res == 1, nil
 }
 
 func (r *RedisStore) HSetCAS(ctx context.Context, table string, key string, expect *string, value interface{}) (bool, error) {

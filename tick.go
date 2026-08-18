@@ -1315,8 +1315,11 @@ const maxEventBounces = 50
 const bounceDelay = 200 * time.Millisecond
 
 type AsyncQueue interface {
-	// Publish 当 uniqueKey 不为空时，后面 Publish 的数据会覆盖前面的数据
-	// uniqueKey 通常为 callId
+	// Publish 投递一个事件。delay 为 0 表示尽快执行。
+	//
+	// 队列层不做去重也不做顶替：同一个 callId 被投递两次就是会被消费两次，
+	// 靠重放租约和状态存储保证不会重复执行。「同 key 顶替」是调度器层面
+	// 用 keyIndex 做的，和这里无关。
 	Publish(ctx context.Context, data Event, delay time.Duration) error
 	Subscribe(h func(ctx context.Context, data Event) error)
 }
@@ -1378,6 +1381,9 @@ type Scheduler struct {
 	// runIndex 记录 flow 与运行实例的索引，供 inspect 和 UI 使用。
 	// 默认是 no-op，不产生任何额外写入。
 	runIndex RunIndex
+
+	// keys 业务 key 到 callId 的绑定。为 nil 时 WithKey 不可用。
+	keys *keyIndex
 }
 
 func NewScheduler(asyncScheduler AsyncQueueFactory, statusStore StoreFactory) *Scheduler {
@@ -1420,6 +1426,99 @@ const (
 // ErrReplayInFlight 表示同一个 callId 正在别的节点上重放。
 //
 // 它会被返回给消息队列，让这个事件稍后重投，而不是被丢掉。
+// TriggerOption 配置一次触发。
+type TriggerOption func(*triggerOpt)
+
+type triggerOpt struct {
+	key   string
+	delay time.Duration
+}
+
+// WithKey 用业务自己的标识给这次调用命名（订单号、用户 ID 之类）。
+//
+// 有了它就不必再存 gotick 生成的 callId：CancelByKey / SendSignalByKey
+// 直接用同一个 key 寻址。
+//
+// 默认顶替：同一个 (flow, key) 再次触发时，前一个还没结束的调用会被取消，
+// 只有最后一次继续跑。旧的落 canceled 终态而不是凭空消失，检查界面上看得到。
+//
+// 想要的是「已经有一个在跑就别再开」的话，这里给不了——那是去重，不是顶替。
+func WithKey(key string) TriggerOption {
+	return func(o *triggerOpt) { o.key = key }
+}
+
+// WithDelay 延迟触发。
+func WithDelay(d time.Duration) TriggerOption {
+	return func(o *triggerOpt) { o.delay = d }
+}
+
+// keyIndex 把「业务自己的 key」映射到 callId。
+//
+// 为什么需要它：不给 key 的话，取消和发信号都得拿 callId，而那是 gotick 生成的
+// 随机串——业务方得在订单表上多存一列，那列除了给 gotick 用没有任何别的意义。
+// 有了 key，调用方用自己本来就有的标识（订单号、用户 ID）就能寻址。
+//
+// 一个 flow 一张哈希表，字段是 key。作用域是 (flowId, key)：
+// 不同 flow 用同一个订单号是正常的，不该互相顶替。
+type keyIndex struct {
+	store store.KVStore
+}
+
+func (k *keyIndex) table(flowId string) string { return "gotick:keys:" + flowId }
+
+func (k *keyIndex) get(flowId, key string) (string, bool, error) {
+	var callId string
+	exist, err := k.store.HGet(context.Background(), k.table(flowId), key, &callId)
+	return callId, exist, err
+}
+
+// bind 把 key 指向 callId，返回被顶替掉的那个 callId（没有就是空）。
+//
+// 用 CAS 换绑：两个 Trigger 同时用一个 key 时必须有且只有一个赢，
+// 否则两边都以为自己顶替了对方，最后两个流程一起跑。
+func (k *keyIndex) bind(flowId, key, callId string) (prev string, err error) {
+	ctx := context.Background()
+	table := k.table(flowId)
+
+	for attempt := 0; attempt < 8; attempt++ {
+		cur, exist, err := k.get(flowId, key)
+		if err != nil {
+			return "", err
+		}
+
+		var expect *string
+		if exist {
+			raw, _ := json.Marshal(cur)
+			str := string(raw)
+			expect = &str
+		}
+
+		ok, err := k.store.HSetCAS(ctx, table, key, expect, callId)
+		if err != nil {
+			return "", err
+		}
+		if ok {
+			if exist {
+				return cur, nil
+			}
+			return "", nil
+		}
+		// 有人抢先了，重读一遍再试
+	}
+	return "", fmt.Errorf("gotick: bind key %q of flow %q failed after retries", key, flowId)
+}
+
+// unbind 只在这个 key 仍然指向 callId 时才解绑。
+// 已经被顶替过的绑定不能被上一个持有者在结束时顺手删掉。
+func (k *keyIndex) unbind(flowId, key, callId string) error {
+	raw, err := json.Marshal(callId)
+	if err != nil {
+		return err
+	}
+	_, err = k.store.HDelIf(context.Background(), k.table(flowId), key, string(raw))
+	return err
+}
+
 // ErrRunNotFound 运行索引里没有这次调用——没开索引，或者它已经过了保留期。
 var ErrRunNotFound = errors.New("gotick: run not found in the index")
 
@@ -1560,6 +1659,14 @@ func (s *Scheduler) register(f *Flow) {
 		} else if canceled {
 			if iErr := s.runIndex.FinishRun(callId, RunStatusCanceled, "", reason, time.Now()); iErr != nil {
 				log.Printf("[gotick] index canceled run %s failed: %v", callId, iErr)
+			}
+			// 取消也是结束，一样要解绑——否则 key 会一直指着一个已经死掉的调用
+			if s.keys != nil {
+				if key, ok, kErr := statusStore.GetKV(runKeyField); kErr == nil && ok && key != "" {
+					if uErr := s.keys.unbind(f.Id, key, callId); uErr != nil {
+						log.Printf("[gotick] unbind key %s/%s failed: %v", f.Id, key, uErr)
+					}
+				}
 			}
 			if s.retainCompleted > 0 {
 				if eErr := statusStore.ExpireAll(s.retainCompleted); eErr != nil {
@@ -1775,6 +1882,17 @@ func (s *Scheduler) register(f *Flow) {
 			}
 		}
 
+		// 流程结束就解绑，否则一个订单一辈子只能跑一次这个 flow。
+		// unbind 内部只在绑定仍然指向自己时才删——已经被顶替掉的绑定
+		// 不能被上一个持有者顺手删掉。
+		if terminal && s.keys != nil {
+			if key, ok, kErr := statusStore.GetKV(runKeyField); kErr == nil && ok && key != "" {
+				if uErr := s.keys.unbind(f.Id, key, callId); uErr != nil {
+					log.Printf("[gotick] unbind key %s/%s failed: %v", f.Id, key, uErr)
+				}
+			}
+		}
+
 		if terminal && s.retainCompleted > 0 {
 			// 已经结束的 flow 不再需要长期保留。
 			// 用过期而不是直接删除：迟到的重复事件仍然能看到「已完成」，
@@ -1798,8 +1916,93 @@ func (s *Scheduler) register(f *Flow) {
 }
 
 // Trigger 触发一次流程运行
-func (s *Scheduler) Trigger(ctx context.Context, flowId string, initData MetaData, delay time.Duration) (string, error) {
-	return s.trigger.Trigger(ctx, flowId, initData, delay)
+func (s *Scheduler) Trigger(ctx context.Context, flowId string, initData MetaData, delay time.Duration, opts ...TriggerOption) (string, error) {
+	var opt triggerOpt
+	opt.delay = delay
+	for _, o := range opts {
+		o(&opt)
+	}
+
+	if opt.key == "" {
+		return s.trigger.Trigger(ctx, flowId, initData, opt.delay)
+	}
+
+	if s.keys == nil {
+		return "", fmt.Errorf("gotick: WithKey needs a KVStore-backed scheduler")
+	}
+
+	callId := randomStr()
+
+	// 先抢绑定再发事件。反过来的话，新流程可能在绑定生效前就跑起来，
+	// 而此时按 key 取消会打到旧的那个。
+	prev, err := s.keys.bind(flowId, opt.key, callId)
+	if err != nil {
+		return "", err
+	}
+
+	// 顶替：旧的走正常取消流程，落 canceled 终态，界面上能看到它是被顶掉的，
+	// 而不是凭空消失。取消失败不该拦住新流程——它已经拿到绑定了。
+	if prev != "" && prev != callId {
+		if cErr := s.Cancel(ctx, prev, "superseded by "+callId); cErr != nil &&
+			!errors.Is(cErr, ErrRunNotCancelable) && !errors.Is(cErr, ErrRunNotFound) {
+			log.Printf("[gotick] supersede %s of key %s/%s failed: %v", prev, flowId, opt.key, cErr)
+		}
+	}
+
+	// 把 key 记进这次调用的存储，终态时用它解绑
+	if err := s.statusFactory.New(callId).SetKV(runKeyField, opt.key); err != nil {
+		return "", err
+	}
+
+	event := Event{CallId: callId, InitMetaData: initData}
+	if err := s.asyncScheduler.New(flowId).Publish(ctx, event, opt.delay); err != nil {
+		return "", err
+	}
+	return callId, nil
+}
+
+// runKeyField 这次调用绑定的业务 key 存在哪。__ 前缀是保留命名空间。
+const runKeyField = "__gotick_key"
+
+// CancelByKey 按业务 key 取消，不必知道 callId。
+func (t *Server) CancelByKey(ctx context.Context, flowId, key, reason string) error {
+	return t.scheduler.CancelByKey(ctx, flowId, key, reason)
+}
+
+func (s *Scheduler) CancelByKey(ctx context.Context, flowId, key, reason string) error {
+	callId, err := s.resolveKey(flowId, key)
+	if err != nil {
+		return err
+	}
+	return s.Cancel(ctx, callId, reason)
+}
+
+// SendSignalByKey 按业务 key 发信号，不必知道 callId。
+func (t *Server) SendSignalByKey(ctx context.Context, flowId, key, signal string, value any) (bool, error) {
+	return t.scheduler.SendSignalByKey(ctx, flowId, key, signal, value)
+}
+
+func (s *Scheduler) SendSignalByKey(ctx context.Context, flowId, key, signal string, value any) (bool, error) {
+	callId, err := s.resolveKey(flowId, key)
+	if err != nil {
+		return false, err
+	}
+	return s.SendSignal(ctx, callId, signal, value)
+}
+
+func (s *Scheduler) resolveKey(flowId, key string) (string, error) {
+	if s.keys == nil {
+		return "", fmt.Errorf("gotick: key addressing needs a KVStore-backed scheduler")
+	}
+	callId, exist, err := s.keys.get(flowId, key)
+	if err != nil {
+		return "", err
+	}
+	if !exist || callId == "" {
+		// 流程结束时会解绑，所以查不到通常意味着「它已经跑完了」
+		return "", fmt.Errorf("%w: flow %s key %s", ErrRunNotFound, flowId, key)
+	}
+	return callId, nil
 }
 
 type Trigger struct {
@@ -1837,8 +2040,8 @@ func (t *Server) RunIndex() RunIndex {
 }
 
 // Trigger 触发一次流程运行，在服务端和客户端都可以调用。
-func (t *Server) Trigger(ctx context.Context, flowId string, data MetaData) (string, error) {
-	return t.scheduler.Trigger(ctx, flowId, data, 0)
+func (t *Server) Trigger(ctx context.Context, flowId string, data MetaData, opts ...TriggerOption) (string, error) {
+	return t.scheduler.Trigger(ctx, flowId, data, 0, opts...)
 }
 
 // Trigger 触发一次流程运行，在服务端和客户端都可以调用。
@@ -2253,6 +2456,7 @@ func newScheduler(delayedQueue store.DelayedQueue, kvStore store.KVStore) *Sched
 	// 索引和状态存在同一个 KVStore 上，所以只要有存储就能有可观测性，
 	// 不需要额外配置任何东西。
 	s.runIndex = NewKvRunIndex(kvStore, s.retainCompleted)
+	s.keys = &keyIndex{store: kvStore}
 	return s
 }
 

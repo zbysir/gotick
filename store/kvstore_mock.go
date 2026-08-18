@@ -120,6 +120,18 @@ func (m *MockKvStore) HSet(ctx context.Context, table string, key string, value 
 	return nil
 }
 
+func (m *MockKvStore) HDelIf(ctx context.Context, table string, key string, expect string) (bool, error) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	cur, exists := m.hm[table][key]
+	if !exists || string(cur) != expect {
+		return false, nil
+	}
+	delete(m.hm[table], key)
+	return true, nil
+}
+
 func (m *MockKvStore) HSetCAS(ctx context.Context, table string, key string, expect *string, value interface{}) (bool, error) {
 	bs, err := json.Marshal(value)
 	if err != nil {
