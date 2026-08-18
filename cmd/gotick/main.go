@@ -113,7 +113,9 @@ func serveUI(args []string) error {
 		return fmt.Errorf("refusing to listen on %s without -auth: the inspector shows every "+
 			"flow's metadata. Pass -auth user:password, or bind to 127.0.0.1", *addr)
 	}
-	fmt.Fprintf(os.Stderr, "gotick inspector on http://%s (%s, redis: %s)\n", *addr, protection, *redisURL)
+	// 版本号写进启动行：容器里这行日志就是「部署上去的到底是哪一版」的第一现场。
+	fmt.Fprintf(os.Stderr, "gotick %s inspector on http://%s (%s, redis: %s)\n",
+		gotick.Version(), *addr, protection, *redisURL)
 
 	// 走 ui.ListenAndServe 而不是 http.ListenAndServe，这样「没有凭据就不许绑非回环地址」
 	// 这道拦截对命令行同样生效。

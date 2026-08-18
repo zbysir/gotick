@@ -19,9 +19,16 @@ COPY . .
 ARG TARGETOS
 ARG TARGETARCH
 
+# 版本号得从外面传进来。这里是在仓库里直接 go build，主模块版本只会是 "(devel)"，
+# 而 .dockerignore 排掉了 .git，连 VCS 戳都没有——不注入的话，恰恰是发布出去的
+# 这个产物说不清自己是哪一版。CI 传的是 docker/metadata-action 算出的那个版本。
+ARG VERSION=""
+
 # CGO_ENABLED=0 才能进 distroless/static；-s -w 去掉符号表和调试信息
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w" -o /out/gotick ./cmd/gotick
+    go build -trimpath \
+    -ldflags="-s -w -X github.com/zbysir/gotick.version=${VERSION}" \
+    -o /out/gotick ./cmd/gotick
 
 FROM gcr.io/distroless/static-debian12:nonroot
 
