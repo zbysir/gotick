@@ -46,8 +46,8 @@ func main() {
 	// 等调度器起来
 	time.Sleep(300 * time.Millisecond)
 
-	trigger := func(flow string, meta gotick.MetaData) {
-		callId, err := tick.Trigger(ctx, flow, meta)
+	trigger := func(flow string, meta gotick.MetaData, opts ...gotick.TriggerOption) {
+		callId, err := tick.Trigger(ctx, flow, meta, opts...)
 		if err != nil {
 			log.Printf("trigger %s: %v", flow, err)
 			return
@@ -55,12 +55,18 @@ func main() {
 		log.Printf("triggered %-22s %s", flow, callId)
 	}
 
-	trigger("demo/checkout", gotick.MetaData{"order_id": "ORD-88231", "user": "bysir"})
-	trigger("demo/checkout", gotick.MetaData{"order_id": "ORD-88232", "user": "alice"})
+	// 一部分带业务 key：界面上的 Key 列和按 key 搜索都靠它，
+	// 全都不带的话那两个功能在 demo 数据里根本看不出来。
+	trigger("demo/checkout", gotick.MetaData{"order_id": "ORD-88231", "user": "bysir"},
+		gotick.WithKey("ORD-88231"))
+	trigger("demo/checkout", gotick.MetaData{"order_id": "ORD-88232", "user": "alice"},
+		gotick.WithKey("ORD-88232"))
 	trigger("demo/flaky-email", gotick.MetaData{"to": "someone@example.com"})
-	trigger("demo/broken-payment", gotick.MetaData{"order_id": "ORD-99001"})
+	trigger("demo/broken-payment", gotick.MetaData{"order_id": "ORD-99001"},
+		gotick.WithKey("ORD-99001"))
 	trigger("demo/parallel-fetch", gotick.MetaData{"batch": "2026-08-14"})
-	trigger("demo/slow-drip", gotick.MetaData{"note": "这个会跑一分钟，用来看 running 状态"})
+	trigger("demo/slow-drip", gotick.MetaData{"note": "这个会跑一分钟，用来看 running 状态"},
+		gotick.WithKey("drip-1"))
 	trigger("demo/scheduled-report", gotick.MetaData{"report": "weekly-2026-W33"})
 
 	fmt.Fprintln(os.Stderr, "\n触发完毕。现在另开一个终端运行：")

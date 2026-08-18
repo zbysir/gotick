@@ -149,8 +149,9 @@ tick.CancelByKey(ctx, "order/close", orderId, "用户撤单")
 ## 看它现在跑到哪了
 
 内置一个检查界面：哪些流程在跑、每一个停在哪一步、花了多久、哪里失败了、睡着的
-那个还剩多久。它就是一个普通的 `http.Handler`，直接读 Redis，不需要连上正在跑的
-worker：
+那个还剩多久。列表里带着触发时传的 metadata，可以按 flow、状态、call id 或者
+`WithKey` 绑的业务 key 筛——「ORD-88231 那单怎么了」是查一次，不是翻一屏。
+它就是一个普通的 `http.Handler`，直接读 Redis，不需要连上正在跑的 worker：
 
 ```go
 h, _ := ui.NewHandler(ui.Options{

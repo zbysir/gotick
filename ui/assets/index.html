@@ -4,6 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>gotick</title>
+<!-- 内联的 data URI，不额外开一个静态资源路由：这个界面可以被挂在任意前缀下，
+     一个写死路径的 <link> 在 /_gotick/ 这种挂法下就 404 了。
+     用 logo-favicon.svg 那一版——它的轴心点是为小尺寸放大过的。 -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cg fill='none' stroke='%2300ADD8' stroke-width='6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M22 13v34q0 7 7 7h3'/%3E%3Cpath d='M14 24h40'/%3E%3C/g%3E%3Ccircle cx='22' cy='24' r='5' fill='%23F04E3E'/%3E%3C/svg%3E">
 <style>
   :root {
     --ground: #f7f7f7;
@@ -18,6 +22,9 @@
     --warn: #855800;
     --crit: #a32118;
     --crit-soft: #fbe7e4;
+    /* logo 轴心点的珊瑚色，两个主题共用一个值——它是品牌色，不跟着界面配色走。
+       和 --crit 刻意不同：那个点不是一个报错信号。 */
+    --pivot: #f04e3e;
     --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
     --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
             "Hiragino Sans GB", "Noto Sans SC", "Microsoft YaHei", sans-serif;
@@ -48,7 +55,17 @@
     font-family: var(--mono); font-size: 19px; font-weight: 600;
     letter-spacing: -.03em; color: var(--accent); text-decoration: none;
   }
+  /* 标记的笔画走 currentColor，跟着 .brand 一起是 --accent；只有轴心点是品牌珊瑚色。
+     .brand 保持 inline（不是 inline-flex）：header 是按基线对齐的，
+     换成 flex 容器之后基线会变成 svg 的下边缘，整行字就浮起来了。 */
+  .brand .mark { width: 21px; height: 21px; vertical-align: -4px; margin-right: 7px; }
   .tagline { color: var(--faint); font-size: 12.5px; }
+  /* 版本号是「要找的时候能找到」的信息，不是要看的信息，所以给到 --line-strong
+     这一档——比 tagline 还退一步，扫视时不会把它读进来。 */
+  .ver {
+    font-family: var(--mono); font-size: 11px; color: var(--line-strong);
+    letter-spacing: .02em;
+  }
   header .spacer { flex: 1; }
   .refresh { font-family: var(--mono); font-size: 11.5px; color: var(--faint); }
 
@@ -136,6 +153,68 @@
     border-radius: 3px; padding: 12px 16px; margin-bottom: 18px; font-size: 13px;
   }
 
+  /* ---- 筛选 / 翻页 ---- */
+  .toolbar input { width: 168px; }
+  .toolbar input::placeholder { color: var(--faint); }
+  button[disabled] {
+    opacity: .4; cursor: default;
+  }
+  button[disabled]:hover { border-color: var(--line-strong); color: var(--ink); }
+
+  .pager {
+    display: flex; align-items: center; gap: 12px; justify-content: flex-end;
+    padding: 10px 16px; border-top: 1px solid var(--line);
+  }
+  .pager .range {
+    font-family: var(--mono); font-size: 11.5px; color: var(--faint);
+    font-variant-numeric: tabular-nums; margin-right: auto;
+  }
+
+  /* note 是「说明」而不是「告警」：范围受限、只筛了一页这类事必须说出来，
+     但它们不是错误，配色跟 --faint 走，不抢 banner 的红。 */
+  .note {
+    padding: 10px 16px; border-top: 1px solid var(--line);
+    font-size: 12.5px; color: var(--faint);
+  }
+
+  /* ---- 列表里的 metadata ---- */
+  .metapair {
+    display: inline-flex; align-items: baseline; gap: 4px;
+    font-family: var(--mono); font-size: 11.5px;
+    max-width: 220px; margin-right: 8px;
+  }
+  .metapair b { color: var(--faint); font-weight: 500; flex: none; }
+  /* min-width:0 是必须的：flex 子项默认 min-width:auto，撑不小就不会出省略号，
+     一个长 metadata 值会直接把这一列顶宽。 */
+  .metapair span {
+    color: var(--ink); min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .metamore {
+    font-family: var(--mono); font-size: 10.5px; padding: 0 5px;
+    border-radius: 2px; vertical-align: 1px;
+  }
+
+  /* ---- metadata 弹窗 ---- */
+  /* 挂在 #app 外面：列表每 3 秒会整块重渲染，放在里面的弹窗会被刷掉。 */
+  .modal {
+    position: fixed; inset: 0; z-index: 20;
+    display: flex; align-items: center; justify-content: center; padding: 24px;
+    background: rgba(0, 0, 0, .45);
+  }
+  .modal-card {
+    background: var(--surface); border: 1px solid var(--line-strong);
+    border-radius: 4px; width: min(680px, 100%); max-height: 80vh;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  .modal-head {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--surface-2);
+  }
+  .modal-head .who { font-family: var(--mono); font-size: 11.5px; color: var(--faint); }
+  .modal-body { overflow: auto; }
+  .modal-body .kv { grid-template-columns: minmax(140px, max-content) 1fr; }
+
   .lang { font-size: 12px; margin-right: 14px; }
   .lang a { color: var(--faint); text-decoration: none; padding: 0 4px; }
   .lang a.on { color: var(--accent); }
@@ -200,14 +279,20 @@
 <body>
 <div class="wrap">
   <header>
-    <a class="brand" href="#/">gotick</a>
+    <a class="brand" href="#/"><svg class="mark" viewBox="0 0 64 64" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"><path d="M22 13v34q0 7 7 7h3"/><path d="M14 24h40"/></g><circle cx="22" cy="24" r="3" fill="var(--pivot)"/></svg>gotick</a>
     <span class="tagline">workflow inspector</span>
+    <!-- 下面那个占位符由 handler 在构造时填成真实版本号（见 ui.versionPlaceholder）。
+         注意别在别处再写出同一个标记：静态写在这里而不是等 JS 去要一个接口，
+         是为了任何一条路由进来都带着它。 -->
+    <span class="ver">{{version}}</span>
     <span class="spacer"></span>
     <span class="lang" id="lang"></span>
     <span class="refresh" id="refresh"></span>
   </header>
   <div id="app"><div class="empty" id="boot"></div></div>
 </div>
+<!-- 弹窗挂在 #app 外面：列表会整块重渲染，放在里面会被刷掉 -->
+<div id="modal"></div>
 
 <script>
 "use strict";
@@ -226,7 +311,16 @@ const MESSAGES = {
     runs: "运行实例", runsCount: "{n} / {total} 条",
     thStatus: "状态", thFlow: "Flow", thCallId: "Call ID", thStarted: "开始",
     thDuration: "耗时", thRuns: "跑了几遍", thFailedAt: "失败于", thRetry: "重试",
+    thKey: "业务 Key", thMeta: "Metadata",
     listEmpty: "还没有运行记录。触发一个 flow 之后回来看看。",
+    phCallId: "Call ID（精确）", phKey: "业务 Key（精确）", clearFilters: "清空条件",
+    pagePrev: "← 上一页", pageNext: "下一页 →", pageRange: "{from}–{to} / {total}",
+    pausedPaging: "已翻页，暂停自动刷新",
+    lookupCount: "命中 {n} 条", filterEmpty: "没有匹配的运行实例。换个条件试试。",
+    noteStatusPage: "这个 store 建不了状态索引，所以状态筛选只在当前这一页里生效，翻页时每页各筛一次。",
+    noteStatusInKey: "已经按业务 key 取了这一页，状态是在这一页里再筛的 —— 上面的总数是这个 key 的全部实例数。",
+    metaTitle: "Metadata", metaEmpty: "这次调用没有 metadata。", close: "关闭",
+    metaLoading: "读取中…",
     actRunning: "执行中", actRunningNote: "任务正在某个节点上运行，心跳还在续期",
     actSleeping: "睡眠中", actSleepingNote: "到点后会被自动唤醒；等待期间不占用任何进程，重启也不受影响",
     actRetrying: "等待重试", actRetryingNote: "上一次执行失败了，退避结束后会再试一次",
@@ -259,7 +353,16 @@ const MESSAGES = {
     runs: "Runs", runsCount: "{n} / {total}",
     thStatus: "Status", thFlow: "Flow", thCallId: "Call ID", thStarted: "Started",
     thDuration: "Duration", thRuns: "Runs", thFailedAt: "Failed at", thRetry: "Retries",
+    thKey: "Key", thMeta: "Metadata",
     listEmpty: "No runs yet. Trigger a flow and come back.",
+    phCallId: "Call ID (exact)", phKey: "Key (exact)", clearFilters: "Clear",
+    pagePrev: "← Prev", pageNext: "Next →", pageRange: "{from}–{to} / {total}",
+    pausedPaging: "auto-refresh paused while paging",
+    lookupCount: "{n} matched", filterEmpty: "No runs match these filters.",
+    noteStatusPage: "This store can't maintain a status index, so the status filter only applies within the current page — each page is filtered on its own.",
+    noteStatusInKey: "This page was taken from the key index, so the status filter was applied within it — the count above is the total number of runs for this key.",
+    metaTitle: "Metadata", metaEmpty: "No metadata on this call.", close: "Close",
+    metaLoading: "Loading…",
     actRunning: "Running", actRunningNote: "A task is executing on some node; its heartbeat is still being renewed",
     actSleeping: "Sleeping", actSleepingNote: "It wakes automatically when due. While waiting it holds no process, and a restart doesn't affect it",
     actRetrying: "Retry pending", actRetryingNote: "The last attempt failed; it will try again once the backoff ends",
@@ -426,37 +529,106 @@ function setRefresh(text) { refreshEl.textContent = text; }
 
 // ---------- 列表页 ----------
 
-async function renderList() {
+const PAGE_SIZE = 50;
+// 每行默认显示几条 metadata，剩下的收进弹窗。
+const META_PREVIEW = 2;
+
+// listQuery 把 hash 里的查询条件读出来。条件都放在 hash 里，
+// 于是「筛好的一屏」本身就是个可以粘给同事的链接。
+function listQuery() {
   const params = new URLSearchParams(location.hash.split("?")[1] || "");
-  const flow = params.get("flow") || "";
-  const status = params.get("status") || "";
+  return {
+    flow: params.get("flow") || "",
+    status: params.get("status") || "",
+    call_id: params.get("call_id") || "",
+    key: params.get("key") || "",
+    offset: Math.max(0, parseInt(params.get("offset") || "0", 10) || 0),
+  };
+}
+
+// gotoList 换一组查询条件。改条件时 offset 一律归零：
+// 停在第 3 页去换 flow，很可能直接落到一个空页上，看起来像没有数据。
+function gotoList(patch, keepOffset) {
+  const q = Object.assign(listQuery(), patch);
+  if (!keepOffset) q.offset = 0;
+
+  const params = new URLSearchParams();
+  for (const k of ["flow", "status", "call_id", "key"]) if (q[k]) params.set(k, q[k]);
+  if (q.offset) params.set("offset", q.offset);
+
+  const qs = params.toString();
+  location.hash = "#/" + (qs ? "?" + qs : "");
+}
+
+// metaCell 渲染列表里的 metadata：默认两条，更多的给一个「+N」按钮。
+//
+// 按名字排序，不是按后端给的顺序：那边是 map，遍历顺序随机，
+// 不排的话每次刷新露出来的都可能是不同的两条。
+function metaCell(r) {
+  const meta = r.meta || {};
+  const names = Object.keys(meta).sort();
+  if (!names.length) return "—";
+
+  const shown = names.slice(0, META_PREVIEW);
+  const total = Math.max(r.meta_total || 0, names.length);
+  const more = total - shown.length;
+
+  return shown.map(n =>
+    `<span class="metapair"><b>${esc(n)}</b><span>${esc(meta[n])}</span></span>`
+  ).join("") + (more > 0
+    ? `<button class="metamore" data-meta="${esc(r.call_id)}">+${more}</button>` : "");
+}
+
+async function renderList() {
+  const q = listQuery();
+  // 只有按 callId 是定位式查询：它最多命中一条，没有分页可言。
+  // 按 key 走的是和状态一样的二级索引，该分页就分页。
+  const isLookup = !!q.call_id;
+  // 空态文案要按「有没有筛选条件」来选：筛出来一条都没有，
+  // 和「这个系统还没跑过任何 flow」是两件完全不同的事。
+  const anyFilter = !!(q.flow || q.status || q.call_id || q.key);
 
   let flows = { flows: [], total_runs: 0 };
   let data = { runs: [], total: 0 };
   try {
     [flows, data] = await Promise.all([
       api("api/flows"),
-      api("api/runs?" + new URLSearchParams({ flow, status, limit: "100" })),
+      api("api/runs?" + new URLSearchParams({
+        flow: q.flow, status: q.status, call_id: q.call_id, key: q.key,
+        offset: q.offset, limit: PAGE_SIZE,
+      })),
     ]);
   } catch (e) {
     app.innerHTML = banner(t("readFail") + e.message);
     return;
   }
 
+  // 请求的窗口整个落在末尾之外：粘来的链接、或者停在后面的页时记录被裁掉了。
+  // 自己退到最后一页，而不是显示一个「51–34 / 34」这样倒过来的区间。
+  // 判断用 offset 和 total 比，不用「这页是空的」——按状态筛的退路模式下，
+  // 一个合法的页也可能一条都不匹配。
+  if (!isLookup && q.offset > 0 && q.offset >= data.total) {
+    const last = Math.max(0, (Math.ceil(data.total / PAGE_SIZE) - 1) * PAGE_SIZE);
+    if (last !== q.offset) { gotoList({offset: last}, true); return; }
+  }
+
   const options = [`<option value="">${t("allFlows")}</option>`].concat(
     (flows.flows || []).map(f =>
-      `<option value="${esc(f.id)}" ${f.id === flow ? "selected" : ""}>${esc(f.id)} (${f.runs})</option>`)
+      `<option value="${esc(f.id)}" ${f.id === q.flow ? "selected" : ""}>${esc(f.id)} (${f.runs})</option>`)
   ).join("");
 
-  const statuses = ["", "running", "done", "failed", "aborted"];
+  // canceled 是真实终态——被 WithKey 顶替掉的调用都落在它上面，
+  // 少了它那些实例在界面上根本筛不出来。
+  const statuses = ["", "running", "done", "failed", "aborted", "canceled"];
   const statusOptions = statuses.map(s =>
-    `<option value="${s}" ${s === status ? "selected" : ""}>${s === "" ? t("allStatus") : s}</option>`
+    `<option value="${s}" ${s === q.status ? "selected" : ""}>${s === "" ? t("allStatus") : s}</option>`
   ).join("");
 
   const rows = (data.runs || []).map(r => `
     <tr class="clickable" data-call="${esc(r.call_id)}">
       <td>${pill(r.status)}</td>
       <td class="mono">${esc(r.flow_id || "—")}</td>
+      <td class="mono">${esc(r.key || "—")}</td>
       <td class="mono">${esc(r.call_id.slice(0, 12))}</td>
       <td class="num" title="${esc(fmtTime(r.started_at))}">${esc(ago(r.started_at))}</td>
       <td class="num">${esc(r.duration_text)}</td>
@@ -465,45 +637,151 @@ async function renderList() {
         ${r.failed_task ? `<span class="mono">${esc(r.failed_task)}</span>` : "—"}
         ${r.error ? `<span class="err">${esc(r.error)}</span>` : ""}
       </td>
+      <td>${metaCell(r)}</td>
     </tr>`).join("");
+
+  // 说明性的脚注。它们都是「这次筛选到底管了多大范围」这类事实，
+  // 不说出来的话界面会显得比它实际做到的更确定。
+  let notes = "";
+  if (data.status_scope === "page") {
+    notes += `<div class="note">${t(q.key ? "noteStatusInKey" : "noteStatusPage")}</div>`;
+  }
+
+  const to = Math.min(q.offset + PAGE_SIZE, data.total);
+  const pager = isLookup || !data.total ? "" : `
+    <div class="pager">
+      <span class="range">${t("pageRange", {from: q.offset + 1, to, total: data.total})}</span>
+      <button id="prev" ${q.offset <= 0 ? "disabled" : ""}>${t("pagePrev")}</button>
+      <button id="next" ${q.offset + PAGE_SIZE >= data.total ? "disabled" : ""}>${t("pageNext")}</button>
+    </div>`;
 
   app.innerHTML = `
     <div class="toolbar">
       <select id="flowFilter">${options}</select>
       <select id="statusFilter">${statusOptions}</select>
+      <input id="keyFilter" type="search" value="${esc(q.key)}" placeholder="${esc(t("phKey"))}">
+      <input id="callFilter" type="search" value="${esc(q.call_id)}" placeholder="${esc(t("phCallId"))}">
       <button id="reload">${t("reload")}</button>
+      ${isLookup || q.flow || q.status ? `<button id="clear">${t("clearFilters")}</button>` : ""}
     </div>
     <div class="panel">
       <div class="panel-head">
         <span>${t("runs")}</span>
-        <span>${t("runsCount", {n: data.runs.length, total: data.total})}</span>
+        <span>${isLookup
+          ? t("lookupCount", {n: data.runs.length})
+          : t("runsCount", {n: data.runs.length, total: data.total})}</span>
       </div>
       <div class="scroller">
         ${rows ? `<table>
           <thead><tr>
-            <th>${t("thStatus")}</th><th>${t("thFlow")}</th><th>${t("thCallId")}</th>
-            <th>${t("thStarted")}</th><th>${t("thDuration")}</th><th>${t("thRuns")}</th><th>${t("thFailedAt")}</th>
+            <th>${t("thStatus")}</th><th>${t("thFlow")}</th><th>${t("thKey")}</th><th>${t("thCallId")}</th>
+            <th>${t("thStarted")}</th><th>${t("thDuration")}</th><th>${t("thRuns")}</th>
+            <th>${t("thFailedAt")}</th><th>${t("thMeta")}</th>
           </tr></thead>
           <tbody>${rows}</tbody>
-        </table>` : `<div class="empty">${t("listEmpty")}</div>`}
+        </table>` : `<div class="empty">${anyFilter ? t("filterEmpty") : t("listEmpty")}</div>`}
       </div>
+      ${notes}
+      ${pager}
     </div>`;
 
-  document.getElementById("flowFilter").onchange = e => {
-    location.hash = "#/?" + new URLSearchParams({ flow: e.target.value, status });
-  };
-  document.getElementById("statusFilter").onchange = e => {
-    location.hash = "#/?" + new URLSearchParams({ flow, status: e.target.value });
-  };
+  document.getElementById("flowFilter").onchange = e => gotoList({flow: e.target.value});
+  document.getElementById("statusFilter").onchange = e => gotoList({status: e.target.value});
+  bindSearchInput("keyFilter", v => gotoList({key: v}));
+  bindSearchInput("callFilter", v => gotoList({call_id: v}));
   document.getElementById("reload").onclick = () => route();
+  const clear = document.getElementById("clear");
+  if (clear) clear.onclick = () => gotoList({flow: "", status: "", call_id: "", key: ""});
+
+  const prev = document.getElementById("prev");
+  const next = document.getElementById("next");
+  if (prev) prev.onclick = () => gotoList({offset: Math.max(0, q.offset - PAGE_SIZE)}, true);
+  if (next) next.onclick = () => gotoList({offset: q.offset + PAGE_SIZE}, true);
+
   app.querySelectorAll("tr.clickable").forEach(tr => {
-    tr.onclick = () => { location.hash = "#/run/" + tr.dataset.call; };
+    tr.onclick = e => {
+      // 点「+N」是要看 metadata，不是要进详情页
+      if (e.target.closest("[data-meta]")) return;
+      location.hash = "#/run/" + tr.dataset.call;
+    };
   });
 
   // 有实例还在跑就自动刷新，跑完了就停下来，别无谓地打 Redis。
+  //
+  // 翻到第二页之后就不刷了：offset 分页的位置会随着新实例插入头部而漂移，
+  // 定时重渲染会让你正在看的那几行自己往下跑。而翻页本身就说明你在查历史，
+  // 不是在盯实时。
   const anyRunning = (data.runs || []).some(r => r.running);
-  scheduleRefresh(anyRunning);
+  if (!anyRunning) {
+    scheduleRefresh(false);
+  } else if (q.offset > 0) {
+    setRefresh(t("pausedPaging"));
+  } else {
+    scheduleRefresh(true);
+  }
 }
+
+// bindSearchInput 让输入框在回车或失焦时提交。
+function bindSearchInput(id, submit) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.onchange = e => submit(e.target.value.trim());
+  el.onkeydown = e => { if (e.key === "Enter") submit(e.target.value.trim()); };
+}
+
+// ---------- metadata 弹窗 ----------
+
+const modalEl = document.getElementById("modal");
+
+function closeModal() { modalEl.innerHTML = ""; }
+
+async function openMetaModal(callId) {
+  modalEl.innerHTML = `
+    <div class="modal" data-backdrop>
+      <div class="modal-card" role="dialog" aria-modal="true" aria-label="${esc(t("metaTitle"))}">
+        <div class="modal-head">
+          <span>${t("metaTitle")}</span>
+          <span class="who">${esc(callId.slice(0, 12))}</span>
+          <button data-close>${t("close")}</button>
+        </div>
+        <div class="modal-body"><div class="empty">${t("metaLoading")}</div></div>
+      </div>
+    </div>`;
+
+  // 弹窗读完整的那一份，不是列表里的快照：快照按体积截断过，而且只拍了
+  // 第一次重放那一刻——流程中途 SetKV 写进去的东西只有这里看得到。
+  let d;
+  try {
+    d = await api("api/runs/" + encodeURIComponent(callId));
+  } catch (e) {
+    const failed = modalEl.querySelector(".modal-body");
+    if (failed) failed.innerHTML = banner(t("readFail") + e.message);
+    return;
+  }
+
+  const body = modalEl.querySelector(".modal-body");
+  if (!body) return; // 请求还在路上时被关掉了
+
+  const user = (d.metadata && d.metadata.user) || {};
+  const names = Object.keys(user).sort();
+  body.innerHTML = names.length
+    ? `<dl class="kv">${names.map(n =>
+        `<dt>${esc(n)}</dt><dd class="mono">${esc(user[n])}</dd>`).join("")}</dl>`
+    : `<div class="empty">${t("metaEmpty")}</div>`;
+}
+
+document.addEventListener("click", e => {
+  if (e.target.closest("[data-close]") || e.target.matches("[data-backdrop]")) {
+    closeModal();
+    return;
+  }
+  const more = e.target.closest("[data-meta]");
+  if (more) openMetaModal(more.dataset.meta);
+});
+
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") closeModal();
+});
 
 // ---------- 详情页 ----------
 
@@ -733,6 +1011,7 @@ async function renderDetail(callId) {
       <div class="panel-head"><span>${t("overview")}</span><span>${esc(run.status || "unknown")}</span></div>
       <dl class="kv">
         <dt>${t("thStatus")}</dt><dd>${pill(run.status)}</dd>
+        ${run.key ? `<dt>${t("thKey")}</dt><dd class="mono">${esc(run.key)}</dd>` : ""}
         <dt>${t("dStarted")}</dt><dd class="mono">${esc(fmtTime(run.started_at))}</dd>
         <dt>${t("dEnded")}</dt><dd class="mono">${esc(fmtTime(run.ended_at))}</dd>
         <dt>${t("dDuration")}</dt><dd class="mono">${esc(run.duration_text || "—")}</dd>
@@ -786,7 +1065,15 @@ function scheduleRefresh(active, delayMs) {
   if (!active) { setRefresh(t("stopped")); return; }
   const ms = delayMs || 3000;
   setRefresh(t("syncEvery", {n: Math.round(ms / 1000)}));
-  timer = setTimeout(route, ms);
+  timer = setTimeout(() => {
+    // 正在工具栏里输入就先别刷：重渲染会把还没提交的输入连同光标位置一起抹掉，
+    // 而列表 3 秒一刷，等于「打字打一半就没了」。
+    if (document.activeElement && document.activeElement.closest(".toolbar")) {
+      scheduleRefresh(active, ms);
+      return;
+    }
+    route();
+  }, ms);
 }
 
 function route() {
@@ -800,7 +1087,9 @@ document.documentElement.lang = LANG === "zh" ? "zh" : "en";
 document.getElementById("boot").textContent = t("loading");
 renderLangSwitch();
 
-window.addEventListener("hashchange", route);
+// 只在真正换页时关弹窗。定时刷新走的是 route()，不经过这里——
+// 否则正看着 metadata 就被下一次轮询关掉了。
+window.addEventListener("hashchange", () => { closeModal(); route(); });
 route();
 </script>
 </body>

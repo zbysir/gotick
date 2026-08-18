@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"net"
 	"net/http"
 	"sort"
@@ -42,6 +43,9 @@ const (
 	defaultPageSize = 50
 	maxPageSize     = 500
 )
+
+// versionPlaceholder 是首页里被替换成真实版本号的那个标记。
+const versionPlaceholder = "{{version}}"
 
 // Options 配置 UI handler。
 type Options struct {
@@ -98,6 +102,12 @@ type handler struct {
 	opt   Options
 	index gotick.RunIndex
 	mux   *http.ServeMux
+
+	// page 是把版本号填好之后的首页，构造时算一次。
+	//
+	// 版本在服务端填而不是让前端再要一次接口：省一个请求，任何一条路由进来
+	// 都带着它，而且 curl 一下就能看出对面那个界面是哪一版。
+	page []byte
 }
 
 // NewHandler 创建 UI 的 http.Handler。
@@ -112,7 +122,24 @@ func NewHandler(opt Options) (http.Handler, error) {
 		index = gotick.NewKvRunIndex(opt.Store, 7*24*time.Hour)
 	}
 
-	h := &handler{opt: opt, index: index, mux: http.NewServeMux()}
+	page, err := assets.ReadFile("assets/index.html")
+	if err != nil {
+		return nil, fmt.Errorf("ui: assets missing: %w", err)
+	}
+
+	h := &handler{
+		opt:   opt,
+		index: index,
+		mux:   http.NewServeMux(),
+		// 用 ReplaceAll 而不是只替换第一处：页面里多写出一个同名标记时，
+		// 只替换一处会把替换让给先出现的那个，真正该显示版本号的地方留着占位符
+		// 发出去。（这一版就是这么错过一次的。）
+		//
+		// 版本号来自构建信息、不是用户输入，但还是转义一遍：
+		// 往 HTML 里拼字符串这件事不该有例外。
+		page: []byte(strings.ReplaceAll(string(page), versionPlaceholder,
+			html.EscapeString(gotick.Version()))),
+	}
 	h.routes()
 
 	var out http.Handler = h
@@ -187,15 +214,9 @@ func (h *handler) handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	page, err := assets.ReadFile("assets/index.html")
-	if err != nil {
-		http.Error(w, "ui assets missing", http.StatusInternalServerError)
-		return
-	}
-
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	_, _ = w.Write(page)
+	_, _ = w.Write(h.page)
 }
 
 func (h *handler) handleFlows(w http.ResponseWriter, r *http.Request) {
@@ -231,46 +252,144 @@ func (h *handler) handleFlows(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"flows": rows, "total_runs": total})
 }
 
+// 状态筛选的作用范围，界面要照实说清楚。
+const (
+	statusScopeIndex = "index" // 在全部记录里筛，分页和总数都准
+	statusScopePage  = "page"  // 只在当前这一页里筛——store 建不了状态索引时的退路
+)
+
 func (h *handler) handleRuns(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 
 	flow := q.Get("flow")
+	status := q.Get("status")
+	callId := strings.TrimSpace(q.Get("call_id"))
+	key := strings.TrimSpace(q.Get("key"))
+
 	offset := intParam(q.Get("offset"), 0)
 	limit := intParam(q.Get("limit"), defaultPageSize)
 	if limit <= 0 || limit > maxPageSize {
 		limit = defaultPageSize
 	}
 
-	runs, err := h.index.ListRuns(flow, int64(offset), int64(limit))
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+	// callId 是索引的主键：一次读就到，翻页对它毫无意义。
+	if callId != "" {
+		h.lookupByCallId(w, lookup{flow: flow, status: status, callId: callId, key: key})
 		return
 	}
 
-	// 状态过滤在这一页之内做。真正的按状态索引要等事件流那一层，
-	// 现在先让「只看失败的」这个最常用的诉求可用。
-	if want := q.Get("status"); want != "" {
-		filtered := runs[:0]
-		for _, run := range runs {
-			if run.Status == want {
-				filtered = append(filtered, run)
-			}
-		}
-		runs = filtered
-	}
+	var (
+		runs  []gotick.RunInfo
+		total int64
+		scope string
+		err   error
+	)
 
-	total, err := h.index.CountRuns(flow)
+	si, hasStatusIndex := h.index.(gotick.StatusFilterIndex)
+	ki, hasKeyIndex := h.index.(gotick.KeyFilterIndex)
+
+	switch {
+	case key != "" && hasKeyIndex:
+		// 业务 key 是最有选择性的条件，用它的索引来翻页。
+		//
+		// 同时还选了状态时，状态只在这一页里过滤：一个 key 通常只对应一两次调用，
+		// 一页装得下，所以这个退让在实践中不会造成翻页问题。scope 照实标出来。
+		if status != "" {
+			scope = statusScopePage
+		}
+		runs, err = ki.ListRunsByKey(flow, key, int64(offset), int64(limit))
+		if err == nil {
+			if status != "" {
+				runs = filterByStatus(runs, status)
+			}
+			total, err = ki.CountRunsByKey(flow, key)
+		}
+
+	case key != "":
+		// 自定义的 RunIndex 实现没有这个能力。明确报错，而不是返回一页空的——
+		// 后者看起来就是「这个 key 不存在」，是个会误导人的答案。
+		writeError(w, http.StatusNotImplemented,
+			errors.New("this run index cannot filter by key"))
+		return
+
+	case status == "":
+		runs, err = h.index.ListRuns(flow, int64(offset), int64(limit))
+		if err == nil {
+			total, err = h.index.CountRuns(flow)
+		}
+
+	case hasStatusIndex && si.StatusFilterSupported():
+		// 在服务端筛：翻页和总数都是全量范围里的，和不筛的时候完全同构。
+		scope = statusScopeIndex
+		runs, err = si.ListRunsByStatus(flow, status, int64(offset), int64(limit))
+		if err == nil {
+			total, err = si.CountRunsByStatus(flow, status)
+		}
+
+	default:
+		// 退路：store 删不掉 ZSET 成员，建不了状态索引（见 store.ZRemmer）。
+		// 只能在当前这一页里过滤，所以 total 仍然是不筛的总数——
+		// 界面靠 status_scope 知道这件事，不会把它说成全量筛选的结果。
+		scope = statusScopePage
+		runs, err = h.index.ListRuns(flow, int64(offset), int64(limit))
+		if err == nil {
+			runs = filterByStatus(runs, status)
+			total, err = h.index.CountRuns(flow)
+		}
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 
 	writeJSON(w, map[string]any{
-		"runs":   decorateRuns(runs),
-		"total":  total,
-		"offset": offset,
-		"limit":  limit,
+		"runs":         decorateRuns(runs),
+		"total":        total,
+		"offset":       offset,
+		"limit":        limit,
+		"status_scope": scope,
 	})
+}
+
+// lookup 是一次按 callId 的精确查询的条件。
+type lookup struct{ flow, status, callId, key string }
+
+// lookupByCallId 按 callId 精确查找，最多命中一条。
+func (h *handler) lookupByCallId(w http.ResponseWriter, l lookup) {
+	run, exist, err := h.index.GetRun(l.callId)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	// 其余条件在这一条上过一遍，让组合筛选成立：填了 callId 又填了 key 的时候，
+	// 不能只按 callId 认人、返回一个 key 根本不匹配的调用。
+	ok := exist &&
+		(l.flow == "" || run.FlowId == l.flow) &&
+		(l.status == "" || run.Status == l.status) &&
+		(l.key == "" || run.Key == l.key)
+
+	runs := []gotick.RunInfo{}
+	if ok {
+		runs = append(runs, run)
+	}
+
+	writeJSON(w, map[string]any{
+		"runs":   decorateRuns(runs),
+		"total":  len(runs),
+		"offset": 0,
+		"limit":  len(runs),
+	})
+}
+
+func filterByStatus(runs []gotick.RunInfo, want string) []gotick.RunInfo {
+	kept := runs[:0]
+	for _, run := range runs {
+		if run.Status == want {
+			kept = append(kept, run)
+		}
+	}
+	return kept
 }
 
 func (h *handler) handleRunDetail(w http.ResponseWriter, r *http.Request) {
@@ -411,9 +530,14 @@ func decorateRun(r gotick.RunInfo) runView {
 	}
 }
 
+// decorateRuns 是给列表用的。
+//
+// 它会丢掉 Marks：一次调用最多留 200 条重放记录，一页 50 行就是上万条，
+// 而列表页一条都用不上——只有详情页的执行记录面板要。
 func decorateRuns(runs []gotick.RunInfo) []runView {
 	out := make([]runView, 0, len(runs))
 	for _, r := range runs {
+		r.Marks = nil
 		out = append(out, decorateRun(r))
 	}
 	return out
@@ -479,9 +603,14 @@ func splitMeta(meta map[string]string) map[string]any {
 	cached := map[string]string{}
 
 	for k, v := range meta {
-		if strings.HasPrefix(k, "__") {
+		switch {
+		case k == gotick.RunKeyField:
+			// 业务 key 不是缓存结果。它已经有自己的位置（RunInfo.Key，
+			// 界面上是独立一列和概览里的一行），再挂到「Memo / Array / Async
+			// 的缓存结果」那个面板里只会让人以为它是某一步的返回值。
+		case strings.HasPrefix(k, "__"):
 			cached[strings.TrimPrefix(k, "__")] = v
-		} else {
+		default:
 			user[k] = v
 		}
 	}

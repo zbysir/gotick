@@ -154,9 +154,11 @@ automatically — only the latest one carries on.
 ## Seeing what's going on
 
 A built-in inspector shows which flows are running, which step each one is on,
-how long it took, what failed, and how long a sleeping one has left. It's a plain
-`http.Handler` that reads Redis directly, so it never has to reach a running
-worker:
+how long it took, what failed, and how long a sleeping one has left. The list
+carries the metadata each run was triggered with, and narrows by flow, status,
+call id, or the business key from `WithKey` — so "what happened to order
+ORD-88231" is one lookup instead of a scroll. It's a plain `http.Handler` that
+reads Redis directly, so it never has to reach a running worker:
 
 ```go
 h, _ := ui.NewHandler(ui.Options{
