@@ -1525,6 +1525,9 @@ var ErrRunNotFound = errors.New("gotick: run not found in the index")
 // ErrRunNotCancelable 这次调用已经有了终态，取消无意义。
 var ErrRunNotCancelable = errors.New("gotick: run already finished")
 
+// ErrQueueClosing 这个 worker 正在关停，事件应当被重投到别的 worker 上。
+var ErrQueueClosing = errors.New("gotick: queue is shutting down")
+
 var ErrReplayInFlight = errors.New("gotick: another worker is replaying this call")
 
 // nextEvent 描述本次重放结束后要发出的下一个调度事件。
@@ -2569,9 +2572,42 @@ func NewClient(p NewClientConfig) (*Client, error) {
 	}, nil
 }
 
+// inflight 统计正在执行的回调，并保证 Add 不会和 Wait 撞车。
+//
+// sync.WaitGroup 明确要求：计数为 0 时的 Add 必须发生在 Wait 之前。
+// 关停期间还有任务被投递进来就会违反这一条——轻则竞争检测器报警，
+// 重则 Wait 提前返回、或者 panic "WaitGroup misuse"。
+// 队列是 at-least-once 的，关停和投递本来就会重叠，所以必须显式串起来。
+type inflight struct {
+	mu     sync.Mutex
+	wg     sync.WaitGroup
+	closed bool
+}
+
+// enter 登记一个正在执行的回调。返回 false 表示已经在关停，不该再接活。
+func (i *inflight) enter() bool {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.closed {
+		return false
+	}
+	i.wg.Add(1)
+	return true
+}
+
+func (i *inflight) leave() { i.wg.Done() }
+
+// closeAndWait 先关门再等人走光。先置 closed 保证之后不会再有新的 Add。
+func (i *inflight) closeAndWait() {
+	i.mu.Lock()
+	i.closed = true
+	i.mu.Unlock()
+	i.wg.Wait()
+}
+
 type DelayedAsyncQueueProduct struct {
 	queue     store.DelayedQueue
-	wg        sync.WaitGroup
+	inflight  inflight
 	closeChan chan bool
 }
 
@@ -2586,8 +2622,8 @@ func (a *DelayedAsyncQueueProduct) Start(ctx context.Context) (err error) {
 	wg.Wait()
 
 	close(a.closeChan)
-	// wait for all queue down
-	a.wg.Wait()
+	// 先关门再等在飞的回调走光
+	a.inflight.closeAndWait()
 
 	return
 }
@@ -2635,14 +2671,14 @@ func (p *DelayedAsyncQueueProduct) rerouteEvent(ctx context.Context, topic strin
 }
 
 func (a *DelayedAsyncQueueProduct) New(key string) AsyncQueue {
-	x := NewDelayedAsyncQueue(a.queue, key, &a.wg, a.closeChan)
+	x := NewDelayedAsyncQueue(a.queue, key, &a.inflight, a.closeChan)
 	return x
 }
 
 type DelayedAsyncQueue struct {
 	delayedQueue store.DelayedQueue
 	key          string
-	wg           *sync.WaitGroup // wait for all callback down
+	inflight     *inflight // 统计在飞的回调，并挡住关停后的新任务
 	closeChan    chan bool
 }
 
@@ -2655,16 +2691,12 @@ func (a *DelayedAsyncQueue) Publish(ctx context.Context, data Event, delay time.
 
 func (a *DelayedAsyncQueue) Subscribe(h func(ctx context.Context, data Event) error) {
 	a.delayedQueue.Subscribe(a.key, func(ctx context.Context, data []byte) error {
-		a.wg.Add(1)
-		defer a.wg.Done()
-
-		// 如果已经关闭，则返回错误重试
-		//select {
-		//case <-a.closeChan:
-		//	// TODO 考虑是否可以重新入队
-		//	return errors.New("queue closed")
-		//default:
-		//}
+		// 已经在关停就别接了，返回错误让队列重投——它会落到还活着的
+		// worker 上。默默 ack 等于把这个事件吞掉，那个流程就再也不会往下走。
+		if !a.inflight.enter() {
+			return ErrQueueClosing
+		}
+		defer a.inflight.leave()
 
 		var ev Event
 		_ = json.Unmarshal(data, &ev)
@@ -2673,11 +2705,11 @@ func (a *DelayedAsyncQueue) Subscribe(h func(ctx context.Context, data Event) er
 	})
 }
 
-func NewDelayedAsyncQueue(redis store.DelayedQueue, key string, wg *sync.WaitGroup, closeChan chan bool) *DelayedAsyncQueue {
+func NewDelayedAsyncQueue(redis store.DelayedQueue, key string, inf *inflight, closeChan chan bool) *DelayedAsyncQueue {
 	return &DelayedAsyncQueue{
 		delayedQueue: redis,
 		key:          key,
-		wg:           wg,
+		inflight:     inf,
 		closeChan:    closeChan,
 	}
 }
