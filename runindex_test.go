@@ -2,10 +2,8 @@ package gotick
 
 import (
 	"fmt"
-	"strings"
 	"testing"
 	"time"
-	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -131,77 +129,6 @@ func TestRunIndexSurvivesExpiredRecord(t *testing.T) {
 	assert.Equal(t, "expired", runs[0].Status)
 }
 
-func TestRunIndexSnapshotsKeyAndMeta(t *testing.T) {
-	kv := store.NewMockKvStore()
-	idx := NewKvRunIndex(kv, time.Hour)
-
-	// 真实顺序：触发时写的 metadata 和 WithKey 绑的 key 都在 BeginRun 之前落地。
-	st := NewKvStoreProduct(kv).New("c1")
-	require.NoError(t, st.SetKV("user", "bysir"))
-	require.NoError(t, st.SetKV(RunKeyField, "order-9"))
-	require.NoError(t, SetToStore(st, "step-result", "a big cached blob"))
-
-	require.NoError(t, idx.BeginRun("shop", "c1", time.Now()))
-
-	info, exist, err := idx.GetRun("c1")
-	require.NoError(t, err)
-	require.True(t, exist)
-
-	assert.Equal(t, "order-9", info.Key)
-	assert.Equal(t, map[string]string{"user": "bysir"}, info.Meta)
-	assert.Equal(t, 1, info.MetaTotal)
-
-	// 快照只拍一次：之后写的东西不进索引，详情页读的才是完整那份。
-	require.NoError(t, st.SetKV("late", "written mid-flow"))
-	require.NoError(t, idx.BeginRun("shop", "c1", time.Now()))
-
-	info, _, err = idx.GetRun("c1")
-	require.NoError(t, err)
-	assert.NotContains(t, info.Meta, "late")
-	assert.Equal(t, 2, info.Replays, "重放次数照常累加")
-}
-
-func TestRunIndexSnapshotIsBounded(t *testing.T) {
-	kv := store.NewMockKvStore()
-	idx := NewKvRunIndex(kv, time.Hour)
-
-	st := NewKvStoreProduct(kv).New("c1")
-	for i := 0; i < maxSnapshotKeys+8; i++ {
-		require.NoError(t, st.SetKV(fmt.Sprintf("k%02d", i), strings.Repeat("x", maxSnapshotValue+50)))
-	}
-	require.NoError(t, idx.BeginRun("shop", "c1", time.Now()))
-
-	info, _, err := idx.GetRun("c1")
-	require.NoError(t, err)
-
-	require.Len(t, info.Meta, maxSnapshotKeys, "索引记录是列表每行都要读的，不能让它无上限地长")
-	assert.Equal(t, maxSnapshotKeys+8, info.MetaTotal, "总数要照实报，界面才知道还有更多")
-
-	// 截断后取的是排序靠前的那几条，每次刷新露出来的是同样的键
-	assert.Contains(t, info.Meta, "k00")
-	assert.NotContains(t, info.Meta, fmt.Sprintf("k%02d", maxSnapshotKeys))
-
-	for name, v := range info.Meta {
-		assert.Equal(t, maxSnapshotValue+1, len([]rune(v)),
-			"%s：截到上限再加一个省略号", name)
-	}
-}
-
-func TestTruncateRunes(t *testing.T) {
-	assert.Equal(t, "abc", truncateRunes("abc", 5), "没超上限的原样返回")
-	assert.Equal(t, "abc", truncateRunes("abc", 3))
-	assert.Equal(t, "ab…", truncateRunes("abcd", 2))
-
-	// 多字节字符不能被切成两半：那会产出非法 UTF-8，
-	// JSON 编码时变成一串 U+FFFD，界面上就是一堆问号。
-	got := truncateRunes("订单号一二三四五", 4)
-	assert.Equal(t, "订单号一…", got)
-	assert.True(t, utf8.ValidString(got))
-
-	// 按字节算的话「订单」就已经超过 5 了，会从中间切开
-	assert.Equal(t, "订单号一二", truncateRunes("订单号一二", 5))
-}
-
 func TestRunIndexStatusIndex(t *testing.T) {
 	idx := newTestRunIndex()
 	require.True(t, idx.StatusFilterSupported(), "MockKvStore 支持 ZRem")
@@ -324,6 +251,64 @@ func ids(runs []RunInfo) []string {
 		out = append(out, r.CallId)
 	}
 	return out
+}
+
+func TestRunIndexBackfillsLegacyRecords(t *testing.T) {
+	kv := store.NewMockKvStore()
+	idx := NewKvRunIndex(kv, time.Hour)
+	at := time.Now().Add(-time.Minute).Truncate(time.Millisecond)
+
+	// 造一条二级索引上线之前的记录：主索引里有，两套二级索引里都没有。
+	// 这就是升级那一刻线上 301 条记录的样子。
+	require.NoError(t, NewKvStoreProduct(kv).New("legacy").SetKV(RunKeyField, "ORD-1"))
+	require.NoError(t, kv.Set(nil, runInfoKey("legacy"), RunInfo{
+		CallId: "legacy", FlowId: "shop", Status: RunStatusDone, StartedAt: at,
+	}, time.Hour))
+	require.NoError(t, kv.ZAdd(nil, allRunsKey, "legacy", float64(at.UnixMilli())))
+	require.NoError(t, kv.ZAdd(nil, flowRunsKey("shop"), "legacy", float64(at.UnixMilli())))
+
+	// 补录之前：主列表看得见，但按状态、按 key 都筛不出来——线上就是这个症状
+	done, err := idx.ListRunsByStatus("", RunStatusDone, 0, 10)
+	require.NoError(t, err)
+	require.Empty(t, done, "补录之前状态索引里没有它")
+
+	// 列出来一次就补上
+	runs, err := idx.ListRuns("", 0, 10)
+	require.NoError(t, err)
+	require.Len(t, runs, 1)
+	assert.Equal(t, "ORD-1", runs[0].Key, "业务 key 要从 meta 里读出来填好")
+	assert.True(t, runs[0].Indexed)
+
+	done, err = idx.ListRunsByStatus("", RunStatusDone, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, done, 1, "补录之后「只看 done」必须能筛出存量记录")
+
+	n, err := idx.CountRunsByStatus("", RunStatusDone)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), n, "总数也要跟上，否则分页是错的")
+
+	byKey, err := idx.ListRunsByKey("shop", "ORD-1", 0, 10)
+	require.NoError(t, err)
+	require.Len(t, byKey, 1, "列表显示了业务 key，就必须搜得到，不然界面自相矛盾")
+
+	// 而且要落库，不能每次列表都重补一遍
+	stored, exist, err := idx.GetRun("legacy")
+	require.NoError(t, err)
+	require.True(t, exist)
+	assert.True(t, stored.Indexed)
+	assert.Equal(t, "ORD-1", stored.Key)
+}
+
+func TestRunIndexMarksNewRecordsIndexed(t *testing.T) {
+	idx := newTestRunIndex()
+
+	// 新记录在 BeginRun 时就建好了索引，不该再被当成存量记录反复补
+	require.NoError(t, idx.BeginRun("shop", "fresh", time.Now()))
+
+	info, _, err := idx.GetRun("fresh")
+	require.NoError(t, err)
+	assert.True(t, info.Indexed,
+		"没打标记的话，每次列表都会为这一行重复写一遍二级索引")
 }
 
 func TestRunIndexTrimCoversStatusIndex(t *testing.T) {

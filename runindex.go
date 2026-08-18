@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -49,20 +47,17 @@ type RunInfo struct {
 	FailedTask string `json:"failed_task,omitempty"`
 	Error      string `json:"error,omitempty"`
 
-	// Meta 是触发时传进来的 metadata 快照，让列表页不点进去就能看出
-	// 「这次调用是关于哪个订单的」。
+	// Indexed 表示这条记录的二级索引条目（按状态、按业务 key）已经写好了。
 	//
-	// 只在第一次重放时拍一次：流程中途 SetKV 写进去的东西不在这里，详情页仍然读
-	// 完整的那一份。这是有意的取舍——每次重放都刷一遍等于给每次重放加一次 HGETALL，
-	// 而重放密集的 flow 会为此付很多，换来的只是列表上几个字段更新得更及时。
+	// 二级索引是后加的，升级那一刻已经存在的记录一条都不在里面。没有这个标记就
+	// 分不清「补过了」和「还没补」，于是要么存量记录永远筛不出来，要么每次列表
+	// 都为每一行重复写一遍索引。
 	//
-	// 内容按 maxSnapshotKeys / maxSnapshotValue 截断：索引记录是列表页每行都要读的
-	// 东西，不能让某个塞了 200 条 metadata 的调用把整个列表的响应撑大。
-	Meta map[string]string `json:"meta,omitempty"`
-
-	// MetaTotal 是快照当时用户 metadata 的总条数。
-	// Meta 可能被截断，界面要靠它知道「还有更多，点开看」。
-	MetaTotal int `json:"meta_total,omitempty"`
+	// 注意这里没有 metadata 的快照：那份数据一直在 <callId>_meta 里，界面读它就行。
+	// 之前冗余过一份，理由是「一页 50 行就是 50 次 HGETALL、还会拖回 Memo/Async
+	// 的缓存结果」——实测真实负载下那个 hash 只有几百字节，为此付快照、截断、
+	// 补录三笔复杂度不值得，而且快照还会和详情页显示得不一样。
+	Indexed bool `json:"indexed,omitempty"`
 
 	// Marks 记录每次重放的开始时刻和它以什么方式结束。
 	//
@@ -180,13 +175,6 @@ var indexedStatuses = []string{
 	RunStatusRunning, RunStatusDone, RunStatusFailed, RunStatusAborted, RunStatusCanceled,
 }
 
-const (
-	// maxSnapshotKeys / maxSnapshotValue 限制快照进索引的 metadata 大小。
-	// 超出的部分不会丢——详情页读的是完整的那一份。
-	maxSnapshotKeys  = 12
-	maxSnapshotValue = 256
-)
-
 // KvRunIndex 把索引建在 KVStore 上，因此 Redis 和内存实现都能用。
 type KvRunIndex struct {
 	store store.KVStore
@@ -265,7 +253,9 @@ func (k *KvRunIndex) BeginRun(flowId, callId string, at time.Time) error {
 		// 只在这里拍快照——这个分支每个 callId 只走一次，不是每次重放。
 		// 时序是成立的：触发时传的 InitMetaData 和 WithKey 绑的 key
 		// 都在调度器调用 BeginRun 之前就已经写进 meta 了。
-		info.Key, info.Meta, info.MetaTotal = k.snapshotMeta(callId)
+		// 只取业务 key：按 key 的索引需要它，而 metadata 界面自己去读。
+		key, keyOK := k.readRunKey(callId)
+		info.Key = key
 
 		score := float64(at.UnixMilli())
 		if err := k.store.ZAdd(ctx, allRunsKey, callId, score); err != nil {
@@ -280,6 +270,9 @@ func (k *KvRunIndex) BeginRun(flowId, callId string, at time.Time) error {
 		if err := k.addToKeyIndex(flowId, callId, info.Key, score, at); err != nil {
 			return err
 		}
+		// 读 key 失败时不打标记，第一次进列表会重试；否则这次调用会永久缺在
+		// 按 key 的索引里。
+		info.Indexed = keyOK
 	}
 
 	// 读-改-写在这里是安全的：同一个 callId 的重放已经被租约串行化了。
@@ -289,64 +282,23 @@ func (k *KvRunIndex) BeginRun(flowId, callId string, at time.Time) error {
 	return k.saveRun(info)
 }
 
-// snapshotMeta 读一次这次调用的 meta，取出业务 key 和用户 metadata。
+// readRunKey 读出这次调用绑定的业务 key。
 //
-// 读失败不返回错误：快照是给列表页看的装饰，缺了只是少显示几个字段，
-// 不该因此让一次重放失败。索引本身就是观测设施，不是流程状态的一部分。
-func (k *KvRunIndex) snapshotMeta(callId string) (key string, meta map[string]string, total int) {
-	all, err := NewKvStoreProduct(k.store).New(callId).GetKVAll()
+// 只读 key，不读 metadata：metadata 一直在 <callId>_meta 里，界面直接读那份就行。
+// key 不一样——按 key 的二级索引要用它当键名，那是写入时就必须定下来的东西。
+//
+// ok 为 false 表示读失败（不是「没有 key」）。调用方靠它决定要不要留着重试：
+// 读失败时如果把记录标成已建索引，这次调用就永久缺在按 key 的索引里了。
+func (k *KvRunIndex) readRunKey(callId string) (key string, ok bool) {
+	v, exist, err := NewKvStoreProduct(k.store).New(callId).GetKV(RunKeyField)
 	if err != nil {
-		log.Printf("[gotick] snapshot meta of run %s failed: %v", callId, err)
-		return "", nil, 0
+		log.Printf("[gotick] read business key of run %s failed: %v", callId, err)
+		return "", false
 	}
-	if len(all) == 0 {
-		return "", nil, 0
+	if !exist {
+		return "", true // 没用 WithKey 触发，正常情况
 	}
-
-	// 先挑出用户那部分。__ 是框架的保留前缀（Memo / Array / Async 的缓存结果都在
-	// 那儿），把它们快照进索引毫无意义，而且体积可能非常大。
-	names := make([]string, 0, len(all))
-	for name := range all {
-		if name == RunKeyField {
-			key = all[name]
-			continue
-		}
-		if strings.HasPrefix(name, "__") {
-			continue
-		}
-		names = append(names, name)
-	}
-
-	total = len(names)
-	if total == 0 {
-		return key, nil, 0
-	}
-
-	// 排序有两个作用：截断时取的是确定的那几条，界面上「默认显示两条」
-	// 每次刷新也是同样的两条。map 遍历顺序随机，不排的话两者都会抖。
-	sort.Strings(names)
-	if len(names) > maxSnapshotKeys {
-		names = names[:maxSnapshotKeys]
-	}
-
-	meta = make(map[string]string, len(names))
-	for _, name := range names {
-		meta[name] = truncateRunes(all[name], maxSnapshotValue)
-	}
-	return key, meta, total
-}
-
-// truncateRunes 按字符而不是字节截断，避免把一个多字节字符切成两半——
-// 那会产出非法 UTF-8，JSON 编码时被替换成一堆 U+FFFD。
-func truncateRunes(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	runes := []rune(s)
-	if len(runes) <= max {
-		return s
-	}
-	return string(runes[:max]) + "…"
+	return v, true
 }
 
 // addToStatusIndex 把一次调用记进某个状态的集合。
@@ -364,6 +316,42 @@ func (k *KvRunIndex) addToStatusIndex(flowId, callId, status string, score float
 		return nil
 	}
 	return k.store.ZAdd(ctx, flowStatusRunsKey(flowId, status), callId, score)
+}
+
+// backfill 给二级索引上线之前写的记录补上索引条目，并把补好的写回去。
+//
+// 为什么必须补：两套二级索引都是在 BeginRun 的首次分支里写的，所以升级那一刻
+// 已经存在的记录一条都不在里面。后果是在一个全是 done 的列表上选「只看 done」
+// 会返回空，按业务 key 搜也搜不到历史。
+//
+// 这件事读穿解决不了：读穿只能拿到某一条记录的内容，而「按状态取一页并给出精确
+// 总数」要求那个集合里本来就有成员。补一次，之后和新记录一样。
+//
+// 只补索引，不碰 metadata——那份数据一直都在，界面自己读。
+func (k *KvRunIndex) backfill(info RunInfo) RunInfo {
+	key, ok := k.readRunKey(info.CallId)
+	info.Key = key
+
+	// 二级索引用主索引同一个 score（开始时间），两边排序才一致。
+	score := float64(info.StartedAt.UnixMilli())
+	if err := k.addToStatusIndex(info.FlowId, info.CallId, info.Status, score); err != nil {
+		log.Printf("[gotick] backfill status index of run %s failed: %v", info.CallId, err)
+		ok = false
+	}
+	// 裁剪窗口按现在算：这次补录发生在当下，不是在这次调用开始的时候。
+	if err := k.addToKeyIndex(info.FlowId, info.CallId, info.Key, score, time.Now()); err != nil {
+		log.Printf("[gotick] backfill key index of run %s failed: %v", info.CallId, err)
+		ok = false
+	}
+
+	// 只有全部补齐才打标记。打上就不会再进来，所以补了一半的记录必须留着
+	// 下次列表再试，否则它会永久缺在某个二级索引里。
+	info.Indexed = ok
+
+	if err := k.saveRun(info); err != nil {
+		log.Printf("[gotick] persist backfill of run %s failed: %v", info.CallId, err)
+	}
+	return info
 }
 
 // addToKeyIndex 把一次调用记进它的业务 key 索引。
@@ -626,6 +614,11 @@ func (k *KvRunIndex) listFrom(key, flowId string, offset, limit int64,
 				Status:    "expired",
 				StartedAt: time.UnixMilli(int64(m.Score)),
 			}
+		}
+		// exist 才补：不存在时上面那条占位记录是凭空造的，
+		// 它的 meta hash 早就跟着 TTL 一起没了，补也补不出东西。
+		if exist && !info.Indexed {
+			info = k.backfill(info)
 		}
 		if keep != nil && !keep(info) {
 			continue

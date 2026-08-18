@@ -343,7 +343,7 @@ func (h *handler) handleRuns(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, map[string]any{
-		"runs":         decorateRuns(runs),
+		"runs":         h.attachMeta(decorateRuns(runs)),
 		"total":        total,
 		"offset":       offset,
 		"limit":        limit,
@@ -375,7 +375,7 @@ func (h *handler) lookupByCallId(w http.ResponseWriter, l lookup) {
 	}
 
 	writeJSON(w, map[string]any{
-		"runs":   decorateRuns(runs),
+		"runs":   h.attachMeta(decorateRuns(runs)),
 		"total":  len(runs),
 		"offset": 0,
 		"limit":  len(runs),
@@ -518,6 +518,91 @@ type runView struct {
 	DurationMs   int64  `json:"duration_ms"`
 	DurationText string `json:"duration_text"`
 	Running      bool   `json:"running"`
+
+	// Meta / MetaTotal 是列表里预览用的 metadata，读的是这次调用的 meta，
+	// 不是索引里的拷贝——索引里没有拷贝。
+	//
+	// 放在 view 上而不是 RunInfo 上：它是展示用的派生数据，不是索引拥有的状态。
+	// 索引存一份快照试过，问题是它只能拍一个时刻，流程中途写进去的 metadata
+	// 就和详情页显示得不一样了；而实测那个 hash 只有几百字节，读穿的代价还不如
+	// 维护一致性的代价大。
+	Meta      map[string]string `json:"meta,omitempty"`
+	MetaTotal int               `json:"meta_total,omitempty"`
+}
+
+const (
+	// metaPreviewKeys / metaPreviewValue 限制列表里带多少 metadata。
+	//
+	// 界面默认只显示两条，剩下的点开弹窗按需拉完整那份，所以这里不需要给全。
+	// 有上限才不会被某个塞了 200 条 metadata 的调用把整个列表响应撑大。
+	metaPreviewKeys  = 4
+	metaPreviewValue = 256
+)
+
+// attachMeta 给这一页的每一行读一次 metadata。
+//
+// 一页最多 limit 行，也就是最多 limit 次 HGETALL；列表本来就已经为每行做了一次
+// GET，所以这是把往返翻一倍。之所以能接受：实测真实负载下这个 hash 只有几百字节。
+// 换来的是列表和详情页永远一致——包括流程中途 SetKV 写进去的那些。
+func (h *handler) attachMeta(views []runView) []runView {
+	product := gotick.NewKvStoreProduct(h.opt.Store)
+
+	for i := range views {
+		all, err := product.New(views[i].CallId).GetKVAll()
+		if err != nil {
+			// 读不到就这一行不显示 metadata，不该让整个列表失败：
+			// 状态、耗时、失败原因这些更重要的东西都还在。
+			continue
+		}
+
+		names := make([]string, 0, len(all))
+		for name := range all {
+			// __ 是框架的保留前缀，Memo / Array / Async 的缓存结果都在那儿
+			if !strings.HasPrefix(name, "__") {
+				names = append(names, name)
+			}
+		}
+
+		views[i].MetaTotal = len(names)
+		if len(names) == 0 {
+			continue
+		}
+
+		// 排序有两个作用：截断时取的是确定的那几条，界面上「默认显示两条」
+		// 每次刷新也是同样的两条。map 遍历顺序随机，不排的话两者都会抖。
+		sort.Strings(names)
+		if len(names) > metaPreviewKeys {
+			names = names[:metaPreviewKeys]
+		}
+
+		meta := make(map[string]string, len(names))
+		for _, name := range names {
+			meta[name] = truncateRunes(all[name], metaPreviewValue)
+		}
+		views[i].Meta = meta
+
+		// 索引里没记 key 的是二级索引上线之前的记录。补录会把它填上，
+		// 但那要等这一行被列出来之后才发生，所以这里顺手用读到的这份兜一下。
+		if views[i].Key == "" {
+			if k, ok := all[gotick.RunKeyField]; ok {
+				views[i].Key = k
+			}
+		}
+	}
+	return views
+}
+
+// truncateRunes 按字符而不是字节截断，避免把一个多字节字符切成两半——
+// 那会产出非法 UTF-8，JSON 编码时被替换成一堆 U+FFFD。
+func truncateRunes(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	return string(runes[:max]) + "…"
 }
 
 func decorateRun(r gotick.RunInfo) runView {

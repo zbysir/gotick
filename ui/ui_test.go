@@ -310,7 +310,7 @@ func TestRunsKeyFilterUnsupportedIsAnError(t *testing.T) {
 	assert.Equal(t, http.StatusOK, rec.Code)
 }
 
-func TestRunsListCarriesMetaSnapshot(t *testing.T) {
+func TestRunsListCarriesMetadata(t *testing.T) {
 	kv := store.NewMockKvStore()
 	idx := gotick.NewKvRunIndex(kv, time.Hour)
 
@@ -332,6 +332,47 @@ func TestRunsListCarriesMetaSnapshot(t *testing.T) {
 
 	// 列表不带重放记录：那是详情页的东西，一页 50 行会是上万条
 	assert.Nil(t, run["marks"])
+
+	// 列表读的是 metadata 本身，不是某个时刻的快照——所以流程中途写进去的
+	// 也看得到，列表和详情页不会各说一套。（快照那版做不到这一点。）
+	require.NoError(t, gotick.NewKvStoreProduct(kv).New("call-1").SetKV("shipped_at", "later"))
+
+	_, body = get(t, h, "/api/runs")
+	run = body["runs"].([]any)[0].(map[string]any)
+	assert.Equal(t, float64(3), run["meta_total"])
+	assert.Contains(t, run["meta"], "shipped_at")
+}
+
+func TestRunsListPreviewIsBounded(t *testing.T) {
+	kv := store.NewMockKvStore()
+	idx := gotick.NewKvRunIndex(kv, time.Hour)
+
+	meta := map[string]string{}
+	for i := 0; i < metaPreviewKeys+6; i++ {
+		meta[fmt.Sprintf("k%02d", i)] = strings.Repeat("x", metaPreviewValue+40)
+	}
+	seedRun(t, kv, idx, "shop", "call-1", "", meta, time.Now())
+
+	h, err := NewHandler(Options{Store: kv, Index: idx})
+	require.NoError(t, err)
+
+	_, body := get(t, h, "/api/runs")
+	run := body["runs"].([]any)[0].(map[string]any)
+
+	preview := run["meta"].(map[string]any)
+	assert.Len(t, preview, metaPreviewKeys,
+		"列表响应不能被一个塞了几百条 metadata 的调用撑大")
+	assert.Equal(t, float64(metaPreviewKeys+6), run["meta_total"],
+		"总数要照实报，界面才知道还有更多可以点开")
+
+	// 截断后取的是排序靠前的那几条，每次刷新露出来的是同样的键
+	assert.Contains(t, preview, "k00")
+	assert.NotContains(t, preview, fmt.Sprintf("k%02d", metaPreviewKeys))
+
+	for name, v := range preview {
+		assert.Equal(t, metaPreviewValue+1, len([]rune(v.(string))),
+			"%s：截到上限再加一个省略号", name)
+	}
 }
 
 func callIds(body map[string]any) []string {
