@@ -6,20 +6,16 @@
 <title>gotick</title>
 <style>
   :root {
-    --ground: #f5f7f5;
+    --ground: #f7f7f7;
     --surface: #ffffff;
-    --surface-2: #ebefec;
-    --ink: #0d1710;
-    --muted: #55665c;
-    --faint: #7b8d82;
-    --line: #dde4df;
-    --line-strong: #b8c6bd;
+    --surface-2: #eeeeee;
+    --ink: #131313;
+    --muted: #5c5c5c;
+    --faint: #828282;
+    --line: #e0e0e0;
+    --line-strong: #c0c0c0;
     --accent: #07743d;
-    --accent-soft: #dcf1e5;
-    --ok: #14663f;
-    --ok-soft: #ddf0e5;
     --warn: #855800;
-    --warn-soft: #faefd6;
     --crit: #a32118;
     --crit-soft: #fbe7e4;
     --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
@@ -28,12 +24,11 @@
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --ground: #050807; --surface: #0c110e; --surface-2: #131b16;
-      --ink: #e8f2ea; --muted: #96a89c; --faint: #6f8175;
-      --line: #1a231d; --line-strong: #2b3830;
-      --accent: #3ef08a; --accent-soft: #0a2617;
-      --ok: #2fc476; --ok-soft: #082114;
-      --warn: #f5b73d; --warn-soft: #2a2011;
+      --ground: #070707; --surface: #0d0d0d; --surface-2: #161616;
+      --ink: #ededed; --muted: #a6a6a6; --faint: #737373;
+      --line: #1f1f1f; --line-strong: #303030;
+      --accent: #3ef08a;
+      --warn: #f5b73d;
       --crit: #ff6f66; --crit-soft: #2c1614;
     }
   }
@@ -96,17 +91,23 @@
 
   .pill {
     display: inline-block; font-family: var(--mono); font-size: 10.5px;
-    letter-spacing: .07em; text-transform: uppercase; padding: 2px 7px;
+    letter-spacing: .07em; text-transform: uppercase; padding: 1px 6px;
     border-radius: 2px; white-space: nowrap; font-weight: 500;
+    background: transparent;
+    border: 1px solid currentColor;
+    border-color: color-mix(in oklab, currentColor 40%, transparent);
   }
-  .pill.done { background: var(--ok-soft); color: var(--ok); }
-  .pill.running { background: var(--accent-soft); color: var(--accent); }
-  .pill.failed, .pill.fail { background: var(--crit-soft); color: var(--crit); }
-  .pill.aborted, .pill.abort { background: var(--crit-soft); color: var(--crit); }
-  .pill.retry { background: var(--warn-soft); color: var(--warn); }
-  .pill.sleep { background: var(--surface-2); color: var(--muted); }
-  .pill.wait_signal { background: var(--accent-soft); color: var(--accent); }
-  .pill.unknown, .pill.expired { background: var(--surface-2); color: var(--faint); }
+  /* 标签一律描边不填色。原来每种状态都铺一层浅底，而列表里绝大多数行是
+     done，于是满屏都是填色的绿块。描边式只在需要注意的状态上才有颜色。
+     border-color 用 color-mix 压到四成；不支持的浏览器落回上一行的 currentColor。 */
+  .pill.done { color: var(--muted); }
+  .pill.running { color: var(--accent); }   /* 绿＝活着，只给正在跑的 */
+  .pill.failed, .pill.fail { color: var(--crit); }
+  .pill.aborted, .pill.abort { color: var(--crit); }
+  .pill.retry { color: var(--warn); }
+  .pill.sleep { color: var(--muted); }
+  .pill.wait_signal { color: var(--accent); }
+  .pill.unknown, .pill.expired { color: var(--faint); }
 
   .err {
     color: var(--crit); font-family: var(--mono); font-size: 12px;
@@ -123,7 +124,9 @@
   h2 { font-size: 17px; margin: 0 0 2px; letter-spacing: -.01em; }
   .sub { color: var(--muted); font-size: 12.5px; margin-bottom: 16px; }
 
-  .bar { height: 4px; background: var(--accent); border-radius: 2px; min-width: 2px; }
+  /* 时长条默认中性：每行一条绿杠也是「绿油油」的一部分，
+     而“跑了多久”本身不是需要注意的信号，出问题才上色。 */
+  .bar { height: 4px; background: var(--line-strong); border-radius: 2px; min-width: 2px; }
   .bar.fail { background: var(--crit); }
   .bar.retry { background: var(--warn); }
   .bartrack { background: var(--surface-2); border-radius: 2px; min-width: 60px; }
@@ -146,6 +149,8 @@
     display: flex; flex-direction: column; gap: 10px;
   }
   .activity.idle { border-left-color: var(--line-strong); }
+  /* 失败/中止不能和「已完成」一个样：这条横幅是「现在怎么样」的总结。 */
+  .activity.bad { border-left-color: var(--crit); }
   .activity-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
   .activity-state {
     font-size: 15px; font-weight: 650; letter-spacing: -.005em;
@@ -534,6 +539,7 @@ function activityBanner(a) {
   }
   const note = noteKey ? t(noteKey) : "";
   const idle = ["done", "failed", "aborted"].includes(a.state);
+  const bad = ["failed", "aborted"].includes(a.state);
 
   let timing = "";
   let progress = "";
@@ -564,7 +570,7 @@ function activityBanner(a) {
   }
 
   return `
-    <div class="activity${idle ? " idle" : ""}">
+    <div class="activity${idle ? " idle" : ""}${bad ? " bad" : ""}">
       <div class="activity-head">
         <span class="activity-state"><i class="dot ${m.dot}"></i>${esc(label)}</span>
         ${a.task ? `<span class="activity-task">${esc(a.task)}</span>` : ""}
