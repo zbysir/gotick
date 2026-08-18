@@ -253,6 +253,8 @@ type FutureT[T interface{}] struct {
 	Val T
 	k   string
 	fun func(retry int) (T, error)
+	// mr 这个任务的重试上限，由 Async 的 TaskOption 决定，默认 defaultAsyncMaxRetry。
+	mr int
 }
 
 func (f *FutureT[T]) Value() T {
@@ -274,12 +276,17 @@ func (f *FutureT[T]) key() string {
 	return f.k
 }
 
+func (f *FutureT[T]) maxRetry() int {
+	return f.mr
+}
+
 type Future interface {
 	exec(retry int) (interface{}, error)
 	key() string
+	maxRetry() int
 }
 
-func AsyncArray[T interface{}, A interface{}](ctx *Context, key string, arr []ArrayWrap[A], f func(ctx *TaskContext, a A, index int) (T, error)) []Future {
+func AsyncArray[T interface{}, A interface{}](ctx *Context, key string, arr []ArrayWrap[A], f func(ctx *TaskContext, a A, index int) (T, error), opts ...TaskOption) []Future {
 	var fs []Future
 
 	for index, t := range arr {
@@ -288,7 +295,7 @@ func AsyncArray[T interface{}, A interface{}](ctx *Context, key string, arr []Ar
 		index := index
 		fs = append(fs, Async(ctx, t.Key(key), func(ctx *TaskContext) (T, error) {
 			return f(ctx, t.Val, index)
-		}))
+		}, opts...))
 	}
 
 	return fs
@@ -298,8 +305,12 @@ func AsyncArray[T interface{}, A interface{}](ctx *Context, key string, arr []Ar
 //
 // 这里只读取已经缓存的结果，不查任务状态：任务是否已完成、能不能执行，
 // 由 Wait 一次性读全量状态来判断，避免每个 future 各查一次 Redis。
-func Async[T interface{}](ctx *Context, key string, f func(ctx *TaskContext) (T, error)) *FutureT[T] {
+func Async[T interface{}](ctx *Context, key string, f func(ctx *TaskContext) (T, error), opts ...TaskOption) *FutureT[T] {
 	ctx.markKeyUsed("Async", key)
+
+	// 默认给 defaultAsyncMaxRetry，不是 Task 那个 defaultMaxRetry：
+	// 保持这个函数原有的行为，不传 opts 的调用方一切照旧。
+	opt := TaskOptions(opts).buildWith(taskOption{MaxRetry: defaultAsyncMaxRetry})
 
 	val, _, err := GetFromStore[T](ctx.store, key)
 	if err != nil {
@@ -313,6 +324,7 @@ func Async[T interface{}](ctx *Context, key string, f func(ctx *TaskContext) (T,
 		fun: func(retry int) (T, error) {
 			return f(&TaskContext{Context: ctx, Retry: retry})
 		},
+		mr: opt.MaxRetry,
 	}
 }
 
@@ -324,10 +336,10 @@ type ParallelOption struct {
 	BatchSizePerRunner int
 }
 
-// defaultAsyncMaxRetry 是 Async 任务的重试上限。
+// defaultAsyncMaxRetry 是 Async / AsyncArray 不传 WithMaxRetry 时的重试上限。
 //
-// TODO: 让 Async / AsyncArray 也接受 TaskOption，和 Task / Array 用同一套配置。
-// 现在用户对 Async 任务设置 WithMaxRetry 是完全无效的。
+// 和 Task 的 defaultMaxRetry(3) 不一样是历史原因，改动它会让现有调用方的
+// 行为变化，所以保留。想改就显式传 WithMaxRetry。
 const defaultAsyncMaxRetry = 5
 
 // waitRecheckDelay 是没有明确重试时间时，下一次回来查看的间隔。
@@ -502,7 +514,7 @@ func runFuture(ctx *Context, f Future, epoch int64, retry int) bool {
 
 	if execErr != nil {
 		_, _ = settleTask(ctx.store, f.key(), epoch, func(s TaskStatus) TaskStatus {
-			if s.RetryCount >= defaultAsyncMaxRetry {
+			if s.RetryCount >= f.maxRetry() {
 				return s.MakeFail(execErr)
 			}
 			return s.MakeRetry(execErr)
@@ -945,9 +957,15 @@ type taskOption struct {
 type TaskOptions []TaskOption
 
 func (os TaskOptions) build() taskOption {
-	option := taskOption{
-		MaxRetry: defaultMaxRetry,
-	}
+	return os.buildWith(taskOption{MaxRetry: defaultMaxRetry})
+}
+
+// buildWith 用调用方给的默认值来构建。
+//
+// 存在的原因：Task 的默认重试是 3，Async 的是 5。如果 Async 直接用 build()，
+// 它的默认值会被悄悄从 5 改成 3——这是一次不该发生的行为变更。
+func (os TaskOptions) buildWith(def taskOption) taskOption {
+	option := def
 	for _, o := range os {
 		o.apply(&option)
 	}
@@ -967,10 +985,29 @@ func (m *maxRetryOption) apply(option *taskOption) {
 	return
 }
 
-// WithMaxRetry 设置最大重试次数（不含第一次执行）。0 表示失败即失败。
+// negMaxRetryWarned 记下已经警告过的负值，同一个值只提醒一次。
 //
-// 注意：目前对 Async / AsyncArray 无效，它们用的是 defaultAsyncMaxRetry。
+// 不做去重会刷屏：WithMaxRetry(...) 是 Task 的实参，而 flow 函数每轮调度都要
+// 从头执行一遍，所以这个实参会被反复求值——一个跑十轮的流程就会打十条。
+var negMaxRetryWarned sync.Map
+
+// WithMaxRetry 设置最大重试次数（不含第一次执行），所以最多执行 n+1 遍。
+// 默认 3。0 表示失败即失败。
+//
+// 负数不代表「无限重试」，会被夹到 0 并打一条警告。判定是
+// `retryCount >= maxRetry`，而首次执行时 retryCount 就是 0，
+// 所以传 -1 的实际效果和 0 完全一样：第一次失败就放弃。
+// 想让某个 task 一直重试，目前没有这个能力。
+//
+// Async / AsyncArray 同样接受这个选项，只是它们不传时的默认值是
+// defaultAsyncMaxRetry(5)，而不是 Task 的 3。
 func WithMaxRetry(maxRetry int) TaskOption {
+	if maxRetry < 0 {
+		if _, dup := negMaxRetryWarned.LoadOrStore(maxRetry, struct{}{}); !dup {
+			log.Printf("[gotick] WithMaxRetry(%d): 负数不是「无限重试」，已按 0 处理（第一次失败就放弃）", maxRetry)
+		}
+		maxRetry = 0
+	}
 	return &maxRetryOption{maxRetry: maxRetry}
 }
 

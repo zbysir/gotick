@@ -594,3 +594,18 @@ func TestSleepYieldsForLongRemainders(t *testing.T) {
 	assert.IsType(t, &breakSleep{}, bp)
 	assert.Less(t, time.Since(start), shortWaitTolerance, "让出应该是立刻的")
 }
+
+// 负数不代表「无限重试」。判定是 retryCount >= maxRetry，而首次执行时
+// retryCount 就是 0，所以传负数的实际效果和 0 一样：第一次失败就放弃。
+// 这一点太容易误会，用测试钉住「夹到 0」这个行为。
+func TestWithMaxRetryClampsNegative(t *testing.T) {
+	for _, n := range []int{-1, -5, -1 << 30} {
+		got := TaskOptions{WithMaxRetry(n)}.build()
+		assert.Equal(t, 0, got.MaxRetry, "WithMaxRetry(%d) 应当被夹到 0", n)
+	}
+
+	// 非负值原样保留，默认值也别被这次改动带跑
+	assert.Equal(t, 0, TaskOptions{WithMaxRetry(0)}.build().MaxRetry)
+	assert.Equal(t, 7, TaskOptions{WithMaxRetry(7)}.build().MaxRetry)
+	assert.Equal(t, defaultMaxRetry, TaskOptions{}.build().MaxRetry)
+}
