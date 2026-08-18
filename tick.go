@@ -1702,7 +1702,7 @@ func (s *Scheduler) register(f *Flow) {
 			}
 			// 取消也是结束，一样要解绑——否则 key 会一直指着一个已经死掉的调用
 			if s.keys != nil {
-				if key, ok, kErr := statusStore.GetKV(runKeyField); kErr == nil && ok && key != "" {
+				if key, ok, kErr := statusStore.GetKV(RunKeyField); kErr == nil && ok && key != "" {
 					if uErr := s.keys.unbind(f.Id, key, callId); uErr != nil {
 						log.Printf("[gotick] unbind key %s/%s failed: %v", f.Id, key, uErr)
 					}
@@ -1926,7 +1926,7 @@ func (s *Scheduler) register(f *Flow) {
 		// unbind 内部只在绑定仍然指向自己时才删——已经被顶替掉的绑定
 		// 不能被上一个持有者顺手删掉。
 		if terminal && s.keys != nil {
-			if key, ok, kErr := statusStore.GetKV(runKeyField); kErr == nil && ok && key != "" {
+			if key, ok, kErr := statusStore.GetKV(RunKeyField); kErr == nil && ok && key != "" {
 				if uErr := s.keys.unbind(f.Id, key, callId); uErr != nil {
 					log.Printf("[gotick] unbind key %s/%s failed: %v", f.Id, key, uErr)
 				}
@@ -1990,7 +1990,7 @@ func (s *Scheduler) Trigger(ctx context.Context, flowId string, initData MetaDat
 	}
 
 	// 把 key 记进这次调用的存储，终态时用它解绑
-	if err := s.statusFactory.New(callId).SetKV(runKeyField, opt.key); err != nil {
+	if err := s.statusFactory.New(callId).SetKV(RunKeyField, opt.key); err != nil {
 		return "", err
 	}
 
@@ -2001,8 +2001,12 @@ func (s *Scheduler) Trigger(ctx context.Context, flowId string, initData MetaDat
 	return callId, nil
 }
 
-// runKeyField 这次调用绑定的业务 key 存在哪。__ 前缀是保留命名空间。
-const runKeyField = "__gotick_key"
+// RunKeyField 是 WithKey 绑定的业务 key 存在这次调用的 meta 里的哪个字段。
+// __ 前缀是框架的保留命名空间。
+//
+// 导出是因为它是框架的簿记字段，不是用户数据也不是任务缓存结果——
+// 读 metadata 的工具（界面、inspect）需要能把它单独认出来。
+const RunKeyField = "__gotick_key"
 
 // CancelByKey 按业务 key 取消，不必知道 callId。
 func (t *Server) CancelByKey(ctx context.Context, flowId, key, reason string) error {

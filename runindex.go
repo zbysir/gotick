@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,8 +25,16 @@ const (
 //
 // 每个 task 的细节在 {callId}_status 里，这里只放「一眼能看懂」的东西。
 type RunInfo struct {
-	CallId    string    `json:"call_id"`
-	FlowId    string    `json:"flow_id"`
+	CallId string `json:"call_id"`
+	FlowId string `json:"flow_id"`
+
+	// Key 是 Trigger 时用 WithKey 绑定的业务 key（订单号、用户 ID 之类）。
+	//
+	// 冗余在这里是有意的：它同时也在这次调用的 meta 里（RunKeyField），但那一份
+	// 在流程结束时会被解绑，而且要多一次 HGETALL 才读得到。列表页每行都要显示它、
+	// 还要能按它筛，所以必须能从索引记录里直接拿到——否则一页 50 行就是 50 次额外往返。
+	Key string `json:"key,omitempty"`
+
 	Status    string    `json:"status"`
 	StartedAt time.Time `json:"started_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -38,6 +48,21 @@ type RunInfo struct {
 	// FailedTask / Error 只在失败时有值，让列表页不用点进去就知道死在哪。
 	FailedTask string `json:"failed_task,omitempty"`
 	Error      string `json:"error,omitempty"`
+
+	// Meta 是触发时传进来的 metadata 快照，让列表页不点进去就能看出
+	// 「这次调用是关于哪个订单的」。
+	//
+	// 只在第一次重放时拍一次：流程中途 SetKV 写进去的东西不在这里，详情页仍然读
+	// 完整的那一份。这是有意的取舍——每次重放都刷一遍等于给每次重放加一次 HGETALL，
+	// 而重放密集的 flow 会为此付很多，换来的只是列表上几个字段更新得更及时。
+	//
+	// 内容按 maxSnapshotKeys / maxSnapshotValue 截断：索引记录是列表页每行都要读的
+	// 东西，不能让某个塞了 200 条 metadata 的调用把整个列表的响应撑大。
+	Meta map[string]string `json:"meta,omitempty"`
+
+	// MetaTotal 是快照当时用户 metadata 的总条数。
+	// Meta 可能被截断，界面要靠它知道「还有更多，点开看」。
+	MetaTotal int `json:"meta_total,omitempty"`
 
 	// Marks 记录每次重放的开始时刻和它以什么方式结束。
 	//
@@ -98,6 +123,30 @@ type RunIndex interface {
 	CountRuns(flowId string) (int64, error)
 }
 
+// StatusFilterIndex 是 RunIndex 的一个可选能力：在服务端按状态筛选。
+//
+// 没有并进 RunIndex，理由和 store.ZRemmer 一样——那是个公开接口，加方法会让
+// 自己实现过它的调用方升级即编译不过。调用方用类型断言问一次，拿不到就退回
+// 「只在当前这一页里过滤」，而不是假装筛过了。
+type StatusFilterIndex interface {
+	// StatusFilterSupported 报告底层设施到底支不支持。实现了这个接口不等于能用：
+	// KvRunIndex 永远实现它，但在一个删不了 ZSET 成员的 store 上会返回 false。
+	StatusFilterSupported() bool
+	ListRunsByStatus(flowId, status string, offset, limit int64) ([]RunInfo, error)
+	CountRunsByStatus(flowId, status string) (int64, error)
+}
+
+// KeyFilterIndex 是 RunIndex 的另一个可选能力：按业务 key 筛选。
+// 不并进 RunIndex 的理由同 StatusFilterIndex。
+//
+// 这里没有对应的 Supported 方法：按 key 的索引只写不删，不依赖任何可选的
+// store 能力。它唯一的边界是时间——索引上线之前跑的调用没有被记进来，
+// 那些记录会随保留期自己消失。
+type KeyFilterIndex interface {
+	ListRunsByKey(flowId, key string, offset, limit int64) ([]RunInfo, error)
+	CountRunsByKey(flowId, key string) (int64, error)
+}
+
 const (
 	flowsKey   = "gotick:flows"
 	allRunsKey = "gotick:runs"
@@ -106,9 +155,48 @@ const (
 func flowRunsKey(flowId string) string { return "gotick:flow:" + flowId + ":runs" }
 func runInfoKey(callId string) string  { return "gotick:run:" + callId }
 
+// 按状态的二级索引。和主索引同构（成员是 callId，score 是开始时间），
+// 所以「按状态筛」和「不筛」走的是完全一样的分页和排序逻辑。
+func statusRunsKey(status string) string { return "gotick:runs:status:" + status }
+func flowStatusRunsKey(flowId, status string) string {
+	return "gotick:flow:" + flowId + ":runs:status:" + status
+}
+
+// 按业务 key 的二级索引。形状和按状态那套完全一样（成员是 callId，score 是开始时间），
+// 所以「按 key 筛」也是一次 ZREVRANGE 加一个精确总数，和不筛时走同一套分页。
+//
+// 和状态索引有一个关键区别：一次调用的 key 从头到尾不会变，所以这里只写不删，
+// 不需要 store.ZRemmer，也不会有滞留成员。
+func keyRunsKey(key string) string { return "gotick:runs:key:" + key }
+func flowKeyRunsKey(flowId, key string) string {
+	return "gotick:flow:" + flowId + ":runs:key:" + key
+}
+
+// indexedStatuses 是会进二级索引的状态。
+//
+// "expired" 不在里面：那是 ListRuns 在记录已经过了 TTL、但 ZSET 成员还在时
+// 凭空补出来的占位状态，从来没有被写入过，也就没有索引可言。
+var indexedStatuses = []string{
+	RunStatusRunning, RunStatusDone, RunStatusFailed, RunStatusAborted, RunStatusCanceled,
+}
+
+const (
+	// maxSnapshotKeys / maxSnapshotValue 限制快照进索引的 metadata 大小。
+	// 超出的部分不会丢——详情页读的是完整的那一份。
+	maxSnapshotKeys  = 12
+	maxSnapshotValue = 256
+)
+
 // KvRunIndex 把索引建在 KVStore 上，因此 Redis 和内存实现都能用。
 type KvRunIndex struct {
 	store store.KVStore
+
+	// zrem 是可选能力，nil 表示这个 store 删不了有序集合的指定成员。
+	//
+	// 有它才维护按状态的二级索引：一次调用结束时要从 running 集合搬到终态集合，
+	// 搬不走的话 running 集合会把所有跑过的调用都留在里面，
+	// 「只看在跑的」于是变成「看全部」——一个会给出错误答案的索引比没有索引更糟。
+	zrem store.ZRemmer
 
 	// retain 索引里的记录保留多久，和 flow 数据的保留期保持一致。
 	retain time.Duration
@@ -128,8 +216,18 @@ const trimInterval = 10 * time.Minute
 var _ RunIndex = (*KvRunIndex)(nil)
 
 func NewKvRunIndex(s store.KVStore, retain time.Duration) *KvRunIndex {
-	return &KvRunIndex{store: s, retain: retain}
+	k := &KvRunIndex{store: s, retain: retain}
+	if store.ZRemSupported(s) {
+		k.zrem, _ = s.(store.ZRemmer)
+	}
+	return k
 }
+
+// StatusFilterSupported 报告这个索引能不能在服务端按状态筛选。
+//
+// 导出是因为界面要据此决定说什么：能筛的时候「只看失败的」是在全部记录里筛，
+// 不能筛的时候它只在当前这一页里生效——两者差别很大，不该让人自己猜。
+func (k *KvRunIndex) StatusFilterSupported() bool { return k.zrem != nil }
 
 func (k *KvRunIndex) RegisterFlow(flowId string) error {
 	return k.store.ZAdd(context.Background(), flowsKey, flowId, float64(time.Now().UnixMilli()))
@@ -164,11 +262,22 @@ func (k *KvRunIndex) BeginRun(flowId, callId string, at time.Time) error {
 			StartedAt: at,
 		}
 
+		// 只在这里拍快照——这个分支每个 callId 只走一次，不是每次重放。
+		// 时序是成立的：触发时传的 InitMetaData 和 WithKey 绑的 key
+		// 都在调度器调用 BeginRun 之前就已经写进 meta 了。
+		info.Key, info.Meta, info.MetaTotal = k.snapshotMeta(callId)
+
 		score := float64(at.UnixMilli())
 		if err := k.store.ZAdd(ctx, allRunsKey, callId, score); err != nil {
 			return err
 		}
 		if err := k.store.ZAdd(ctx, flowRunsKey(flowId), callId, score); err != nil {
+			return err
+		}
+		if err := k.addToStatusIndex(flowId, callId, RunStatusRunning, score); err != nil {
+			return err
+		}
+		if err := k.addToKeyIndex(flowId, callId, info.Key, score, at); err != nil {
 			return err
 		}
 	}
@@ -178,6 +287,147 @@ func (k *KvRunIndex) BeginRun(flowId, callId string, at time.Time) error {
 	info.UpdatedAt = at
 
 	return k.saveRun(info)
+}
+
+// snapshotMeta 读一次这次调用的 meta，取出业务 key 和用户 metadata。
+//
+// 读失败不返回错误：快照是给列表页看的装饰，缺了只是少显示几个字段，
+// 不该因此让一次重放失败。索引本身就是观测设施，不是流程状态的一部分。
+func (k *KvRunIndex) snapshotMeta(callId string) (key string, meta map[string]string, total int) {
+	all, err := NewKvStoreProduct(k.store).New(callId).GetKVAll()
+	if err != nil {
+		log.Printf("[gotick] snapshot meta of run %s failed: %v", callId, err)
+		return "", nil, 0
+	}
+	if len(all) == 0 {
+		return "", nil, 0
+	}
+
+	// 先挑出用户那部分。__ 是框架的保留前缀（Memo / Array / Async 的缓存结果都在
+	// 那儿），把它们快照进索引毫无意义，而且体积可能非常大。
+	names := make([]string, 0, len(all))
+	for name := range all {
+		if name == RunKeyField {
+			key = all[name]
+			continue
+		}
+		if strings.HasPrefix(name, "__") {
+			continue
+		}
+		names = append(names, name)
+	}
+
+	total = len(names)
+	if total == 0 {
+		return key, nil, 0
+	}
+
+	// 排序有两个作用：截断时取的是确定的那几条，界面上「默认显示两条」
+	// 每次刷新也是同样的两条。map 遍历顺序随机，不排的话两者都会抖。
+	sort.Strings(names)
+	if len(names) > maxSnapshotKeys {
+		names = names[:maxSnapshotKeys]
+	}
+
+	meta = make(map[string]string, len(names))
+	for _, name := range names {
+		meta[name] = truncateRunes(all[name], maxSnapshotValue)
+	}
+	return key, meta, total
+}
+
+// truncateRunes 按字符而不是字节截断，避免把一个多字节字符切成两半——
+// 那会产出非法 UTF-8，JSON 编码时被替换成一堆 U+FFFD。
+func truncateRunes(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	return string(runes[:max]) + "…"
+}
+
+// addToStatusIndex 把一次调用记进某个状态的集合。
+// 没有 ZRem 能力时整个二级索引都不维护——见 KvRunIndex.zrem。
+func (k *KvRunIndex) addToStatusIndex(flowId, callId, status string, score float64) error {
+	if k.zrem == nil {
+		return nil
+	}
+
+	ctx := context.Background()
+	if err := k.store.ZAdd(ctx, statusRunsKey(status), callId, score); err != nil {
+		return err
+	}
+	if flowId == "" {
+		return nil
+	}
+	return k.store.ZAdd(ctx, flowStatusRunsKey(flowId, status), callId, score)
+}
+
+// addToKeyIndex 把一次调用记进它的业务 key 索引。
+//
+// 这套索引的键名里含用户数据（key 本身），所以键的数量是无界的：一个 flow
+// 跑过多少个不同的订单号，就有多少个 ZSET。清理靠三件事，各管一种情况：
+//
+//  1. 每次写都刷一遍 TTL。于是「这个 key 再也不会出现」的那些 ZSET，在最后一次
+//     被使用之后 retain 时间就自己消失了。这是它们唯一的出路——键名枚举不出来，
+//     TrimBefore 够不到。
+//  2. 每次写顺手裁掉 now-retain 之前开始的成员。反复复用同一个 key（定时任务那种）
+//     不会让它越堆越大。注意 now 是这次调用的开始时间而不是墙上时间，和 trimIfDue
+//     的口径一致：生产里调用方传的就是 time.Now()，而拿历史时间回填时窗口会偏早，
+//     方向是少裁，不会误删窗口内的记录。
+//  3. 上面那一刀把成员裁光时，Redis 会连整个键一起删掉，于是空壳也不留。
+//
+// 一个已知的边界：TTL 只在这里刷，而这里每个 callId 只走一次（BeginRun 的首次分支），
+// 所以活得比 retain 还久的调用会在中途从这套索引里消失。主索引是一样的——TrimBefore
+// 按开始时间裁，长命的调用同样会被裁掉。两边一致，都是「保留期以开始时间为锚」
+// 这个既有设定的结果，不是这套索引单独的问题。
+func (k *KvRunIndex) addToKeyIndex(flowId, callId, key string, score float64, now time.Time) error {
+	if key == "" {
+		return nil
+	}
+
+	ctx := context.Background()
+	names := []string{keyRunsKey(key)}
+	if flowId != "" {
+		names = append(names, flowKeyRunsKey(flowId, key))
+	}
+
+	for _, name := range names {
+		if err := k.store.ZAdd(ctx, name, callId, score); err != nil {
+			return err
+		}
+		if k.retain <= 0 {
+			continue // <=0 表示永久保留，既不设 TTL 也不裁
+		}
+		if err := k.store.Expire(ctx, name, k.retain); err != nil {
+			return err
+		}
+		if _, err := k.store.ZRemBelow(ctx, name, float64(now.Add(-k.retain).UnixMilli())); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// moveStatusIndex 把一次调用从旧状态的集合搬到新状态的集合。
+func (k *KvRunIndex) moveStatusIndex(flowId, callId, from, to string, score float64) error {
+	if k.zrem == nil || from == to {
+		return nil
+	}
+
+	ctx := context.Background()
+	if err := k.zrem.ZRem(ctx, statusRunsKey(from), callId); err != nil {
+		return err
+	}
+	if flowId != "" {
+		if err := k.zrem.ZRem(ctx, flowStatusRunsKey(flowId, from), callId); err != nil {
+			return err
+		}
+	}
+	return k.addToStatusIndex(flowId, callId, to, score)
 }
 
 func (k *KvRunIndex) RecordReplay(callId string, mark ReplayMark) error {
@@ -204,6 +454,8 @@ func (k *KvRunIndex) FinishRun(callId, status, failedTask, errMsg string, at tim
 		return nil
 	}
 
+	prevStatus := info.Status
+
 	info.Status = status
 	info.EndedAt = at
 	info.UpdatedAt = at
@@ -212,6 +464,16 @@ func (k *KvRunIndex) FinishRun(callId, status, failedTask, errMsg string, at tim
 
 	if err := k.saveRun(info); err != nil {
 		return err
+	}
+
+	// 二级索引用主索引同一个 score（开始时间），两边排序才一致。
+	// from == to 时是空操作，所以重复 FinishRun 不会把记录搬丢。
+	if err := k.moveStatusIndex(info.FlowId, callId, prevStatus, status,
+		float64(info.StartedAt.UnixMilli())); err != nil {
+		// 主记录已经写成功了，状态是对的，只是二级索引落后了一点。
+		// 为此让流程报错不值得——下一次裁剪会把过期成员清掉，
+		// 而按状态筛选顶多多显示一条已经结束的调用。
+		log.Printf("[gotick] move run %s to status index %s failed: %v", callId, status, err)
 	}
 
 	k.trimIfDue(info.FlowId, at)
@@ -267,11 +529,84 @@ func (k *KvRunIndex) GetRun(callId string) (RunInfo, bool, error) {
 }
 
 func (k *KvRunIndex) ListRuns(flowId string, offset, limit int64) ([]RunInfo, error) {
-	key := allRunsKey
-	if flowId != "" {
-		key = flowRunsKey(flowId)
-	}
+	return k.listFrom(runsKeyOf(flowId), flowId, offset, limit, nil)
+}
 
+// ListRunsByStatus 只返回某个状态的实例，分页和总数都是全量范围的。
+//
+// 需要 store 支持 ZRem，先用 StatusFilterSupported 问一次；不支持时二级索引
+// 从来没被写过，这里会返回空——而不是悄悄退化成「全部」。
+func (k *KvRunIndex) ListRunsByStatus(flowId, status string, offset, limit int64) ([]RunInfo, error) {
+	if status == "" {
+		return k.ListRuns(flowId, offset, limit)
+	}
+	// 核对真实状态：二级索引的搬迁不和主记录一起原子完成，搬迁失败会留下滞留成员。
+	return k.listFrom(statusKeyOf(flowId, status), flowId, offset, limit,
+		func(info RunInfo) bool { return info.Status == status })
+}
+
+// ListRunsByKey 返回绑定了某个业务 key 的实例，按开始时间倒序。
+//
+// 不核对记录里的 Key：一次调用的 key 不会变，这套索引只写不删，
+// 不存在状态索引那种滞留成员。
+func (k *KvRunIndex) ListRunsByKey(flowId, key string, offset, limit int64) ([]RunInfo, error) {
+	if key == "" {
+		return k.ListRuns(flowId, offset, limit)
+	}
+	return k.listFrom(keyKeyOf(flowId, key), flowId, offset, limit, nil)
+}
+
+// CountRunsByKey 是绑定了这个业务 key 的实例总数。
+func (k *KvRunIndex) CountRunsByKey(flowId, key string) (int64, error) {
+	if key == "" {
+		return k.CountRuns(flowId)
+	}
+	return k.store.ZCard(context.Background(), keyKeyOf(flowId, key))
+}
+
+func (k *KvRunIndex) CountRuns(flowId string) (int64, error) {
+	return k.store.ZCard(context.Background(), runsKeyOf(flowId))
+}
+
+// CountRunsByStatus 是某个状态下的实例总数。
+//
+// 它可能比实际能列出来的多一点：二级索引搬迁失败时会有成员滞留在旧状态里，
+// 列表会在读到记录时把它们剔掉，而这个计数是直接问 ZSET 的。
+// 宁可让计数偏大也不去逐条核对——那等于把一次 ZCARD 换成一次全量扫描。
+func (k *KvRunIndex) CountRunsByStatus(flowId, status string) (int64, error) {
+	if status == "" {
+		return k.CountRuns(flowId)
+	}
+	return k.store.ZCard(context.Background(), statusKeyOf(flowId, status))
+}
+
+func runsKeyOf(flowId string) string {
+	if flowId != "" {
+		return flowRunsKey(flowId)
+	}
+	return allRunsKey
+}
+
+func statusKeyOf(flowId, status string) string {
+	if flowId != "" {
+		return flowStatusRunsKey(flowId, status)
+	}
+	return statusRunsKey(status)
+}
+
+func keyKeyOf(flowId, key string) string {
+	if flowId != "" {
+		return flowKeyRunsKey(flowId, key)
+	}
+	return keyRunsKey(key)
+}
+
+// listFrom 从某个索引集合里读一页并把记录取回来。
+//
+// keep 非 nil 时用来核对读到的记录还符不符合这个索引的前提。核对是免费的——
+// 记录本来就要读——但只有会漂移的索引需要它（见 ListRunsByStatus）。
+func (k *KvRunIndex) listFrom(key, flowId string, offset, limit int64,
+	keep func(RunInfo) bool) ([]RunInfo, error) {
 	members, err := k.store.ZRevRange(context.Background(), key, offset, limit)
 	if err != nil {
 		return nil, err
@@ -292,27 +627,40 @@ func (k *KvRunIndex) ListRuns(flowId string, offset, limit int64) ([]RunInfo, er
 				StartedAt: time.UnixMilli(int64(m.Score)),
 			}
 		}
+		if keep != nil && !keep(info) {
+			continue
+		}
 		out = append(out, info)
 	}
 	return out, nil
 }
 
-func (k *KvRunIndex) CountRuns(flowId string) (int64, error) {
-	key := allRunsKey
-	if flowId != "" {
-		key = flowRunsKey(flowId)
-	}
-	return k.store.ZCard(context.Background(), key)
-}
-
-// TrimBefore 删掉开始时间早于 cutoff 的索引条目。
+// TrimBefore 删掉开始时间早于 cutoff 的索引条目，返回主索引里删掉的数量。
 // 记录本身有 TTL 会自己消失，但 ZSET 成员不会，需要定期裁剪。
+//
+// 按状态的二级索引也一起裁：它们和主索引同构，不裁的话就只增不减了。
+// 返回值只算主索引——同一次调用在两处各有一份，加起来会得到一个双倍的数字。
+//
+// 按 key 的索引裁不到，因为键名里含 key 本身、枚举不出来。它靠自己的 TTL
+// 和写入时的顺手裁剪收口，见 addToKeyIndex。
 func (k *KvRunIndex) TrimBefore(flowId string, cutoff time.Time) (int64, error) {
-	key := allRunsKey
-	if flowId != "" {
-		key = flowRunsKey(flowId)
+	ctx := context.Background()
+	max := float64(cutoff.UnixMilli())
+
+	n, err := k.store.ZRemBelow(ctx, runsKeyOf(flowId), max)
+	if err != nil {
+		return n, err
 	}
-	return k.store.ZRemBelow(context.Background(), key, float64(cutoff.UnixMilli()))
+
+	if k.zrem == nil {
+		return n, nil // 二级索引从来没被写过，没什么可裁的
+	}
+	for _, status := range indexedStatuses {
+		if _, err := k.store.ZRemBelow(ctx, statusKeyOf(flowId, status), max); err != nil {
+			return n, err
+		}
+	}
+	return n, nil
 }
 
 // noopRunIndex 在没有配置索引时使用，所有操作都是空操作。
