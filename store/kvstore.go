@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -60,6 +61,35 @@ type ZMember struct {
 	Member string
 	Score  float64
 }
+
+// ZRemmer 是一个可选能力：删掉有序集合里的指定成员。
+//
+// 它没有并进 KVStore，因为那是个公开接口——加一个方法会让所有自己实现过它的
+// 调用方升级即编译不过。而这个能力只有一处用得上：给运行实例按状态建二级索引时，
+// 一次调用结束要从 running 集合搬到终态集合。用不上它的实现不该为此付代价。
+//
+// 实现了它的 store 会自动获得界面上的服务端状态筛选；没实现的退回到
+// 「只在当前这一页里过滤」。
+type ZRemmer interface {
+	ZRem(ctx context.Context, key string, members ...string) error
+}
+
+// ZRemSupported 报告这个 store 到底能不能删除有序集合的指定成员。
+//
+// 不能直接对 KVStore 做类型断言：WithPrefix 无条件实现了 ZRem（它得加前缀），
+// 但被它包住的那一层可能并不支持。断言只会看到最外层，于是二级索引会被当成可用，
+// 结果是一个只写不删的半残索引——那比没有索引更糟，因为它会给出错误答案。
+func ZRemSupported(s KVStore) bool {
+	if w, ok := s.(*WithPrefix); ok {
+		return ZRemSupported(w.store)
+	}
+	_, ok := s.(ZRemmer)
+	return ok
+}
+
+// ErrZRemUnsupported 由那些包装了不支持 ZRem 的 store 的实现返回。
+// 调用方应该先用 ZRemSupported 问一次，而不是靠它来发现。
+var ErrZRemUnsupported = errors.New("store: underlying store does not support ZRem")
 
 var _ KVStore = (*WithPrefix)(nil)
 
@@ -130,6 +160,16 @@ func (w *WithPrefix) ZCard(ctx context.Context, key string) (int64, error) {
 
 func (w *WithPrefix) ZRemBelow(ctx context.Context, key string, max float64) (int64, error) {
 	return w.store.ZRemBelow(ctx, w.prefix+key, max)
+}
+
+// ZRem 把可选能力透传下去，顺带加上前缀。
+// 被包住的那层不支持时报错而不是静默成功——静默会让二级索引悄悄漏掉删除。
+func (w *WithPrefix) ZRem(ctx context.Context, key string, members ...string) error {
+	zr, ok := w.store.(ZRemmer)
+	if !ok {
+		return ErrZRemUnsupported
+	}
+	return zr.ZRem(ctx, w.prefix+key, members...)
 }
 
 func NewWithPrefix(prefix string, store KVStore) *WithPrefix {
@@ -333,6 +373,17 @@ func (r *RedisStore) ZCard(ctx context.Context, key string) (int64, error) {
 
 func (r *RedisStore) ZRemBelow(ctx context.Context, key string, max float64) (int64, error) {
 	return r.redis.ZRemRangeByScore(ctx, key, "-inf", fmt.Sprintf("(%f", max)).Result()
+}
+
+func (r *RedisStore) ZRem(ctx context.Context, key string, members ...string) error {
+	if len(members) == 0 {
+		return nil
+	}
+	args := make([]interface{}, 0, len(members))
+	for _, m := range members {
+		args = append(args, m)
+	}
+	return r.redis.ZRem(ctx, key, args...).Err()
 }
 
 func (r *RedisStore) DeleteIf(ctx context.Context, key string, expect string) (bool, error) {

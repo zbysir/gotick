@@ -285,6 +285,16 @@ func (m *MockKvStore) ZCard(ctx context.Context, key string) (int64, error) {
 	return int64(len(m.zs[key])), nil
 }
 
+func (m *MockKvStore) ZRem(ctx context.Context, key string, members ...string) error {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	for _, member := range members {
+		delete(m.zs[key], member)
+	}
+	return nil
+}
+
 func (m *MockKvStore) ZRemBelow(ctx context.Context, key string, max float64) (int64, error) {
 	m.lock.Lock()
 	defer m.lock.Unlock()
